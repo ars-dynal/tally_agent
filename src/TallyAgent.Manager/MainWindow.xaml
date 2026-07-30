@@ -1,0 +1,103 @@
+<Window x:Class="TallyAgent.Manager.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Tally BigQuery Agent — Management Console"
+        Width="860" Height="640" MinWidth="760" MinHeight="560"
+        WindowStartupLocation="CenterScreen">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Header -->
+        <DockPanel Grid.Row="0" Margin="0,0,0,12">
+            <TextBlock Text="Tally BigQuery Data Sync Agent" FontSize="20" FontWeight="Bold"/>
+            <TextBlock x:Name="VersionText" DockPanel.Dock="Right" HorizontalAlignment="Right"
+                       VerticalAlignment="Center" Foreground="Gray"/>
+        </DockPanel>
+
+        <!-- Status grid -->
+        <Border Grid.Row="1" BorderBrush="#DDD" BorderThickness="1" CornerRadius="6" Padding="12"
+                Background="#FAFAFA" Margin="0,0,0,12">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition/><RowDefinition/><RowDefinition/>
+                    <RowDefinition/><RowDefinition/>
+                </Grid.RowDefinitions>
+
+                <TextBlock Grid.Row="0" Grid.Column="0" Style="{StaticResource StatusLabel}" Text="Service:"/>
+                <TextBlock Grid.Row="0" Grid.Column="1" Style="{StaticResource StatusValue}" x:Name="ServiceStatusText"/>
+                <TextBlock Grid.Row="0" Grid.Column="2" Style="{StaticResource StatusLabel}" Text="Tally connection:"/>
+                <TextBlock Grid.Row="0" Grid.Column="3" Style="{StaticResource StatusValue}" x:Name="TallyStatusText"/>
+
+                <TextBlock Grid.Row="1" Grid.Column="0" Style="{StaticResource StatusLabel}" Text="Cloud API:"/>
+                <TextBlock Grid.Row="1" Grid.Column="1" Style="{StaticResource StatusValue}" x:Name="CloudStatusText"/>
+                <TextBlock Grid.Row="1" Grid.Column="2" Style="{StaticResource StatusLabel}" Text="Company:"/>
+                <TextBlock Grid.Row="1" Grid.Column="3" Style="{StaticResource StatusValue}" x:Name="CompanyText"/>
+
+                <TextBlock Grid.Row="2" Grid.Column="0" Style="{StaticResource StatusLabel}" Text="Last successful sync:"/>
+                <TextBlock Grid.Row="2" Grid.Column="1" Style="{StaticResource StatusValue}" x:Name="LastSyncText"/>
+                <TextBlock Grid.Row="2" Grid.Column="2" Style="{StaticResource StatusLabel}" Text="Current activity:"/>
+                <TextBlock Grid.Row="2" Grid.Column="3" Style="{StaticResource StatusValue}" x:Name="ActivityText"/>
+
+                <TextBlock Grid.Row="3" Grid.Column="0" Style="{StaticResource StatusLabel}" Text="Pending batches:"/>
+                <TextBlock Grid.Row="3" Grid.Column="1" Style="{StaticResource StatusValue}" x:Name="PendingText"/>
+                <TextBlock Grid.Row="3" Grid.Column="2" Style="{StaticResource StatusLabel}" Text="Failed batches:"/>
+                <TextBlock Grid.Row="3" Grid.Column="3" Style="{StaticResource StatusValue}" x:Name="FailedText"/>
+
+                <TextBlock Grid.Row="4" Grid.Column="0" Style="{StaticResource StatusLabel}" Text="Uploaded today:"/>
+                <TextBlock Grid.Row="4" Grid.Column="1" Style="{StaticResource StatusValue}" x:Name="AckedText"/>
+                <TextBlock Grid.Row="4" Grid.Column="2" Style="{StaticResource StatusLabel}" Text="Environment:"/>
+                <TextBlock Grid.Row="4" Grid.Column="3" Style="{StaticResource StatusValue}" x:Name="EnvironmentText"/>
+            </Grid>
+        </Border>
+
+        <!-- Action buttons -->
+        <WrapPanel Grid.Row="2" Margin="0,0,0,4">
+            <Button x:Name="TestTallyBtn" Content="Test Tally Connection" Click="TestTally_Click"/>
+            <Button x:Name="TestCloudBtn" Content="Test Cloud Connection" Click="TestCloud_Click"/>
+            <Button x:Name="StartBtn" Content="Start Service" Click="StartService_Click"/>
+            <Button x:Name="StopBtn" Content="Stop Service" Click="StopService_Click"/>
+            <Button x:Name="RestartBtn" Content="Restart Service" Click="RestartService_Click"/>
+            <Button x:Name="SyncNowBtn" Content="Sync Now" Click="SyncNow_Click"/>
+            <Button x:Name="RetryBtn" Content="Retry Failed Batches" Click="RetryFailed_Click"/>
+            <Button Content="Open Log Folder" Click="OpenLogs_Click"/>
+            <Button Content="Export Diagnostics" Click="ExportDiag_Click"/>
+            <Button Content="Update Configuration" Click="EditConfig_Click"/>
+        </WrapPanel>
+
+        <!-- Recent errors -->
+        <GroupBox Grid.Row="3" Header="Recent errors" Margin="0,4,0,8">
+            <DataGrid x:Name="ErrorsGrid" AutoGenerateColumns="False" IsReadOnly="True"
+                      HeadersVisibility="Column" GridLinesVisibility="Horizontal"
+                      CanUserAddRows="False">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="Time (UTC)" Binding="{Binding TsUtc}" Width="160"/>
+                    <DataGridTextColumn Header="Category" Binding="{Binding Category}" Width="170"/>
+                    <DataGridTextColumn Header="Severity" Binding="{Binding Severity}" Width="80"/>
+                    <DataGridTextColumn Header="Dataset" Binding="{Binding Dataset}" Width="130"/>
+                    <DataGridTextColumn Header="Message" Binding="{Binding Message}" Width="*"/>
+                </DataGrid.Columns>
+            </DataGrid>
+        </GroupBox>
+
+        <!-- Footer -->
+        <DockPanel Grid.Row="4">
+            <TextBlock x:Name="FooterText" Foreground="Gray"
+                       Text="Closing this window does not stop the sync service."/>
+            <TextBlock DockPanel.Dock="Right" HorizontalAlignment="Right">
+                <Hyperlink Click="Refresh_Click">Refresh</Hyperlink>
+            </TextBlock>
+        </DockPanel>
+    </Grid>
+</Window>
