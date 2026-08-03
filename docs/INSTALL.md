@@ -11,6 +11,7 @@ Prerequisites:
 ```powershell
 git clone <repo> tally-bigquery-agent
 cd tally-bigquery-agent
+dotnet test tests\TallyAgent.Core.Tests   # unit tests must pass first
 .\build\build.ps1
 # → dist\Tally BigQuery Agent Setup.exe
 ```
