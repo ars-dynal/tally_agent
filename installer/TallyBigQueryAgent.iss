@@ -17,7 +17,9 @@
 ; ────────────────────────────────────────────────────────────────────
 
 #define MyAppName "Tally BigQuery Agent"
+#ifndef MyAppVersion
 #define MyAppVersion "1.0.0"
+#endif
 #define MyAppPublisher "Dynalektric"
 #define MyServiceName "TallyBigQueryAgent"
 #define MyServiceDisplay "Tally BigQuery Data Sync Agent"

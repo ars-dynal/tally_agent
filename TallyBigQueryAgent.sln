@@ -10,6 +10,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TallyAgent.Cli", "src\Tally
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TallyAgent.Manager", "src\TallyAgent.Manager\TallyAgent.Manager.csproj", "{6F9DD5E7-6A2B-4C0D-9E31-A1B2C3D4E5F6}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TallyAgent.Core.Tests", "tests\TallyAgent.Core.Tests\TallyAgent.Core.Tests.csproj", "{3A1B7C2D-4E5F-6789-ABCD-EF0123456789}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -32,6 +34,10 @@ Global
 		{6F9DD5E7-6A2B-4C0D-9E31-A1B2C3D4E5F6}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{6F9DD5E7-6A2B-4C0D-9E31-A1B2C3D4E5F6}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{6F9DD5E7-6A2B-4C0D-9E31-A1B2C3D4E5F6}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3A1B7C2D-4E5F-6789-ABCD-EF0123456789}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3A1B7C2D-4E5F-6789-ABCD-EF0123456789}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3A1B7C2D-4E5F-6789-ABCD-EF0123456789}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3A1B7C2D-4E5F-6789-ABCD-EF0123456789}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

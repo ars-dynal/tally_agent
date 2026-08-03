@@ -539,6 +539,8 @@ batch_id = {agent_id}-{company_id}-{dataset}-{window_from}-{window_to}-{sequence
 
 No wall-clock component. Every upload retry — minutes or days later, before or after service restarts — reuses the stored `batch_id` byte-for-byte, so API-level dedupe and GCS object keying are reliable.
 
+*Implemented (Phase A-1):* `BatchIdentity.Compute` + `BatchBuilder` ordering (tmp → flush/close → checksum → derive id → atomic rename → enqueue); per-dataset sequences draw from both `upload_batches` and `batch_history` (schema v2 adds `sequence_no` to history) so they never regress after acks; `TryEnqueue` treats a batch_id collision (byte-identical re-extraction) as a silent no-op. Batches created by older builds keep their stored IDs — IDs are read from SQLite, never recomputed.
+
 ### 9.3 GCS → BigQuery loading pipeline (Cloud Run responsibilities)
 
 ```

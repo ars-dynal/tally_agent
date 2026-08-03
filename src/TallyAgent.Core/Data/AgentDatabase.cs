@@ -10,7 +10,7 @@ namespace TallyAgent.Core.Data;
 /// </summary>
 public sealed class AgentDatabase
 {
-    public const int CurrentSchemaVersion = 1;
+    public const int CurrentSchemaVersion = 2;
 
     private readonly string _connectionString;
     private readonly ILogger<AgentDatabase> _log;
@@ -52,7 +52,8 @@ public sealed class AgentDatabase
 
         var version = GetSchemaVersion(conn, tx);
         if (version < 1) MigrateToV1(conn, tx);
-        // future: if (version < 2) MigrateToV2(conn, tx); — additive only
+        if (version < 2) MigrateToV2(conn, tx);
+        // future: if (version < 3) MigrateToV3(conn, tx); — additive only
 
         Exec(conn, tx, """
             INSERT INTO schema_meta(key, value) VALUES('schema_version', $v)
@@ -127,6 +128,8 @@ public sealed class AgentDatabase
               completed_utc TEXT NOT NULL,
               retry_count   INTEGER NOT NULL
             );
+            -- sequence_no is added by MigrateToV2 (kept out of V1 so pre-existing
+            -- V1 databases and fresh databases take the identical migration path)
 
             CREATE TABLE IF NOT EXISTS sync_runs (
               sync_id       TEXT PRIMARY KEY,
@@ -162,6 +165,16 @@ public sealed class AgentDatabase
               delivered    INTEGER NOT NULL DEFAULT 0,
               payload_json TEXT NOT NULL
             );
+            """);
+    }
+
+    /// <summary>V2: batch_history carries sequence_no so per-dataset sequence
+    /// numbers stay monotonic after acked rows leave upload_batches
+    /// (sequence feeds the deterministic batch ID — it must never regress).</summary>
+    private static void MigrateToV2(SqliteConnection conn, SqliteTransaction tx)
+    {
+        Exec(conn, tx, """
+            ALTER TABLE batch_history ADD COLUMN sequence_no INTEGER NOT NULL DEFAULT 0;
             """);
     }
 

@@ -1,0 +1,81 @@
+name: Windows Agent Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without v, for example 1.0.1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+          cache: true
+          cache-dependency-path: |
+            **/*.csproj
+            **/packages.lock.json
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Resolve release version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $version = "${{ inputs.version }}"
+          } else {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          }
+
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Version must use MAJOR.MINOR.PATCH, for example 1.0.1"
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Release version: $version"
+
+      - name: Build, test and package
+        shell: pwsh
+        run: .\build\build.ps1 -Version "${{ steps.version.outputs.version }}"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tally-agent-v${{ steps.version.outputs.version }}
+          path: |
+            dist/Tally BigQuery Agent Setup.exe
+            dist/Tally BigQuery Agent Setup.exe.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Create GitHub release
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            "dist/Tally BigQuery Agent Setup.exe" `
+            "dist/Tally BigQuery Agent Setup.exe.sha256" `
+            --title "Tally BigQuery Agent ${{ github.ref_name }}" `
+            --generate-notes `
+            --verify-tag

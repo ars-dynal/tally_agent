@@ -44,14 +44,70 @@ public sealed class BatchQueueRepository(AgentDatabase db)
         cmd.ExecuteNonQuery();
     }
 
-    /// <summary>Next monotonic sequence number for a dataset.</summary>
+    /// <summary>Next monotonic sequence number for a dataset. Considers BOTH the
+    /// live queue and completed history — acked rows leave upload_batches, and a
+    /// sequence regression would corrupt deterministic batch IDs.</summary>
     public long NextSequence(string dataset)
     {
         using var conn = db.Open();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT COALESCE(MAX(sequence_no),0)+1 FROM upload_batches WHERE dataset=$ds";
+        cmd.CommandText = """
+            SELECT MAX(seq)+1 FROM (
+              SELECT COALESCE(MAX(sequence_no),0) AS seq FROM upload_batches WHERE dataset=$ds
+              UNION ALL
+              SELECT COALESCE(MAX(sequence_no),0) AS seq FROM batch_history  WHERE dataset=$ds
+            )
+            """;
         cmd.Parameters.AddWithValue("$ds", dataset);
         return Convert.ToInt64(cmd.ExecuteScalar());
+    }
+
+    /// <summary>Find an equivalent active batch before allocating a new sequence.
+    /// This prevents an identical re-extraction from receiving a different sequence
+    /// number and therefore a different deterministic batch ID.</summary>
+    public QueuedBatch? FindEquivalentActiveBatch(
+        string dataset, string company, string? windowFrom, string? windowTo,
+        string checksumSha256, long recordCount)
+    {
+        using var conn = db.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT * FROM upload_batches
+            WHERE dataset=$ds
+              AND company=$co
+              AND (($wf IS NULL AND window_from IS NULL) OR window_from=$wf)
+              AND (($wt IS NULL AND window_to IS NULL) OR window_to=$wt)
+              AND checksum_sha256=$ck
+              AND record_count=$rc
+              AND status IN ('pending','uploading','failed')
+            ORDER BY created_utc ASC
+            LIMIT 1
+            """;
+        cmd.Parameters.AddWithValue("$ds", dataset);
+        cmd.Parameters.AddWithValue("$co", company);
+        cmd.Parameters.AddWithValue("$wf", (object?)windowFrom ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$wt", (object?)windowTo ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$ck", checksumSha256);
+        cmd.Parameters.AddWithValue("$rc", recordCount);
+        using var r = cmd.ExecuteReader();
+        return r.Read() ? Map(r) : null;
+    }
+
+    /// <summary>Idempotent enqueue: returns false (without throwing) when a batch
+    /// with the same deterministic batch_id already exists — i.e. a byte-identical
+    /// re-extraction of the same window/sequence. The caller keeps the payload file
+    /// (same name, same bytes) and skips the duplicate row.</summary>
+    public bool TryEnqueue(QueuedBatch b)
+    {
+        try
+        {
+            Enqueue(b);
+            return true;
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode == 19) // SQLITE_CONSTRAINT
+        {
+            return false;
+        }
     }
 
     /// <summary>Oldest due batch (per-dataset sequence order preserved). Marks it 'uploading'.</summary>
@@ -103,7 +159,10 @@ public sealed class BatchQueueRepository(AgentDatabase db)
             hist.Transaction = tx;
             hist.CommandText = """
                 INSERT OR REPLACE INTO batch_history
-                SELECT batch_id, dataset, record_count, 'acked', created_utc, $now, retry_count
+                  (batch_id, dataset, record_count, status, created_utc,
+                   completed_utc, retry_count, sequence_no)
+                SELECT batch_id, dataset, record_count, 'acked', created_utc,
+                       $now, retry_count, sequence_no
                 FROM upload_batches WHERE batch_id=$id
                 """;
             hist.Parameters.AddWithValue("$id", batchId);
