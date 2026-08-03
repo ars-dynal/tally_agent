@@ -51,7 +51,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-results-${{ github.run_number }}
           path: TestResults/
@@ -59,7 +59,7 @@ jobs:
           retention-days: 14
 
       - name: Upload installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tally-agent-installer-${{ steps.version.outputs.version }}
           path: |
