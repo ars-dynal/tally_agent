@@ -50,9 +50,26 @@ public sealed class SyncEngine(
             CurrentOperation = "preflight";
             CheckDiskSpace();
 
+            // Force Full Sync with a configured company: reset the checkpoint
+            // BEFORE the probe, so the request survives even if Tally happens to
+            // be closed right now (a likely moment when someone is fiddling).
+            if (mode == "full-forced" && !string.IsNullOrWhiteSpace(config.Tally.Company))
+                ResetVoucherCheckpoint(config.Tally.Company);
+
             var probe = await tally.ProbeAsync(ct);
             if (!probe.Ok)
             {
+                if (mode == "full-forced" && string.IsNullOrWhiteSpace(config.Tally.Company))
+                {
+                    // Auto-discover company: the reset hasn't happened yet — re-arm
+                    // the trigger so the request isn't silently lost.
+                    try
+                    {
+                        File.WriteAllText(Path.Combine(AgentInfo.TriggerDir, "force-full.trigger"),
+                            DateTime.UtcNow.ToString("O"));
+                    }
+                    catch { /* best effort */ }
+                }
                 var category = probe.Category ?? ErrorCategory.TallyNotRunning;
                 // Routed through ErrorReporter (C6): repeated Tally-down cycles are
                 // grouped into digests; the reporter also owns critical dispatch.
@@ -68,14 +85,9 @@ public sealed class SyncEngine(
             log.LogInformation("Sync {SyncId} ({Mode}) starting: company='{Company}', {N} datasets",
                 syncId, mode, company, enabled.Count);
 
-            // Force Full Sync: reset the voucher checkpoint so the planner
-            // re-walks the entire history from extractionStartDate.
+            // Force Full Sync (auto-discover path; idempotent when already reset above).
             if (mode == "full-forced")
-            {
-                checkpoints.Upsert(new SyncCheckpoint("_vouchers_window", company,
-                    null, null, null, null, FullSyncDone: false));
-                log.LogWarning("Force Full Sync requested — voucher checkpoint reset for '{Company}'", company);
-            }
+                ResetVoucherCheckpoint(company);
 
             // ── AlterID change gate (best-effort; null ⇒ always extract) ──
             // ALTMSTID/ALTVCHID are company-wide watermarks bumped on any master/
@@ -123,9 +135,22 @@ public sealed class SyncEngine(
             if (enabled.Any(d => d.Kind == DatasetKind.Voucher))
             {
                 var plan = PlanVouchers(company);
-                if (plan.RecoveredGapDays > 0)
+                // AlterID gate first: when ALTVCHID is unchanged, Tally itself
+                // asserts no voucher was created/edited/deleted — including during
+                // any apparent "gap" — so skipping is safe and the checkpoint is
+                // advanced to today to keep the planner's high-water mark moving.
+                // (Without the advance, an idle company would raise a false
+                // "extraction gap" alert every lookback+2 days, forever.)
+                var skipVouchers = vouchersUnchanged && !plan.IsFullSync;
+                if (skipVouchers)
                 {
-                    // An outage longer than the lookback happened; the planner is
+                    log.LogInformation("AlterID gate: no voucher changes — skipping voucher extraction");
+                    var todayD = DateOnly.FromDateTime(DateTime.Today);
+                    AdvanceVoucherWindowCheckpoint(company, todayD, todayD);
+                }
+                else if (plan.RecoveredGapDays > 0)
+                {
+                    // A real outage longer than the lookback: the planner is
                     // re-extracting the missed days. Surface it — silent gaps were
                     // the old (data-losing) behaviour.
                     log.LogWarning(
@@ -137,9 +162,6 @@ public sealed class SyncEngine(
                         "detected and recovered — verify the agent/Tally uptime.",
                         operation: "plan:vouchers", ct: CancellationToken.None);
                 }
-                var skipVouchers = vouchersUnchanged && !plan.IsFullSync && plan.RecoveredGapDays == 0;
-                if (skipVouchers)
-                    log.LogInformation("AlterID gate: no voucher changes — skipping voucher extraction");
 
                 if (!skipVouchers && plan.Windows.Count > 0)
                 {
@@ -248,6 +270,13 @@ public sealed class SyncEngine(
         SyncPlanner.PlanVoucherWindows(config.Tally,
             checkpoints.Get("_vouchers_window", company),
             DateOnly.FromDateTime(DateTime.Today));
+
+    private void ResetVoucherCheckpoint(string company)
+    {
+        checkpoints.Upsert(new SyncCheckpoint("_vouchers_window", company,
+            null, null, null, null, FullSyncDone: false));
+        log.LogWarning("Force Full Sync — voucher checkpoint reset for '{Company}'", company);
+    }
 
     private void AdvanceVoucherWindowCheckpoint(string company, DateOnly from, DateOnly to)
     {

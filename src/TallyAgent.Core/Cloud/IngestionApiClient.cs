@@ -150,9 +150,12 @@ public sealed class IngestionApiClient
             return await resp.Content.ReadFromJsonAsync<HeartbeatResponse>(ct)
                    ?? new HeartbeatResponse { Ok = true };
         }
-        catch (JsonException)
+        catch (Exception ex) when (ex is JsonException or NotSupportedException)
         {
-            return new HeartbeatResponse { Ok = true }; // 2xx with non-JSON body: delivered
+            // 2xx with a non-JSON body (or non-JSON content type): delivered.
+            // NotSupportedException is what ReadFromJsonAsync throws for e.g.
+            // a plain-text "OK" response.
+            return new HeartbeatResponse { Ok = true };
         }
     }
 

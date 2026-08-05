@@ -111,14 +111,22 @@ public sealed class BatchBuilder(BatchQueueRepository queue, AgentConfig config,
             var finalPath = Path.Combine(QueueDir, batchId + ".ndjson.gz");
 
             // (5) atomic rename — or duplicate handling. Same id ⇒ same business
-            // content (audit fields may differ), so if the final file already exists
-            // (crash-replay of an identical extraction) the ORIGINAL payload is left
-            // untouched — it may be mid-upload and its stored transport checksum
-            // matches it — and only the redundant temp file is deleted.
+            // content, but the BYTES may differ (the replay carries a new _sync_id/
+            // _sync_timestamp). If the final file already exists (crash-replay), the
+            // ORIGINAL payload is kept — it may be mid-upload — the redundant temp
+            // file is deleted, and the transport checksum/size are RECOMPUTED from
+            // the kept file so the queue row always describes the bytes on disk.
             if (File.Exists(finalPath))
+            {
                 File.Delete(tmpPath);
+                using var fs = File.OpenRead(finalPath);
+                payloadChecksum = Convert.ToHexString(SHA256.HashData(fs)).ToLowerInvariant();
+                bytes = fs.Length;
+            }
             else
+            {
                 File.Move(tmpPath, finalPath);
+            }
 
             // (6) durable queue row — idempotent on batch_id
             var enqueued = queue.TryEnqueue(new QueuedBatch(
