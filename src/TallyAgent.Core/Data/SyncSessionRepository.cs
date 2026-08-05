@@ -13,7 +13,7 @@ public sealed record SyncSession(
 /// service restarts. Scheduled incremental sessions are blocked until a FULL
 /// session reaches READY_FOR_CLOUD_VALIDATION.
 /// </summary>
-public sealed class SyncSessionRepository(AgentDatabase db)
+public sealed class SyncSessionRepository
 {
     public const string Created = "CREATED";
     public const string Extracting = "EXTRACTING";
@@ -22,14 +22,17 @@ public sealed class SyncSessionRepository(AgentDatabase db)
     public const string Failed = "FAILED";
     public const string Cancelled = "CANCELLED";
 
-    public SyncSessionRepository : this(db)
+    private readonly AgentDatabase _db;
+
+    public SyncSessionRepository(AgentDatabase db)
     {
+        _db = db;
         EnsureSchema();
     }
 
     private void EnsureSchema()
     {
-        using var conn = db.Open();
+        using var conn = _db.Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             CREATE TABLE IF NOT EXISTS production_sync_sessions (
@@ -50,9 +53,9 @@ public sealed class SyncSessionRepository(AgentDatabase db)
             CREATE INDEX IF NOT EXISTS ix_prod_sessions_company
               ON production_sync_sessions(company, started_utc DESC);
             CREATE TABLE IF NOT EXISTS production_session_acks (
-              batch_id      TEXT PRIMARY KEY,
-              sync_id       TEXT NOT NULL,
-              acknowledged_utc TEXT NOT NULL,
+              batch_id          TEXT PRIMARY KEY,
+              sync_id           TEXT NOT NULL,
+              acknowledged_utc  TEXT NOT NULL,
               FOREIGN KEY(sync_id) REFERENCES production_sync_sessions(sync_id)
             );
             """;
@@ -61,7 +64,7 @@ public sealed class SyncSessionRepository(AgentDatabase db)
 
     public bool HasReadyFull(string company)
     {
-        using var conn = db.Open();
+        using var conn = _db.Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             SELECT EXISTS(
@@ -81,8 +84,11 @@ public sealed class SyncSessionRepository(AgentDatabase db)
             if (active is not null) return active;
         }
 
-        var id = $"{(syncType == "full" ? "full" : "inc")}-{DateTime.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid():N}"[..31];
-        using var conn = db.Open();
+        var prefix = syncType == "full" ? "full" : "inc";
+        var id = $"{prefix}-{DateTime.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid():N}";
+        if (id.Length > 48) id = id[..48];
+
+        using var conn = _db.Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             INSERT INTO production_sync_sessions
@@ -101,7 +107,7 @@ public sealed class SyncSessionRepository(AgentDatabase db)
 
     public SyncSession? GetActiveFull(string company)
     {
-        using var conn = db.Open();
+        using var conn = _db.Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             SELECT * FROM production_sync_sessions
@@ -119,7 +125,7 @@ public sealed class SyncSessionRepository(AgentDatabase db)
 
     public SyncSession? Get(string syncId)
     {
-        using var conn = db.Open();
+        using var conn = _db.Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT * FROM production_sync_sessions WHERE sync_id=$id";
         cmd.Parameters.AddWithValue("$id", syncId);
@@ -129,7 +135,7 @@ public sealed class SyncSessionRepository(AgentDatabase db)
 
     public void MarkExtractionCompleted(string syncId, long rows, long batchesQueued, int failedBatches, string? error)
     {
-        using var conn = db.Open();
+        using var conn = _db.Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             UPDATE production_sync_sessions SET
@@ -155,7 +161,7 @@ public sealed class SyncSessionRepository(AgentDatabase db)
 
     public void RecordBatchAcknowledged(string syncId, string batchId)
     {
-        using var conn = db.Open();
+        using var conn = _db.Open();
         using var tx = conn.BeginTransaction();
         using (var ins = conn.CreateCommand())
         {
@@ -186,7 +192,7 @@ public sealed class SyncSessionRepository(AgentDatabase db)
 
     public void MarkFailed(string syncId, string error)
     {
-        using var conn = db.Open();
+        using var conn = _db.Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "UPDATE production_sync_sessions SET status=$s,error_message=$e WHERE sync_id=$id";
         cmd.Parameters.AddWithValue("$s", Failed);
@@ -197,7 +203,7 @@ public sealed class SyncSessionRepository(AgentDatabase db)
 
     private void TryPromoteReady(string syncId)
     {
-        using var conn = db.Open();
+        using var conn = _db.Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             UPDATE production_sync_sessions SET status=$ready, ready_utc=$now
