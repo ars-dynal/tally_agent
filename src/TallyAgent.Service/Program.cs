@@ -117,7 +117,15 @@ try
         var recovered = queue.RecoverStuckUploads();
         if (recovered > 0)
             Log.Warning("Recovered {N} batches stuck in 'uploading' after previous shutdown", recovered);
-        BatchBuilder.SweepOrphans(queue);
+
+        var missing = queue.MarkRowsWithMissingPayloads();
+        if (missing.Count > 0)
+            Log.Error("Marked {N} queue rows failed — payload files missing at startup: {Ids}",
+                missing.Count, string.Join(", ", missing.Take(10)));
+
+        var swept = BatchBuilder.SweepOrphans(queue);
+        if (swept > 0)
+            Log.Information("Startup sweep removed {N} orphaned temp/payload files", swept);
     }
 
     await host.RunAsync();

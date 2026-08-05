@@ -149,27 +149,41 @@ public sealed class BatchBuilder(BatchQueueRepository queue, AgentConfig config,
         return copy;
     }
 
-    /// <summary>Delete orphaned payload files with no matching queue row (crash debris).</summary>
-    public static int SweepOrphans(BatchQueueRepository queue)
+    /// <summary>Delete orphaned payload files with no matching queue row (crash debris).
+    ///
+    /// SAFETY: the referenced-file set comes from GetAllReferencedPayloadFileNames(),
+    /// which reads EVERY queue row with no limit. (The previous implementation capped
+    /// the set at 10k pending rows — a multi-day offline backlog exceeded the cap and
+    /// startup then deleted live, still-queued payloads: permanent data loss.)
+    /// If the referenced set cannot be read, NOTHING is deleted.</summary>
+    public static int SweepOrphans(BatchQueueRepository queue, string? queueDir = null)
     {
-        var live = queue.ListByStatus("pending", 10000).Concat(queue.ListByStatus("uploading", 1000))
-            .Concat(queue.ListByStatus("failed", 10000))
-            .Select(b => Path.GetFileName(b.PayloadPath))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> live;
+        try
+        {
+            live = queue.GetAllReferencedPayloadFileNames();
+        }
+        catch
+        {
+            return 0; // cannot establish what is referenced — delete nothing
+        }
 
+        var dir = queueDir ?? AgentInfo.QueueDir;
         var removed = 0;
-        foreach (var file in Directory.EnumerateFiles(AgentInfo.QueueDir))
+        foreach (var file in Directory.EnumerateFiles(dir))
         {
             var name = Path.GetFileName(file);
-            if (name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase) ||
-                (!live.Contains(name) && name.EndsWith(".ndjson.gz", StringComparison.OrdinalIgnoreCase)))
+            var isTmp = name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase);
+            var isPayload = name.EndsWith(".ndjson.gz", StringComparison.OrdinalIgnoreCase);
+            if (!isTmp && !isPayload) continue;
+            if (isPayload && live.Contains(name)) continue;   // referenced — never touch
+
+            // .tmp is always debris; unreferenced payloads only after a 1h grace
+            // period (a batch may be mid-enqueue between rename and row insert).
+            var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(file);
+            if (isTmp || age > TimeSpan.FromHours(1))
             {
-                // .tmp files are always debris; .ndjson.gz only if unreferenced AND older than 1h
-                var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(file);
-                if (name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase) || age > TimeSpan.FromHours(1))
-                {
-                    try { File.Delete(file); removed++; } catch { /* next sweep */ }
-                }
+                try { File.Delete(file); removed++; } catch { /* next sweep */ }
             }
         }
         return removed;

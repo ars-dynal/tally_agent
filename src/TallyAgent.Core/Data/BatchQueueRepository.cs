@@ -242,6 +242,45 @@ public sealed class BatchQueueRepository(AgentDatabase db)
         return cmd.ExecuteNonQuery();
     }
 
+    /// <summary>ALL payload file names referenced by ANY queue row, regardless of
+    /// status and with NO row limit. Used by the startup orphan sweep — an
+    /// incomplete list here would cause live payload files to be deleted.</summary>
+    public HashSet<string> GetAllReferencedPayloadFileNames()
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using var conn = db.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT payload_path FROM upload_batches";
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            var name = Path.GetFileName(r.GetString(0));
+            if (name.Length > 0) set.Add(name);
+        }
+        return set;
+    }
+
+    /// <summary>Mark 'failed' any queue row whose payload file is missing on disk.
+    /// Returns the affected batch ids (startup integrity check).</summary>
+    public List<string> MarkRowsWithMissingPayloads()
+    {
+        var missing = new List<string>();
+        using var conn = db.Open();
+        using (var sel = conn.CreateCommand())
+        {
+            sel.CommandText = """
+                SELECT batch_id, payload_path FROM upload_batches
+                WHERE status IN ('pending','uploading')
+                """;
+            using var r = sel.ExecuteReader();
+            while (r.Read())
+                if (!File.Exists(r.GetString(1)))
+                    missing.Add(r.GetString(0));
+        }
+        foreach (var id in missing) MarkFailed(id, "Payload file missing at startup");
+        return missing;
+    }
+
     public QueueStats GetStats()
     {
         using var conn = db.Open();
