@@ -47,6 +47,20 @@ public sealed class CheckpointRepository(AgentDatabase db)
         cmd.ExecuteNonQuery();
     }
 
+    /// <summary>
+    /// Safe Force Full Sync reset. Only extraction checkpoints are removed; the
+    /// durable upload queue, batch history, configuration and diagnostics remain.
+    /// Existing cloud objects are never deleted by the Windows agent.
+    /// </summary>
+    public int ResetForCompany(string company)
+    {
+        using var conn = db.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM sync_checkpoints WHERE company=$c";
+        cmd.Parameters.AddWithValue("$c", company);
+        return cmd.ExecuteNonQuery();
+    }
+
     public string? GetLastSuccessfulSyncUtc()
     {
         using var conn = db.Open();
