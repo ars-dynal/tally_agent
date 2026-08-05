@@ -85,6 +85,34 @@ public sealed class TallyClient
     }
 
     /// <summary>POST an envelope with bounded retries; parses + sanitizes the response.</summary>
+    /// <summary>POST an envelope and return the RAW sanitized response text —
+    /// used by the capture-xml diagnostics verb to persist real Tally responses
+    /// as validation fixtures (ARCHITECTURE §8.4 extraction-validation gate).</summary>
+    public async Task<string> PostRawAsync(string envelope, CancellationToken ct = default)
+    {
+        var doc = await PostAsync(envelope, ct);
+        return doc.ToString(System.Xml.Linq.SaveOptions.None);
+    }
+
+    /// <summary>Company-wide AlterID watermarks for the configured company —
+    /// (masters, vouchers), or null when the Tally build doesn't expose them
+    /// (callers must treat null as "always changed").</summary>
+    public async Task<(long Masters, long Vouchers)?> GetCompanyAlterIdsAsync(CancellationToken ct = default)
+    {
+        var doc = await PostAsync(TallyEnvelopes.CompanyAlterIds(_settings.Company), ct);
+        foreach (var el in doc.Descendants("COMPANY"))
+        {
+            var name = TallyXml.Text(el, "NAME");
+            if (!string.IsNullOrWhiteSpace(_settings.Company) &&
+                !name.Equals(_settings.Company, StringComparison.OrdinalIgnoreCase))
+                continue;
+            var m = TallyXml.Int(el, "ALTMSTID");
+            var v = TallyXml.Int(el, "ALTVCHID");
+            if (m > 0 || v > 0) return (m, v);
+        }
+        return null;
+    }
+
     public async Task<XDocument> PostAsync(string envelope, CancellationToken ct = default)
     {
         TallyException? last = null;

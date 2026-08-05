@@ -25,6 +25,11 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
         public List<Row> SalesInvoiceLines { get; } = [];
         public List<Row> DayBook { get; } = [];
         public List<Row> BankBook { get; } = [];
+        /// <summary>Slim (guid, date, type, alter_id, is_cancelled) manifest per
+        /// window — the warehouse diffs it against stored GUIDs to detect
+        /// vouchers DELETED in Tally (they simply vanish from extraction and can
+        /// only be found by comparison). See ARCHITECTURE §8.2.</summary>
+        public List<Row> Manifest { get; } = [];
     }
 
     /// <summary>Fetch vouchers for a window and fan out to all voucher datasets.
@@ -104,6 +109,14 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                 ["amount"] = Num(v, "AMOUNT"),
             };
             result.VoucherHeaders.Add(header);
+            result.Manifest.Add(new Row
+            {
+                ["guid"] = guid,
+                ["voucher_date"] = voucherDateText,
+                ["voucher_type"] = vchType,
+                ["alter_id"] = header["alter_id"],
+                ["is_cancelled"] = isCancelled,
+            });
 
             // Tally may expose ledger lines as ALLLEDGERENTRIES.LIST (voucher view)
             // and/or LEDGERENTRIES.LIST (invoice view) — the SAME lines in two

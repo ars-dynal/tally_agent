@@ -46,6 +46,7 @@ public static class DatasetRegistry
         new("sales_register",         DatasetKind.Voucher,  "tally_sales_register"),
         new("purchase_register",      DatasetKind.Voucher,  "tally_purchase_register"),
         new("sales_invoice_lines",    DatasetKind.Voucher,  "tally_sales_invoice_lines"),
+        new("voucher_guid_manifest",  DatasetKind.Voucher,  "tally_voucher_guid_manifest"),
         // Snapshot reports
         new("trial_balance",          DatasetKind.Snapshot, "tally_trial_balance"),
         new("balance_sheet",          DatasetKind.Snapshot, "tally_balance_sheet"),

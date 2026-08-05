@@ -27,6 +27,8 @@ try
         "save-config" => SaveConfig(argv.Skip(1).ToList(), json),
         "show-config" => ShowConfig(json),
         "sync-now" => WriteTrigger("sync-now"),
+        "force-full-sync" => WriteTrigger("force-full"),
+        "capture-xml" => await CaptureXml(argv.Skip(1).ToList()),
         "retry-failed" => RetryFailed(json),
         "export-diag" => ExportDiag(json),
         "status" => Status(json),
@@ -161,6 +163,48 @@ static int WriteTrigger(string name)
     return 0;
 }
 
+/// <summary>capture-xml — dump raw (sanitized) Tally responses as validation
+/// fixtures for the ARCHITECTURE §8.4 extraction-validation gate.
+/// usage: capture-xml --kind vouchers --from 2026-07-01 --to 2026-07-31
+///        capture-xml --kind masters --collection Ledger</summary>
+static async Task<int> CaptureXml(List<string> a)
+{
+    var cfg = new ConfigStore().Load();
+    var client = new TallyClient(cfg.Tally, NullLogger<TallyClient>.Instance);
+
+    string kind = "vouchers", collection = "Ledger";
+    DateOnly from = DateOnly.FromDateTime(DateTime.Today).AddDays(-7);
+    DateOnly to = DateOnly.FromDateTime(DateTime.Today);
+    for (var i = 0; i < a.Count - 1; i++)
+    {
+        switch (a[i])
+        {
+            case "--kind": kind = a[++i]; break;
+            case "--collection": collection = a[++i]; break;
+            case "--from": from = DateOnly.Parse(a[++i]); break;
+            case "--to": to = DateOnly.Parse(a[++i]); break;
+        }
+    }
+
+    var envelope = kind switch
+    {
+        "vouchers" => TallyEnvelopes.VoucherCollection(from, to, cfg.Tally.Company),
+        "masters" => TallyEnvelopes.Collection(collection,
+            ["GUID", "MASTERID", "ALTERID", "NAME", "PARENT"], cfg.Tally.Company),
+        "alterids" => TallyEnvelopes.CompanyAlterIds(cfg.Tally.Company),
+        _ => throw new ArgumentException($"Unknown --kind '{kind}' (vouchers|masters|alterids)"),
+    };
+
+    var xml = await client.PostRawAsync(envelope);
+    var dir = Path.Combine(AgentInfo.DataDir, "fixtures");
+    Directory.CreateDirectory(dir);
+    var file = Path.Combine(dir,
+        $"{kind}-{(kind == "masters" ? collection + "-" : "")}{DateTime.Now:yyyyMMdd-HHmmss}.xml");
+    File.WriteAllText(file, xml);
+    Console.WriteLine($"Captured {xml.Length:N0} chars of sanitized Tally XML to:\n  {file}");
+    return 0;
+}
+
 static int RetryFailed(bool json)
 {
     var db = new AgentDatabase(NullLogger<AgentDatabase>.Instance);
@@ -221,6 +265,9 @@ static int Usage()
           save-config --file <plaintext.json> | --set section.key=value ... [--json]
           show-config
           sync-now
+          force-full-sync          (reset checkpoints; re-extract full history)
+          capture-xml --kind vouchers|masters|alterids [--from d] [--to d]
+                      [--collection Ledger]   (save raw Tally XML fixtures)
           retry-failed [--json]
           export-diag  [--json]
           status       [--json]

@@ -68,7 +68,39 @@ public sealed class SyncEngine(
             log.LogInformation("Sync {SyncId} ({Mode}) starting: company='{Company}', {N} datasets",
                 syncId, mode, company, enabled.Count);
 
+            // Force Full Sync: reset the voucher checkpoint so the planner
+            // re-walks the entire history from extractionStartDate.
+            if (mode == "full-forced")
+            {
+                checkpoints.Upsert(new SyncCheckpoint("_vouchers_window", company,
+                    null, null, null, null, FullSyncDone: false));
+                log.LogWarning("Force Full Sync requested — voucher checkpoint reset for '{Company}'", company);
+            }
+
+            // ── AlterID change gate (best-effort; null ⇒ always extract) ──
+            // ALTMSTID/ALTVCHID are company-wide watermarks bumped on any master/
+            // voucher create-edit-delete. When unchanged since the last successful
+            // cycle, the corresponding phase is skipped entirely — this is the
+            // single biggest idle-load reduction for quiet companies. Gating only
+            // applies to steady-state incremental cycles.
+            (long Masters, long Vouchers)? alterIds = null;
+            if (mode == "incremental")
+            {
+                try { alterIds = await tally.GetCompanyAlterIdsAsync(ct); }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    log.LogDebug("AlterID gate unavailable ({Msg}) — extracting unconditionally", ex.Message);
+                }
+            }
+            var mastersUnchanged = alterIds is { } a1 &&
+                checkpoints.Get("_alter_gate_masters", company)?.LastAlterId == a1.Masters;
+            var vouchersUnchanged = alterIds is { } a2 &&
+                checkpoints.Get("_alter_gate_vouchers", company)?.LastAlterId == a2.Vouchers;
+
             // ── Masters & snapshots (cheap full re-extract each cycle) ──
+            if (mastersUnchanged && vouchersUnchanged)
+                log.LogInformation("AlterID gate: no master or voucher changes — skipping masters/snapshots");
+            else
             foreach (var ds in enabled.Where(d => d.Kind is DatasetKind.Master or DatasetKind.Snapshot))
             {
                 ct.ThrowIfCancellationRequested();
@@ -105,15 +137,24 @@ public sealed class SyncEngine(
                         "detected and recovered — verify the agent/Tally uptime.",
                         operation: "plan:vouchers", ct: CancellationToken.None);
                 }
-                var windows = plan.Windows;
-                if (windows.Count > 0)
+                var skipVouchers = vouchersUnchanged && !plan.IsFullSync && plan.RecoveredGapDays == 0;
+                if (skipVouchers)
+                    log.LogInformation("AlterID gate: no voucher changes — skipping voucher extraction");
+
+                if (!skipVouchers && plan.Windows.Count > 0)
                 {
                     HashSet<string> bankLedgers;
                     try { bankLedgers = await reports.BankLedgerNames(ct); }
                     catch { bankLedgers = []; }
 
-                    foreach (var (from, to) in windows)
+                    // Adaptive windowing: a window that times out is split in half
+                    // and retried (down to single days) instead of being retried
+                    // at the same size forever — large companies/heavy months no
+                    // longer livelock the sync.
+                    var pending = new Queue<(DateOnly From, DateOnly To)>(plan.Windows);
+                    while (pending.Count > 0)
                     {
+                        var (from, to) = pending.Dequeue();
                         ct.ThrowIfCancellationRequested();
                         CurrentOperation = $"extract:vouchers {from:yyyy-MM-dd}..{to:yyyy-MM-dd}";
                         try
@@ -132,6 +173,19 @@ public sealed class SyncEngine(
                             AdvanceVoucherWindowCheckpoint(company, from, to);
                             ok++;
                         }
+                        catch (TallyException tex) when (
+                            tex.Category == ErrorCategory.TallyTimeout && to > from)
+                        {
+                            var mid = from.AddDays((to.DayNumber - from.DayNumber) / 2);
+                            log.LogWarning(
+                                "Window {From}..{To} timed out — splitting into {From}..{Mid} and {MidNext}..{To}",
+                                from, to, mid, mid.AddDays(1));
+                            var rest = pending.ToList();
+                            pending.Clear();
+                            pending.Enqueue((from, mid));
+                            pending.Enqueue((mid.AddDays(1), to));
+                            foreach (var w in rest) pending.Enqueue(w);
+                        }
                         catch (Exception ex) when (ex is not OperationCanceledException)
                         {
                             failed++;
@@ -140,6 +194,16 @@ public sealed class SyncEngine(
                         }
                     }
                 }
+            }
+
+            // Advance the AlterID gate watermarks only after a fully successful cycle
+            // (any failure leaves them unchanged so the next cycle re-extracts).
+            if (alterIds is { } finalIds && failed == 0)
+            {
+                checkpoints.Upsert(new SyncCheckpoint("_alter_gate_masters", company,
+                    null, null, finalIds.Masters, DateTime.UtcNow.ToString("O"), true));
+                checkpoints.Upsert(new SyncCheckpoint("_alter_gate_vouchers", company,
+                    null, null, finalIds.Vouchers, DateTime.UtcNow.ToString("O"), true));
             }
 
             var status = failed == 0 ? "success" : ok > 0 ? "partial" : "failed";
@@ -245,6 +309,7 @@ public sealed class SyncEngine(
         yield return ("sales_register", r.SalesRegister);
         yield return ("purchase_register", r.PurchaseRegister);
         yield return ("sales_invoice_lines", r.SalesInvoiceLines);
+        yield return ("voucher_guid_manifest", r.Manifest);
     }
 
     // ── persistence helpers ───────────────────────────────────────
