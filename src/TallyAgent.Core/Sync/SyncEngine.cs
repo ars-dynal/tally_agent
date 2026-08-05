@@ -29,7 +29,7 @@ public sealed class SyncEngine(
     BatchBuilder batchBuilder,
     CheckpointRepository checkpoints,
     BatchQueueRepository queue,
-    ErrorLogRepository errors,
+    ErrorReporter reporter,
     AgentDatabase db,
     ILogger<SyncEngine> log)
 {
@@ -54,8 +54,11 @@ public sealed class SyncEngine(
             if (!probe.Ok)
             {
                 var category = probe.Category ?? ErrorCategory.TallyNotRunning;
-                errors.Insert(category, ErrorSeverity.Error, probe.Error ?? "Tally probe failed",
-                    operation: "preflight");
+                // Routed through ErrorReporter (C6): repeated Tally-down cycles are
+                // grouped into digests; the reporter also owns critical dispatch.
+                await reporter.ReportAsync(category, ErrorSeverity.Error,
+                    probe.Error ?? "Tally probe failed",
+                    operation: "preflight", ct: CancellationToken.None);
                 RecordRunFinish(syncId, "failed", 0, probe.Error);
                 return new SyncResult(syncId, "failed", 0, 0, 0, [probe.Error ?? "Tally unavailable"]);
             }
@@ -80,7 +83,7 @@ public sealed class SyncEngine(
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     failed++;
-                    HandleDatasetError(ds.Name, ex, ref errorList);
+                    await HandleDatasetErrorAsync(ds.Name, ex, errorList);
                 }
             }
 
@@ -97,10 +100,10 @@ public sealed class SyncEngine(
                         "Recovering {Days}-day extraction gap beyond the {Lookback}-day lookback " +
                         "(agent or Tally was unavailable). Missed days are being re-extracted.",
                         plan.RecoveredGapDays, config.Tally.IncrementalLookbackDays);
-                    errors.Insert(ErrorCategory.ServiceStopped, ErrorSeverity.Warning,
+                    await reporter.ReportAsync(ErrorCategory.ServiceStopped, ErrorSeverity.Warning,
                         $"Extraction gap of {plan.RecoveredGapDays} day(s) beyond the lookback window " +
                         "detected and recovered — verify the agent/Tally uptime.",
-                        operation: "plan:vouchers");
+                        operation: "plan:vouchers", ct: CancellationToken.None);
                 }
                 var windows = plan.Windows;
                 if (windows.Count > 0)
@@ -132,7 +135,7 @@ public sealed class SyncEngine(
                         catch (Exception ex) when (ex is not OperationCanceledException)
                         {
                             failed++;
-                            HandleDatasetError($"vouchers[{from:yyyy-MM-dd}..{to:yyyy-MM-dd}]", ex, ref errorList);
+                            await HandleDatasetErrorAsync($"vouchers[{from:yyyy-MM-dd}..{to:yyyy-MM-dd}]", ex, errorList);
                             break; // windows are sequential; resume from checkpoint next cycle
                         }
                     }
@@ -153,8 +156,8 @@ public sealed class SyncEngine(
         }
         catch (Exception ex)
         {
-            errors.Insert(ErrorCategory.UnexpectedException, ErrorSeverity.Critical,
-                ex.Message, ex.StackTrace, operation: CurrentOperation);
+            await reporter.ReportAsync(ErrorCategory.UnexpectedException, ErrorSeverity.Critical,
+                ex.Message, ex.StackTrace, operation: CurrentOperation, ct: CancellationToken.None);
             RecordRunFinish(syncId, "failed", totalRows, ex.Message);
             return new SyncResult(syncId, "failed", ok, failed + 1, totalRows, [ex.Message]);
         }
@@ -280,12 +283,15 @@ public sealed class SyncEngine(
                 $"(limit {config.Advanced.QueueDiskLimitMb} MB). Uploads must drain before extracting more.");
     }
 
-    private void HandleDatasetError(string dataset, Exception ex, ref List<string> errorList)
+    private async Task HandleDatasetErrorAsync(string dataset, Exception ex, List<string> errorList)
     {
         var category = ex is TallyException tex ? tex.Category : ErrorCategory.UnexpectedException;
         var severity = category == ErrorCategory.DiskSpaceLow ? ErrorSeverity.Critical : ErrorSeverity.Error;
-        errors.Insert(category, severity, ex.Message, ex.StackTrace,
-            operation: CurrentOperation, dataset: dataset);
+        // ErrorReporter logs locally AND dispatches criticals immediately (with
+        // per-group cooldown); non-criticals join the periodic digest. Previously
+        // these rows went straight to error_log and criticals were never alerted.
+        await reporter.ReportAsync(category, severity, ex.Message, ex.StackTrace,
+            operation: CurrentOperation, dataset: dataset, ct: CancellationToken.None);
         errorList.Add($"{dataset}: {ex.Message}");
         log.LogError(ex, "Dataset {Dataset} failed", dataset);
     }
