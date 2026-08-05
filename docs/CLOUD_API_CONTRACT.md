@@ -1,170 +1,124 @@
-# Cloud Ingestion API Contract (v1)
+# Cloud Ingestion API Contract (v2.1)
 
-Contract between the Windows agent and the Cloud Run ingestion service.
-The agent **never** talks to BigQuery or GCS directly.
+Contract between the Windows agent and the `tally-ingestion-api` Cloud Run
+service. **This document matches the code in
+`src/TallyAgent.Core/Cloud/IngestionApiClient.cs` as of agent v2.0.** The agent
+never talks to BigQuery or GCS directly.
 
 ## Conventions
 
-* Base URL: configured `cloud.ingestionApiUrl` (HTTPS mandatory outside Development).
-* Auth on every request: `Authorization: Bearer <agent-token>` plus
-  `X-Agent-Id: <agentId>` and `X-Environment: Development|Testing|Production`.
-* The token is a per-agent credential issued by the admin, revocable server-side,
-  scoped to one `company_id`. Server must reject mismatched agent/company pairs.
+* Base URL: configured `cloud.ingestionApiUrl` (HTTPS mandatory outside
+  Development). All endpoints are RELATIVE to this base — one contract, one
+  auth scheme, no `/v1/` split.
+* Auth on every request: **`X-API-Token: <agent token>`** (the `Authorization`
+  header is left free for Google/API-Gateway IAM). Plus `X-Agent-Id` and
+  `X-Environment` headers.
+* The token is a per-agent credential bound server-side to
+  (`agent_id`, `company_id`, `environment`); revocable; never a GCP key.
+* `401`/`403` → the agent pauses uploads 10 min and raises a critical
+  `AuthenticationFailure` alert. Return these only for real credential problems.
 * All timestamps ISO-8601 UTC.
-* `401`/`403` responses cause the agent to pause uploads and raise a critical
-  `AuthenticationFailure` alert — return them only for real credential problems.
 
----
+## GET {base}/health
 
-## GET /v1/ping
+Connectivity probe (installer test, Manager test button).
+**200** any JSON — the agent reads an optional `timestamp` field.
+NOTE: if `health` is unauthenticated, a wrong token is NOT detected here;
+it surfaces at the first `sync`/`heartbeat` call (known limitation — see
+CHANGELOG "Known issues").
 
-Connectivity + credential probe (installer test button, manager test button).
+## POST {base}/sync
 
-**200** `{ "ok": true, "server_time": "2026-07-30T12:00:00Z" }`
+Upload one batch. JSON envelope (the on-disk gzip NDJSON is expanded into
+`records` client-side):
 
----
+```json
+{
+  "agent_id":        "TALLY-SERVER-01",
+  "company_id":      "dynel-electric",
+  "batch_id":        "TALLY-SERVER-01-dynel-electric-vouchers-2026-07-23-2026-07-30-000042-9f2c1ab34e01",
+  "dataset_name":    "vouchers",
+  "tally_company":   "Dynel Electric Private Limited",
+  "sequence_no":     42,
+  "sync_id":         "a1b2c3d4e5f6",
+  "record_count":    4813,
+  "checksum_sha256": "…",
+  "content_checksum":"…",
+  "schema_version":  "1.0",
+  "agent_version":   "2.0.0",
+  "window_from":     "2026-07-23",
+  "window_to":       "2026-07-30",
+  "extract_start":   "2026-07-30T09:00:01Z",
+  "extracted_at":    "2026-07-30T09:00:14Z",
+  "retry_count":     0,
+  "records":         [ { "…row…": 1 } ]
+}
+```
 
-## POST /v1/batches
+Field notes: `checksum_sha256` is the transport checksum of the agent's local
+gzip payload file; `content_checksum` is the **identity** checksum computed
+over rows WITHOUT audit fields (`_sync_timestamp`, `_sync_id`,
+`source_last_seen_at`) — use it for cross-batch duplicate/replacement
+decisions. Each row in `records` still carries the audit fields plus
+`_company`. `window_from`/`window_to` are null for masters/snapshots.
 
-Upload one extracted batch.
+`batch_id` is **deterministic**
+(`{agent}-{company}-{dataset}-{window_from}-{window_to}-{seq:D6}-{content_sha256[:12]}`),
+created once, persisted in the agent's SQLite, and reused verbatim on every
+retry — server-side dedupe on it is reliable.
 
-* Body: gzip-compressed NDJSON — one JSON object per row.
-  `Content-Type: application/x-ndjson`, `Content-Encoding: gzip`.
-* Every row carries meta columns `_sync_timestamp`, `_sync_id`, `_company`
-  (matching the BigQuery schema in Tally_Schema_Design.xlsx).
-
-Request headers (batch envelope):
-
-| Header | Example | Notes |
-|---|---|---|
-| X-Batch-Id | `TALLY-SERVER-01-dynel-electric-vouchers-2026-07-23-2026-07-30-000042-9f2c1ab34e01` | **deterministic**: `{agent_id}-{company_id}-{dataset}-{window_from}-{window_to}-{sequence}-{sha256[:12]}`, created once, persisted in the agent's SQLite, reused verbatim on every retry |
-| X-Dataset | `vouchers` | dataset key (33 known values) |
-| X-Company | `Dynel%20Electric%20Private%20Limited` | URL-encoded Tally company |
-| X-Company-Id | `dynel-electric` | tenant key |
-| X-Sequence | `42` | monotonic per dataset |
-| X-Sync-Id | `a1b2c3d4e5f6` | sync-run correlation id |
-| X-Record-Count | `4813` | rows in payload |
-| X-Checksum-Sha256 | `9f2c...` | hash of the gzip payload — server MUST verify |
-| X-Schema-Version | `1.0` | reject unknown versions with 400 |
-| X-Agent-Version | `1.0.0` | |
-| X-Extract-Start / X-Extract-End | ISO UTC | extraction wall-clock |
-| X-Window-From / X-Window-To | `2026-07-23` | voucher date window (optional) |
-| X-Retry-Count | `3` | delivery attempt count |
-| X-Control-Totals | JSON | record count, debit/credit/amount totals, cancelled count — drives reconciliation |
-
-Responses:
+Responses (implemented status matrix):
 
 | Status | Body | Agent behaviour |
 |---|---|---|
-| 200/201/202 | `{"status":"accepted","batch_id":"..."}` | ack: delete local payload |
-| 200 or 409 | `{"status":"duplicate","batch_id":"..."}` | ack (idempotent re-send) |
-| 400/422 | `{"status":"rejected","errors":[...]}` | failed-final, critical `SchemaMismatch` alert, payload kept locally |
-| 401/403 | — | pause uploads, critical `AuthenticationFailure` |
+| 200/201/202 | `{"status":"accepted","batch_id":"…"}` (or empty) | ack: delete local payload |
+| 409 | any | treated as `duplicate` → ack |
+| 400/422 | `{"status":"rejected","errors":["…"]}` | failed-final, critical `SchemaMismatch` alert, payload kept locally |
+| 401/403 | — | pause uploads 10 min, critical `AuthenticationFailure` |
 | 413 | — | failed-final, advise smaller `uploadBatchMaxRecords` |
 | 429 | honour `Retry-After` | retry |
-| 5xx / network | — | exponential backoff retry (1m→30m cap, jitter), forever |
+| 5xx / network | — | exponential backoff (1m→30m cap, jitter), retries forever |
 
-**Server-side pipeline & duplicate-proofing (implementation requirement):**
+Server-side responsibilities (unchanged from ARCHITECTURE.md): authenticate →
+verify `record_count`/`content_checksum` → store raw in GCS keyed by batch_id →
+register in `ingestion_control` (`accepted`→`loaded`→`processed`/`failed`) →
+BigQuery load + MERGE on stable source keys (never `_sync_id`).
 
-1. **Authenticate** the agent (token ↔ agent_id ↔ company_id binding).
-2. **Validate** metadata + recompute payload SHA-256 vs `X-Checksum-Sha256` (mismatch ⇒ 400).
-3. **Store** raw payload at `gs://{raw-bucket}/{company_id}/{dataset}/{batch_id}.ndjson.gz`
-   (key = batch_id ⇒ replays overwrite identically — idempotent).
-4. **Register** the batch in the `ingestion_control` table (dedupe on `batch_id` —
-   an already-registered batch returns `{"status":"duplicate"}` without reprocessing):
-   `batch_id, agent_id, company_id, dataset, sequence, window_from, window_to,
-   record_count, checksum, schema_version, agent_version, control_totals,
-   status, received_at, loaded_at, processed_at, error`.
-5. **Start or queue** the BigQuery load job (GCS → `stg_{dataset}`), then MERGE
-   staging → warehouse, advancing `ingestion_control.status`:
+## POST {base}/heartbeat
 
-   | status | meaning |
-   |---|---|
-   | `accepted` | raw file safely stored in Cloud Storage (what the 200 to the agent asserts) |
-   | `loaded` | load job completed into staging |
-   | `processed` | staging merged into warehouse |
-   | `failed` | a step failed — `error` set, raw file retained for replay, alert raised |
+Every `heartbeatMinutes` (default 5). Body = the `HeartbeatRequest` model
+(`src/TallyAgent.Core/Cloud/ApiModels.cs`): agent/company ids, machine name,
+Windows version, agent version, environment, service status, Tally
+connected/company-open flags, Tally company, last successful/attempted sync,
+current operation, pending/failed batch counts, last error, disk free MB,
+memory MB, internet flag, timestamp.
 
-**MERGE keys — stable source keys ONLY (`_sync_id`/`_sync_timestamp` are audit columns, never key material):**
+**200** `{"ok":true,"commands":[{"type":"sync_now"}]}` — `commands` optional;
+supported types: `sync_now`, `update`. A 2xx with a non-JSON body counts as
+delivered. Server watchdog requirement: no heartbeat for >15 min ⇒ agent-down
+alert to the admin.
 
-* voucher datasets: `source_company_id + voucher_guid`
-* masters: `source_company_id + master_id` (or `source_company_id + master_guid`)
-* voucher child records: `source_company_id + voucher_guid + entry_type + stable_line_identifier`
-  (line ordinal per entry type; re-extraction replaces the voucher's child set deterministically)
-* SNAPSHOT tables (trial_balance, stock_items, outstanding_*): replace per
-  `source_company_id` per sync (WRITE_TRUNCATE semantics from the schema workbook)
+## POST {base}/errors
 
-Recency between versions of a key: `source_last_seen_at` / batch load time.
-Voucher rows carry `is_cancelled`, `is_deleted`, `source_status`, `source_last_seen_at`;
-deletions detected by GUID-manifest reconciliation are **status updates, never physical
-deletes** of raw records.
+Immediate critical reports and grouped summaries. Body = `ErrorReportRequest`
+model (fixed-taxonomy category, severity, message, stack trace, operation,
+dataset, batch_id, retry count, agent version, `is_summary`, `occurrences`).
+**200** `{"ok":true}`.
+
+## GET {base}/updates/check?current=2.0.0&channel=production
+
+**204/404** no update · **200** `{"version":"…","url":"…","sha256":"…","mandatory":false}`.
+Only versions approved for the channel may be returned.
 
 ---
 
-## POST /v1/heartbeat
+### Changes vs v1 of this document
 
-Every 5 minutes. JSON body:
-
-```json
-{
-  "agent_id": "TALLY-SERVER-01", "company_id": "dynel-electric",
-  "machine_name": "ACCOUNTS-SERVER", "windows_version": "...",
-  "agent_version": "1.0.0", "environment": "Production",
-  "service_status": "running",
-  "tally_connected": true, "tally_company_open": true,
-  "tally_company": "Dynel Electric Private Limited",
-  "last_successful_sync_utc": "...", "last_attempted_sync_utc": "...",
-  "current_operation": "idle",
-  "pending_batches": 4, "failed_batches": 0,
-  "last_error": "TallyTimeout: ...",
-  "disk_free_mb": 51200, "memory_used_mb": 145,
-  "internet_connected": true, "timestamp_utc": "..."
-}
-```
-
-**200** `{ "ok": true, "commands": [ { "type": "sync_now" } ] }` — `commands`
-optional; supported types: `sync_now`, `update` (`{"type":"update","version":"1.1.0"}`).
-
-**Server watchdog requirement:** no heartbeat for >15 minutes ⇒ raise the
-`ServiceStopped` / agent-down alert to the developer/admin (the dead agent cannot
-report itself).
-
----
-
-## POST /v1/errors
-
-Immediate critical reports and periodic grouped summaries.
-
-```json
-{
-  "agent_id": "...", "company_id": "...", "machine_name": "...",
-  "company_name": "...", "category": "TallyPortUnavailable",
-  "severity": "critical", "message": "...", "stack_trace": "...",
-  "timestamp_utc": "...", "operation": "extract:vouchers",
-  "dataset": "vouchers", "batch_id": null, "retry_count": 3,
-  "agent_version": "1.0.0", "is_summary": false, "occurrences": 1
-}
-```
-
-**200** `{ "ok": true }`. Server fans out to: admin email (`notifications.adminEmail`
-registered with the agent), Google Chat/Slack, and the monitoring dashboard.
-Category values are the fixed taxonomy listed in ARCHITECTURE.md §10.
-
----
-
-## GET /v1/updates/check?current=1.0.0&channel=production
-
-Controlled update channel — return only versions **approved for that channel**.
-
-**204** no update · **200**:
-
-```json
-{ "version": "1.1.0",
-  "url": "https://storage.googleapis.com/agent-releases/TallyAgentSetup-1.1.0.exe",
-  "sha256": "...", "mandatory": false }
-```
-
-Agent behaviour: download to temp → verify SHA-256 (+ Authenticode) → run the
-installer silently (`/SILENT`) which stops the service, swaps binaries, preserves
-ProgramData, restarts the service. A failed health check after update triggers
-reinstall of the previous cached Setup.exe (rollback).
+* `Bearer` auth → `X-API-Token` header (Authorization reserved for gateways).
+* `/v1/ping|batches|heartbeat|errors|updates` → unversioned
+  `health|sync|heartbeat|errors|updates/check` on one base — the previous
+  half-migrated split (sync new-style, monitoring old-style) is removed.
+* gzip-NDJSON body + 15 metadata headers → JSON envelope with the metadata
+  restored as body fields after the first `/sync` migration dropped them.
+* New `content_checksum` field (identity, audit-fields excluded); the batch ID
+  suffix is now derived from it rather than from the transport checksum.

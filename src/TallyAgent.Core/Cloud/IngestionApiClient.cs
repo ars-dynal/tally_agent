@@ -74,7 +74,11 @@ public sealed class IngestionApiClient
         return new PingResponse { Ok = true, ServerTime = timestamp };
     }
 
-    /// <summary>Upload one queued batch (payload is gzip NDJSON on disk).</summary>
+    /// <summary>Upload one queued batch (payload is gzip NDJSON on disk).
+    /// The envelope carries the full integrity/ordering metadata so the server
+    /// can verify checksums, dedupe/replace by window, order by sequence, and
+    /// feed reconciliation — this metadata was dropped in the first /sync
+    /// migration and is restored here (contract v2.1).</summary>
     public async Task<BatchResponse> UploadBatchAsync(QueuedBatch batch, CancellationToken ct = default)
     {
         var records = await ReadBatchRecordsAsync(batch.PayloadPath, ct);
@@ -84,7 +88,19 @@ public sealed class IngestionApiClient
             company_id = _config.Cloud.CompanyId,
             batch_id = batch.BatchId,
             dataset_name = batch.Dataset,
+            tally_company = batch.Company,
+            sequence_no = batch.SequenceNo,
+            sync_id = batch.SyncId,
+            record_count = batch.RecordCount,
+            checksum_sha256 = batch.ChecksumSha256,      // transport checksum (gzip file)
+            content_checksum = batch.ContentChecksum,    // identity checksum (audit-free rows)
+            schema_version = batch.SchemaVersion,
+            agent_version = AgentInfo.Version,
+            window_from = batch.WindowFrom,
+            window_to = batch.WindowTo,
+            extract_start = batch.ExtractStartUtc,
             extracted_at = batch.ExtractEndUtc,
+            retry_count = batch.RetryCount,
             records,
         };
 
@@ -120,32 +136,42 @@ public sealed class IngestionApiClient
         }
     }
 
+    /// <summary>Heartbeat on the SAME base + auth scheme as health/sync (one
+    /// contract, not two). Failures are wrapped in CloudApiException so the
+    /// caller can categorize instead of receiving raw HttpRequestException.</summary>
     public async Task<HeartbeatResponse> SendHeartbeatAsync(HeartbeatRequest hb, CancellationToken ct = default)
     {
-        using var resp = await SendAsync(() => new HttpRequestMessage(HttpMethod.Post, "v1/heartbeat")
+        using var resp = await SendAsync(() => new HttpRequestMessage(HttpMethod.Post, "heartbeat")
         { Content = JsonContent.Create(hb) }, ct);
         EnsureAuth(resp);
-        resp.EnsureSuccessStatusCode();
-        return await resp.Content.ReadFromJsonAsync<HeartbeatResponse>(ct)
-               ?? new HeartbeatResponse { Ok = true };
+        EnsureSuccess(resp, "heartbeat");
+        try
+        {
+            return await resp.Content.ReadFromJsonAsync<HeartbeatResponse>(ct)
+                   ?? new HeartbeatResponse { Ok = true };
+        }
+        catch (JsonException)
+        {
+            return new HeartbeatResponse { Ok = true }; // 2xx with non-JSON body: delivered
+        }
     }
 
     public async Task ReportErrorAsync(ErrorReportRequest report, CancellationToken ct = default)
     {
-        using var resp = await SendAsync(() => new HttpRequestMessage(HttpMethod.Post, "v1/errors")
+        using var resp = await SendAsync(() => new HttpRequestMessage(HttpMethod.Post, "errors")
         { Content = JsonContent.Create(report) }, ct);
         EnsureAuth(resp);
-        resp.EnsureSuccessStatusCode();
+        EnsureSuccess(resp, "error report");
     }
 
     public async Task<UpdateInfo?> CheckForUpdateAsync(CancellationToken ct = default)
     {
         using var resp = await SendAsync(() => new HttpRequestMessage(HttpMethod.Get,
-            $"v1/updates/check?current={AgentInfo.Version}&channel={_config.Cloud.Environment.ToLowerInvariant()}"), ct);
+            $"updates/check?current={AgentInfo.Version}&channel={_config.Cloud.Environment.ToLowerInvariant()}"), ct);
         if (resp.StatusCode == HttpStatusCode.NoContent || resp.StatusCode == HttpStatusCode.NotFound)
             return null;
         EnsureAuth(resp);
-        resp.EnsureSuccessStatusCode();
+        EnsureSuccess(resp, "update check");
         var info = await resp.Content.ReadFromJsonAsync<UpdateInfo>(ct);
         return string.IsNullOrEmpty(info?.Version) ? null : info;
     }
@@ -200,6 +226,17 @@ public sealed class IngestionApiClient
             throw new CloudApiException(ErrorCategory.AuthenticationFailure,
                 $"Ingestion API rejected the agent token (HTTP {(int)resp.StatusCode}). " +
                 "Verify the API token, agent ID and environment.", retryable: false);
+    }
+
+    /// <summary>Non-2xx → categorized CloudApiException (never a raw
+    /// HttpRequestException from EnsureSuccessStatusCode, which callers can't
+    /// classify or schedule retries from).</summary>
+    private static void EnsureSuccess(HttpResponseMessage resp, string operation)
+    {
+        if (!resp.IsSuccessStatusCode)
+            throw new CloudApiException(ErrorCategory.CloudApiUnavailable,
+                $"Ingestion API {operation} returned HTTP {(int)resp.StatusCode}.",
+                retryable: true, RetryAfterOf(resp));
     }
 
     private static bool IsDnsOrOffline(HttpRequestException ex) =>
