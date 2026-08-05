@@ -10,7 +10,7 @@ namespace TallyAgent.Core.Data;
 /// </summary>
 public sealed class AgentDatabase
 {
-    public const int CurrentSchemaVersion = 2;
+    public const int CurrentSchemaVersion = 3;
 
     private readonly string _connectionString;
     private readonly ILogger<AgentDatabase> _log;
@@ -53,7 +53,8 @@ public sealed class AgentDatabase
         var version = GetSchemaVersion(conn, tx);
         if (version < 1) MigrateToV1(conn, tx);
         if (version < 2) MigrateToV2(conn, tx);
-        // future: if (version < 3) MigrateToV3(conn, tx); — additive only
+        if (version < 3) MigrateToV3(conn, tx);
+        // future: if (version < 4) MigrateToV4(conn, tx); — additive only
 
         Exec(conn, tx, """
             INSERT INTO schema_meta(key, value) VALUES('schema_version', $v)
@@ -175,6 +176,18 @@ public sealed class AgentDatabase
     {
         Exec(conn, tx, """
             ALTER TABLE batch_history ADD COLUMN sequence_no INTEGER NOT NULL DEFAULT 0;
+            """);
+    }
+
+    /// <summary>V3: content_checksum — SHA-256 over the batch's business rows
+    /// EXCLUDING audit fields (_sync_timestamp/_sync_id/source_last_seen_at).
+    /// This is the identity/dedup checksum; checksum_sha256 remains the
+    /// transport checksum of the final gzip bytes. Pre-existing rows keep ''
+    /// (they never participate in equivalence matching, IDs are unchanged).</summary>
+    private static void MigrateToV3(SqliteConnection conn, SqliteTransaction tx)
+    {
+        Exec(conn, tx, """
+            ALTER TABLE upload_batches ADD COLUMN content_checksum TEXT NOT NULL DEFAULT '';
             """);
     }
 
