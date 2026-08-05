@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
@@ -19,9 +20,10 @@ public sealed class CloudApiException(ErrorCategory category, string message, bo
 }
 
 /// <summary>
-/// HTTPS client for the cloud ingestion API. Bearer-token auth, gzip NDJSON
-/// batch upload, heartbeat, error reporting, update check. TLS certificate
-/// validation is ALWAYS on. Secrets never appear in logs.
+/// HTTPS client for the cloud ingestion API. The custom agent token is sent in
+/// X-API-Token, while Google/API Gateway authentication can use Authorization.
+/// Batch files are converted from gzip NDJSON to the JSON envelope expected by
+/// the tally-ingestion-api /sync endpoint. TLS validation is always enabled.
 /// </summary>
 public sealed class IngestionApiClient
 {
@@ -40,8 +42,11 @@ public sealed class IngestionApiClient
         });
         _http.BaseAddress = new Uri(config.Cloud.IngestionApiUrl.TrimEnd('/') + "/");
         _http.Timeout = TimeSpan.FromMinutes(5);
-        _http.DefaultRequestHeaders.Authorization =
-            new AuthenticationHeaderValue("Bearer", ConfigStore.GetApiToken(config));
+
+        var apiToken = ConfigStore.GetApiToken(config);
+        if (!string.IsNullOrWhiteSpace(apiToken))
+            _http.DefaultRequestHeaders.Add("X-API-Token", apiToken);
+
         _http.DefaultRequestHeaders.Add("X-Agent-Id", config.Cloud.AgentId);
         _http.DefaultRequestHeaders.Add("X-Environment", config.Cloud.Environment);
         _http.DefaultRequestHeaders.UserAgent.ParseAdd($"TallyBigQueryAgent/{AgentInfo.Version}");
@@ -49,40 +54,43 @@ public sealed class IngestionApiClient
 
     public async Task<PingResponse> PingAsync(CancellationToken ct = default)
     {
-        using var resp = await SendAsync(() => new HttpRequestMessage(HttpMethod.Get, "v1/ping"), ct);
+        using var resp = await SendAsync(() => new HttpRequestMessage(HttpMethod.Get, "health"), ct);
         EnsureAuth(resp);
         resp.EnsureSuccessStatusCode();
-        return await resp.Content.ReadFromJsonAsync<PingResponse>(ct)
-               ?? new PingResponse { Ok = false };
+
+        var body = await resp.Content.ReadAsStringAsync(ct);
+        string? timestamp = null;
+        try
+        {
+            using var document = JsonDocument.Parse(body);
+            if (document.RootElement.TryGetProperty("timestamp", out var value))
+                timestamp = value.GetString();
+        }
+        catch (JsonException)
+        {
+            // A successful HTTP response is sufficient for the connection test.
+        }
+
+        return new PingResponse { Ok = true, ServerTime = timestamp };
     }
 
-    /// <summary>Upload one queued batch (payload already gzip NDJSON on disk).</summary>
+    /// <summary>Upload one queued batch (payload is gzip NDJSON on disk).</summary>
     public async Task<BatchResponse> UploadBatchAsync(QueuedBatch batch, CancellationToken ct = default)
     {
-        using var resp = await SendAsync(() =>
+        var records = await ReadBatchRecordsAsync(batch.PayloadPath, ct);
+        var payload = new
         {
-            var req = new HttpRequestMessage(HttpMethod.Post, "v1/batches");
-            var stream = File.OpenRead(batch.PayloadPath); // disposed with request content
-            var content = new StreamContent(stream);
-            content.Headers.ContentType = new MediaTypeHeaderValue("application/x-ndjson");
-            content.Headers.ContentEncoding.Add("gzip");
-            req.Content = content;
-            req.Headers.Add("X-Batch-Id", batch.BatchId);
-            req.Headers.Add("X-Dataset", batch.Dataset);
-            req.Headers.Add("X-Company", Uri.EscapeDataString(batch.Company));
-            req.Headers.Add("X-Company-Id", _config.Cloud.CompanyId);
-            req.Headers.Add("X-Sequence", batch.SequenceNo.ToString());
-            req.Headers.Add("X-Sync-Id", batch.SyncId);
-            req.Headers.Add("X-Record-Count", batch.RecordCount.ToString());
-            req.Headers.Add("X-Checksum-Sha256", batch.ChecksumSha256);
-            req.Headers.Add("X-Schema-Version", batch.SchemaVersion);
-            req.Headers.Add("X-Agent-Version", AgentInfo.Version);
-            req.Headers.Add("X-Extract-Start", batch.ExtractStartUtc);
-            req.Headers.Add("X-Extract-End", batch.ExtractEndUtc);
-            req.Headers.Add("X-Retry-Count", batch.RetryCount.ToString());
-            if (batch.WindowFrom is not null) req.Headers.Add("X-Window-From", batch.WindowFrom);
-            if (batch.WindowTo is not null) req.Headers.Add("X-Window-To", batch.WindowTo);
-            return req;
+            agent_id = _config.Cloud.AgentId,
+            company_id = _config.Cloud.CompanyId,
+            batch_id = batch.BatchId,
+            dataset_name = batch.Dataset,
+            extracted_at = batch.ExtractEndUtc,
+            records,
+        };
+
+        using var resp = await SendAsync(() => new HttpRequestMessage(HttpMethod.Post, "sync")
+        {
+            Content = JsonContent.Create(payload),
         }, ct);
 
         EnsureAuth(resp);
@@ -140,6 +148,26 @@ public sealed class IngestionApiClient
         resp.EnsureSuccessStatusCode();
         var info = await resp.Content.ReadFromJsonAsync<UpdateInfo>(ct);
         return string.IsNullOrEmpty(info?.Version) ? null : info;
+    }
+
+    private static async Task<List<JsonElement>> ReadBatchRecordsAsync(
+        string payloadPath, CancellationToken ct)
+    {
+        var records = new List<JsonElement>();
+        await using var file = File.OpenRead(payloadPath);
+        await using var gzip = new GZipStream(file, CompressionMode.Decompress);
+        using var reader = new StreamReader(gzip);
+
+        while (await reader.ReadLineAsync(ct) is { } line)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+
+            using var document = JsonDocument.Parse(line);
+            records.Add(document.RootElement.Clone());
+        }
+
+        return records;
     }
 
     // ── plumbing ──────────────────────────────────────────────────
