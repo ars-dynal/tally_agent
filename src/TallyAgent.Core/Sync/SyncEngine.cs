@@ -87,7 +87,22 @@ public sealed class SyncEngine(
             // ── Vouchers (windowed Day Book fan-out) ───────────────
             if (enabled.Any(d => d.Kind == DatasetKind.Voucher))
             {
-                var windows = PlanVoucherWindows(company);
+                var plan = PlanVouchers(company);
+                if (plan.RecoveredGapDays > 0)
+                {
+                    // An outage longer than the lookback happened; the planner is
+                    // re-extracting the missed days. Surface it — silent gaps were
+                    // the old (data-losing) behaviour.
+                    log.LogWarning(
+                        "Recovering {Days}-day extraction gap beyond the {Lookback}-day lookback " +
+                        "(agent or Tally was unavailable). Missed days are being re-extracted.",
+                        plan.RecoveredGapDays, config.Tally.IncrementalLookbackDays);
+                    errors.Insert(ErrorCategory.ServiceStopped, ErrorSeverity.Warning,
+                        $"Extraction gap of {plan.RecoveredGapDays} day(s) beyond the lookback window " +
+                        "detected and recovered — verify the agent/Tally uptime.",
+                        operation: "plan:vouchers");
+                }
+                var windows = plan.Windows;
                 if (windows.Count > 0)
                 {
                     HashSet<string> bankLedgers;
@@ -158,40 +173,14 @@ public sealed class SyncEngine(
     {
         var today = DateOnly.FromDateTime(DateTime.Today);
         var cp = checkpoints.Get("_vouchers_window", company);
-        var windows = new List<(DateOnly, DateOnly)>();
-
-        if (cp is not { FullSyncDone: true })
-        {
-            // Initial full sync (possibly resuming)
-            var start = ResolveExtractionStart(cp);
-            var chunk = Math.Max(1, config.Tally.FullSyncChunkDays);
-            for (var from = start; from <= today; from = from.AddDays(chunk))
-            {
-                var to = from.AddDays(chunk - 1);
-                if (to > today) to = today;
-                windows.Add((from, to));
-            }
-        }
-        else
-        {
-            var lookback = Math.Max(0, config.Tally.IncrementalLookbackDays);
-            windows.Add((today.AddDays(-lookback), today));
-        }
-        return windows;
+        return SyncPlanner.PlanVoucherWindows(config.Tally, cp, today).Windows;
     }
 
-    private DateOnly ResolveExtractionStart(SyncCheckpoint? cp)
-    {
-        // Resume after crash: continue from day after last completed window
-        if (cp?.LastToDate is { } lastTo && DateOnly.TryParse(lastTo, out var resume))
-            return resume.AddDays(1);
-        if (DateOnly.TryParse(config.Tally.ExtractionStartDate, out var configured))
-            return configured;
-        // Default: start of current financial year (April 1, India)
-        var today = DateOnly.FromDateTime(DateTime.Today);
-        var fyYear = today.Month >= 4 ? today.Year : today.Year - 1;
-        return new DateOnly(fyYear, 4, 1);
-    }
+    /// <summary>Checkpoint-aware voucher planning (SyncPlanner is the pure core).</summary>
+    public VoucherPlan PlanVouchers(string company) =>
+        SyncPlanner.PlanVoucherWindows(config.Tally,
+            checkpoints.Get("_vouchers_window", company),
+            DateOnly.FromDateTime(DateTime.Today));
 
     private void AdvanceVoucherWindowCheckpoint(string company, DateOnly from, DateOnly to)
     {
