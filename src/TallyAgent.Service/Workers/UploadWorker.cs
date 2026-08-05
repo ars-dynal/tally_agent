@@ -7,22 +7,21 @@ namespace TallyAgent.Service.Workers;
 
 /// <summary>
 /// Drains the durable batch queue to the cloud ingestion API.
-///   • transient errors → exponential backoff (1m→…→30m cap, jitter)
-///   • 409 duplicate → treated as acked (idempotent)
-///   • 400 schema → failed-final + critical alert
-///   • 401/403 → pause pump 10 min + critical alert (never hammers auth)
-/// A batch's payload file is deleted ONLY after the cloud API acknowledged it.
+/// Successful acknowledgements are also recorded against the production sync
+/// session, allowing FULL → INCREMENTAL promotion only after all batches arrive.
 /// </summary>
 public sealed class UploadWorker(
     AgentConfig config,
     BatchQueueRepository queue,
     IngestionApiClient api,
     ErrorReporter errors,
+    AgentDatabase db,
     AgentState state,
     ILogger<UploadWorker> log) : BackgroundService
 {
     private static readonly TimeSpan IdlePoll = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan AuthPause = TimeSpan.FromMinutes(10);
+    private readonly SyncSessionRepository _sessions = new(db);
 
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
@@ -66,8 +65,10 @@ public sealed class UploadWorker(
                 if (resp.Status is "accepted" or "duplicate")
                 {
                     queue.Ack(batch.BatchId);
-                    log.LogInformation("Batch {BatchId} {Status} ({Records} records, attempt {Attempt})",
-                        batch.BatchId, resp.Status, batch.RecordCount, batch.RetryCount + 1);
+                    _sessions.RecordBatchAcknowledged(batch.SyncId, batch.BatchId);
+                    log.LogInformation(
+                        "Batch {BatchId} {Status} ({Records} records, session {SyncId}, attempt {Attempt})",
+                        batch.BatchId, resp.Status, batch.RecordCount, batch.SyncId, batch.RetryCount + 1);
                 }
                 else
                 {
@@ -104,18 +105,13 @@ public sealed class UploadWorker(
                 log.LogWarning("Batch {BatchId} upload failed ({Category}) — retry in {Delay:F0}s: {Msg}",
                     batch.BatchId, ex.Category, delay.TotalSeconds, ex.Message);
 
-                // Only log (grouped digest) — offline periods are expected, not critical.
                 await errors.ReportAsync(ex.Category, ErrorSeverity.Warning, ex.Message,
                     dataset: batch.Dataset, batchId: batch.BatchId,
                     retryCount: batch.RetryCount + 1, ct: CancellationToken.None);
-
-                // While offline, don't spin through every queued batch each poll.
                 await SafeDelay(TimeSpan.FromSeconds(30), ct);
             }
             catch (OperationCanceledException)
             {
-                // Service stopping mid-upload: batch stays 'uploading'; recovered to
-                // 'pending' at next start. Payload untouched — no data loss.
                 throw;
             }
             catch (Exception ex)
