@@ -2,8 +2,7 @@ using System.Text;
 
 namespace TallyAgent.Core.Tally;
 
-/// <summary>Builders for the two Tally request families: TDL collections
-/// (masters) and report exports (Day Book, Trial Balance, ...).</summary>
+/// <summary>Builders for Tally XML requests.</summary>
 public static class TallyEnvelopes
 {
     /// <summary>Collection request: &lt;TYPE&gt;Ledger&lt;/TYPE&gt; + FETCH list.</summary>
@@ -30,7 +29,7 @@ public static class TallyEnvelopes
     public static string Report(string reportName, DateOnly? from = null, DateOnly? to = null, string? company = null)
     {
         var sb = new StringBuilder(512);
-        sb.Append("<ENVELOPE><HEADER><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER>")
+        sb.Append("<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER>")
           .Append("<BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>")
           .Append(reportName)
           .Append("</REPORTNAME><STATICVARIABLES>");
@@ -42,6 +41,37 @@ public static class TallyEnvelopes
             sb.Append("<SVTODATE>").Append(t.ToString("yyyyMMdd")).Append("</SVTODATE>");
         sb.Append("<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>")
           .Append("</STATICVARIABLES></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Export vouchers through an explicit TDL collection instead of relying on
+    /// the currently selected Day Book period in the interactive Tally session.
+    /// The date formula is applied at collection level and the same dates are also
+    /// supplied through SVFROMDATE/SVTODATE for compatibility across Tally versions.
+    /// </summary>
+    public static string VoucherCollection(DateOnly from, DateOnly to, string? company)
+    {
+        var sb = new StringBuilder(4096);
+        sb.Append("<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>")
+          .Append("<TYPE>Collection</TYPE><ID>AgentVoucherCollection</ID></HEADER>")
+          .Append("<BODY><DESC><STATICVARIABLES>")
+          .Append("<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>")
+          .Append("<SVFROMDATE>").Append(from.ToString("yyyyMMdd")).Append("</SVFROMDATE>")
+          .Append("<SVTODATE>").Append(to.ToString("yyyyMMdd")).Append("</SVTODATE>");
+
+        if (!string.IsNullOrEmpty(company))
+            sb.Append("<SVCURRENTCOMPANY>").Append(TallyXml.XmlEscape(company)).Append("</SVCURRENTCOMPANY>");
+
+        sb.Append("</STATICVARIABLES><TDL><TDLMESSAGE>")
+          .Append("<COLLECTION NAME=\"AgentVoucherCollection\"><TYPE>Voucher</TYPE>")
+          .Append("<FETCH>DATE,VOUCHERTYPENAME,VOUCHERNUMBER,REFERENCE,NARRATION,PARTYLEDGERNAME,GUID,MASTERID,ALTERID,ISCANCELLED,ISOPTIONAL,AMOUNT</FETCH>")
+          .Append("<FETCH>ALLLEDGERENTRIES.*,LEDGERENTRIES.*,ALLINVENTORYENTRIES.*,INVENTORYENTRIES.*</FETCH>")
+          .Append("<FETCH>BILLALLOCATIONS.*,BANKALLOCATIONS.*,CATEGORYALLOCATIONS.*,COSTCENTREALLOCATIONS.*,BATCHALLOCATIONS.*</FETCH>")
+          .Append("<FILTER>AgentVoucherDateFilter</FILTER></COLLECTION>")
+          .Append("<SYSTEM TYPE=\"Formulae\" NAME=\"AgentVoucherDateFilter\">")
+          .Append("$Date &gt;= ##SVFromDate AND $Date &lt;= ##SVToDate")
+          .Append("</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>");
         return sb.ToString();
     }
 
