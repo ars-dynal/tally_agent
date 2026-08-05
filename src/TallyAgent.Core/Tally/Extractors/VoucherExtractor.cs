@@ -78,6 +78,8 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                 continue;
             }
 
+            var isCancelled = Bool(v, "ISCANCELLED");
+            var isOptional = Bool(v, "ISOPTIONAL");
             var header = new Row
             {
                 ["voucher_date"] = voucherDateText,
@@ -89,17 +91,37 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                 ["guid"] = guid,
                 ["master_id"] = Int(v, "MASTERID"),
                 ["alter_id"] = Int(v, "ALTERID"),
-                ["is_cancelled"] = Bool(v, "ISCANCELLED"),
+                ["is_cancelled"] = isCancelled,
+                ["is_optional"] = isOptional,
+                // Lifecycle contract (§8.1): is_deleted flips to true only via
+                // GUID-manifest reconciliation in the warehouse — the agent always
+                // emits false because a voucher it can see is, by definition, not
+                // deleted. source_last_seen_at is audit-like (excluded from the
+                // content checksum by BatchBuilder).
+                ["is_deleted"] = false,
+                ["source_status"] = isCancelled ? "cancelled" : isOptional ? "optional" : "active",
+                ["source_last_seen_at"] = DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"),
                 ["amount"] = Num(v, "AMOUNT"),
             };
             result.VoucherHeaders.Add(header);
 
-            var ledgerEntries = v.Descendants("ALLLEDGERENTRIES.LIST")
-                .Concat(v.Descendants("LEDGERENTRIES.LIST"))
-                .Distinct()
-                .ToList();
+            // Tally may expose ledger lines as ALLLEDGERENTRIES.LIST (voucher view)
+            // and/or LEDGERENTRIES.LIST (invoice view) — the SAME lines in two
+            // shapes. Concat+Distinct was reference-equality (a no-op) and doubled
+            // every line on builds returning both. Prefer ALL*; fall back only
+            // when it is absent.
+            var allLedger = v.Descendants("ALLLEDGERENTRIES.LIST").ToList();
+            var ledgerEntries = allLedger.Count > 0
+                ? allLedger
+                : v.Descendants("LEDGERENTRIES.LIST").ToList();
 
             double cgst = 0, sgst = 0, igst = 0;
+            // Per-voucher, per-entry-type ordinals. NOTE (child identity contract):
+            // these ordinals identify a line only WITHIN one extraction of one
+            // voucher — they are NOT stable across edits. The warehouse must
+            // replace the entire child set per (source_company_id, voucher_guid,
+            // entry_type) on every new version of a voucher, never merge by ordinal.
+            int lineIndex = 0, billIndex = 0, bankIndex = 0, ccIndex = 0, invIndex = 0;
 
             foreach (var entry in ledgerEntries)
             {
@@ -110,6 +132,8 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                 result.VoucherLines.Add(new Row
                 {
                     ["voucher_guid"] = guid,
+                    ["entry_type"] = "ledger",
+                    ["line_index"] = lineIndex,
                     ["voucher_date"] = voucherDateText,
                     ["voucher_number"] = voucherNumber,
                     ["ledger_name"] = ledgerName,
@@ -129,7 +153,11 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                     ["master_id"] = header["master_id"],
                     ["alter_id"] = header["alter_id"],
                     ["is_cancelled"] = header["is_cancelled"],
-                    ["is_optional"] = Bool(v, "ISOPTIONAL"),
+                    ["is_optional"] = isOptional,
+                    ["is_deleted"] = false,
+                    ["source_status"] = header["source_status"],
+                    ["source_last_seen_at"] = header["source_last_seen_at"],
+                    ["line_index"] = lineIndex,
                     ["ledger_name"] = ledgerName,
                     ["amount"] = amount,
                     ["is_deemed_positive"] = deemedPositive,
@@ -166,6 +194,8 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                     result.BillAllocations.Add(new Row
                     {
                         ["voucher_guid"] = guid,
+                        ["entry_type"] = "bill_allocation",
+                        ["line_index"] = billIndex++,
                         ["voucher_date"] = voucherDateText,
                         ["voucher_number"] = voucherNumber,
                         ["ledger_name"] = ledgerName,
@@ -180,6 +210,8 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                     result.BankAllocations.Add(new Row
                     {
                         ["voucher_guid"] = guid,
+                        ["entry_type"] = "bank_allocation",
+                        ["line_index"] = bankIndex++,
                         ["voucher_date"] = voucherDateText,
                         ["voucher_number"] = voucherNumber,
                         ["voucher_type"] = vchType,
@@ -200,6 +232,8 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                     result.CostCentreAllocations.Add(new Row
                     {
                         ["voucher_guid"] = guid,
+                        ["entry_type"] = "cost_centre_allocation",
+                        ["line_index"] = ccIndex++,
                         ["voucher_date"] = voucherDateText,
                         ["voucher_type"] = vchType,
                         ["ledger_name"] = ledgerName,
@@ -219,6 +253,8 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                         result.CostCentreAllocations.Add(new Row
                         {
                             ["voucher_guid"] = guid,
+                            ["entry_type"] = "cost_centre_allocation",
+                            ["line_index"] = ccIndex++,
                             ["voucher_date"] = voucherDateText,
                             ["voucher_type"] = vchType,
                             ["ledger_name"] = ledgerName,
@@ -228,17 +264,27 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                         });
                     }
                 }
+
+                lineIndex++;
             }
 
-            foreach (var inv in v.Descendants("INVENTORYENTRIES.LIST")
-                         .Concat(v.Descendants("ALLINVENTORYENTRIES.LIST"))
-                         .Distinct())
+            // Same dual-shape issue as ledger entries: prefer ALLINVENTORYENTRIES,
+            // fall back to INVENTORYENTRIES only when it is absent (Concat+Distinct
+            // was reference-equality and double-counted stock movements).
+            var allInventory = v.Descendants("ALLINVENTORYENTRIES.LIST").ToList();
+            var inventoryEntries = allInventory.Count > 0
+                ? allInventory
+                : v.Descendants("INVENTORYENTRIES.LIST").ToList();
+
+            foreach (var inv in inventoryEntries)
             {
                 var stockItem = Text(inv, "STOCKITEMNAME");
                 if (stockItem.Length == 0) continue;
                 var invRow = new Row
                 {
                     ["voucher_guid"] = guid,
+                    ["entry_type"] = "inventory",
+                    ["line_index"] = invIndex++,
                     ["voucher_date"] = voucherDateText,
                     ["voucher_number"] = voucherNumber,
                     ["stock_item"] = stockItem,
