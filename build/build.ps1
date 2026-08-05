@@ -9,11 +9,19 @@ Set-Location $Root
 
 Write-Host "Building Tally BigQuery Agent version $Version" -ForegroundColor Cyan
 
+function Assert-ExitCode([string]$Step) {
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Step failed with exit code $LASTEXITCODE"
+    }
+}
+
 if (-not $SkipTests) {
     dotnet restore .\TallyBigQueryAgent.sln
+    Assert-ExitCode "dotnet restore"
     dotnet test .\TallyBigQueryAgent.sln -c Release --no-restore `
         --logger "trx;LogFileName=tests.trx" `
         --results-directory .\TestResults
+    Assert-ExitCode "dotnet test"
 }
 
 Remove-Item .\publish -Recurse -Force -ErrorAction SilentlyContinue
@@ -34,6 +42,7 @@ foreach ($project in $projects) {
         -p:PublishSingleFile=false `
         -p:Version=$Version `
         -o ".\publish\$($project.Name)"
+    Assert-ExitCode "dotnet publish ($($project.Name))"
 }
 
 $isccCandidates = @(
@@ -48,6 +57,7 @@ if (-not $ISCC) {
 
 Write-Host "Compiling installer..." -ForegroundColor Yellow
 & $ISCC "/DMyAppVersion=$Version" ".\installer\TallyBigQueryAgent.iss"
+Assert-ExitCode "ISCC installer compile"
 
 $Installer = ".\dist\Tally BigQuery Agent Setup.exe"
 if (-not (Test-Path $Installer)) {
