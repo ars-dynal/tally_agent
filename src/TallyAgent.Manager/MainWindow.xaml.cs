@@ -94,8 +94,11 @@ public partial class MainWindow : Window
         {
             using var conn = _db!.Open();
             using var cmd = conn.CreateCommand();
-            cmd.CommandText =
-                "SELECT mode || ' sync (' || status || ')' FROM sync_runs ORDER BY started_utc DESC LIMIT 1";
+            // mode + status + sync id, e.g. "incremental sync (success) · id a1b2c3d4e5f6"
+            cmd.CommandText = """
+                SELECT mode || ' sync (' || status || ') · id ' || sync_id
+                FROM sync_runs ORDER BY started_utc DESC LIMIT 1
+                """;
             return cmd.ExecuteScalar() as string;
         }
         catch { return null; }
@@ -202,6 +205,26 @@ public partial class MainWindow : Window
         {
             Warn($"Service control failed: {ex.Message}");
         }
+    }
+
+    private void ForceFull_Click(object sender, RoutedEventArgs e)
+    {
+        var confirm = MessageBox.Show(this,
+            "Force Full Sync resets the extraction checkpoints and re-extracts the " +
+            "ENTIRE voucher history from the configured start date.\n\n" +
+            "Re-uploaded data does not create duplicates (the warehouse merges on " +
+            "stable keys), but the full walk can take a long time on large companies.\n\n" +
+            "Continue?",
+            "Force Full Sync", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+        if (confirm != MessageBoxResult.Yes) return;
+        try
+        {
+            AgentInfo.EnsureDirectories();
+            File.WriteAllText(Path.Combine(AgentInfo.TriggerDir, "force-full.trigger"),
+                DateTime.UtcNow.ToString("O"));
+            FooterText.Text = "Force Full Sync requested — the service will restart the full history walk.";
+        }
+        catch (Exception ex) { Warn($"Could not request full sync: {ex.Message}"); }
     }
 
     private void SyncNow_Click(object sender, RoutedEventArgs e)

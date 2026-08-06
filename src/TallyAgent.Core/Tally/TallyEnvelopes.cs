@@ -75,6 +75,26 @@ public static class TallyEnvelopes
         return sb.ToString();
     }
 
+    /// <summary>Company-wide AlterID watermarks: ALTMSTID (masters) and ALTVCHID
+    /// (vouchers) change whenever ANY master/voucher is created, edited or
+    /// deleted. One tiny request lets the agent skip whole extraction phases
+    /// when nothing changed (reference-proven change gate).</summary>
+    public static string CompanyAlterIds(string? company)
+    {
+        var sb = new StringBuilder(512);
+        sb.Append("<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>")
+          .Append("<TYPE>Collection</TYPE><ID>AgentCompanyAlterIds</ID></HEADER>")
+          .Append("<BODY><DESC><STATICVARIABLES>")
+          .Append("<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>");
+        if (!string.IsNullOrEmpty(company))
+            sb.Append("<SVCURRENTCOMPANY>").Append(TallyXml.XmlEscape(company)).Append("</SVCURRENTCOMPANY>");
+        sb.Append("</STATICVARIABLES><TDL><TDLMESSAGE>")
+          .Append("<COLLECTION NAME=\"AgentCompanyAlterIds\"><TYPE>Company</TYPE>")
+          .Append("<FETCH>NAME,ALTMSTID,ALTVCHID</FETCH>")
+          .Append("</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>");
+        return sb.ToString();
+    }
+
     /// <summary>Lightweight company-list probe (also the connection test).</summary>
     public static string CompanyList() =>
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>" +

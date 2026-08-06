@@ -7,7 +7,7 @@ public sealed record QueuedBatch(
     string ExtractStartUtc, string ExtractEndUtc, string? WindowFrom, string? WindowTo,
     long RecordCount, string PayloadPath, long PayloadBytes, string ChecksumSha256,
     string SchemaVersion, string Status, int RetryCount, string? NextAttemptUtc,
-    string? LastError, string CreatedUtc);
+    string? LastError, string CreatedUtc, string ContentChecksum = "");
 
 public sealed record QueueStats(long Pending, long Failed, long AckedToday, long TotalQueueBytes);
 
@@ -23,9 +23,10 @@ public sealed class BatchQueueRepository(AgentDatabase db)
             INSERT INTO upload_batches
               (batch_id, dataset, company, sequence_no, sync_id, extract_start_utc, extract_end_utc,
                window_from, window_to, record_count, payload_path, payload_bytes, checksum_sha256,
-               schema_version, status, retry_count, created_utc)
-            VALUES ($id,$ds,$co,$seq,$sync,$es,$ee,$wf,$wt,$rc,$pp,$pb,$ck,$sv,'pending',0,$cr)
+               schema_version, status, retry_count, created_utc, content_checksum)
+            VALUES ($id,$ds,$co,$seq,$sync,$es,$ee,$wf,$wt,$rc,$pp,$pb,$ck,$sv,'pending',0,$cr,$cc)
             """;
+        cmd.Parameters.AddWithValue("$cc", b.ContentChecksum);
         cmd.Parameters.AddWithValue("$id", b.BatchId);
         cmd.Parameters.AddWithValue("$ds", b.Dataset);
         cmd.Parameters.AddWithValue("$co", b.Company);
@@ -67,8 +68,12 @@ public sealed class BatchQueueRepository(AgentDatabase db)
     /// number and therefore a different deterministic batch ID.</summary>
     public QueuedBatch? FindEquivalentActiveBatch(
         string dataset, string company, string? windowFrom, string? windowTo,
-        string checksumSha256, long recordCount)
+        string contentChecksum, long recordCount)
     {
+        // Matches on content_checksum (business rows only, audit fields excluded)
+        // so a re-extraction with a new _sync_id/_sync_timestamp still matches.
+        // Rows migrated from schema v2 have '' and never match — safe.
+        if (string.IsNullOrEmpty(contentChecksum)) return null;
         using var conn = db.Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
@@ -77,7 +82,7 @@ public sealed class BatchQueueRepository(AgentDatabase db)
               AND company=$co
               AND (($wf IS NULL AND window_from IS NULL) OR window_from=$wf)
               AND (($wt IS NULL AND window_to IS NULL) OR window_to=$wt)
-              AND checksum_sha256=$ck
+              AND content_checksum=$ck
               AND record_count=$rc
               AND status IN ('pending','uploading','failed')
             ORDER BY created_utc ASC
@@ -87,7 +92,7 @@ public sealed class BatchQueueRepository(AgentDatabase db)
         cmd.Parameters.AddWithValue("$co", company);
         cmd.Parameters.AddWithValue("$wf", (object?)windowFrom ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$wt", (object?)windowTo ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$ck", checksumSha256);
+        cmd.Parameters.AddWithValue("$ck", contentChecksum);
         cmd.Parameters.AddWithValue("$rc", recordCount);
         using var r = cmd.ExecuteReader();
         return r.Read() ? Map(r) : null;
@@ -237,6 +242,45 @@ public sealed class BatchQueueRepository(AgentDatabase db)
         return cmd.ExecuteNonQuery();
     }
 
+    /// <summary>ALL payload file names referenced by ANY queue row, regardless of
+    /// status and with NO row limit. Used by the startup orphan sweep — an
+    /// incomplete list here would cause live payload files to be deleted.</summary>
+    public HashSet<string> GetAllReferencedPayloadFileNames()
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using var conn = db.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT payload_path FROM upload_batches";
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            var name = Path.GetFileName(r.GetString(0));
+            if (name.Length > 0) set.Add(name);
+        }
+        return set;
+    }
+
+    /// <summary>Mark 'failed' any queue row whose payload file is missing on disk.
+    /// Returns the affected batch ids (startup integrity check).</summary>
+    public List<string> MarkRowsWithMissingPayloads()
+    {
+        var missing = new List<string>();
+        using var conn = db.Open();
+        using (var sel = conn.CreateCommand())
+        {
+            sel.CommandText = """
+                SELECT batch_id, payload_path FROM upload_batches
+                WHERE status IN ('pending','uploading')
+                """;
+            using var r = sel.ExecuteReader();
+            while (r.Read())
+                if (!File.Exists(r.GetString(1)))
+                    missing.Add(r.GetString(0));
+        }
+        foreach (var id in missing) MarkFailed(id, "Payload file missing at startup");
+        return missing;
+    }
+
     public QueueStats GetStats()
     {
         using var conn = db.Open();
@@ -286,7 +330,9 @@ public sealed class BatchQueueRepository(AgentDatabase db)
         RetryCount: r.GetInt32(r.GetOrdinal("retry_count")),
         NextAttemptUtc: r.IsDBNull(r.GetOrdinal("next_attempt_utc")) ? null : r.GetString(r.GetOrdinal("next_attempt_utc")),
         LastError: r.IsDBNull(r.GetOrdinal("last_error")) ? null : r.GetString(r.GetOrdinal("last_error")),
-        CreatedUtc: r.GetString(r.GetOrdinal("created_utc")));
+        CreatedUtc: r.GetString(r.GetOrdinal("created_utc")),
+        ContentChecksum: r.IsDBNull(r.GetOrdinal("content_checksum"))
+            ? "" : r.GetString(r.GetOrdinal("content_checksum")));
 
     private static string Truncate(string s, int max) => s.Length <= max ? s : s[..max];
 }

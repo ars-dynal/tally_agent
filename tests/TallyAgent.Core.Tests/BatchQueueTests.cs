@@ -137,23 +137,27 @@ public class BatchQueueTests : IDisposable
         var row = Assert.Single(repo.ListByStatus("pending"));
 
         Assert.StartsWith("TEST-AGENT-test-co-ledgers-na-na-", id);          // §9.2 format, no timestamp
-        Assert.EndsWith(row.ChecksumSha256[..12], id);                       // id embeds payload checksum
-        Assert.Equal(64, row.ChecksumSha256.Length);
+        Assert.EndsWith(row.ContentChecksum[..12], id);                      // id embeds CONTENT checksum
+        Assert.Equal(64, row.ContentChecksum.Length);
+        Assert.Equal(64, row.ChecksumSha256.Length);                         // transport checksum kept
+        Assert.NotEqual(row.ContentChecksum, row.ChecksumSha256);
     }
 
     [Fact]
     public void CrashReplay_SameExtraction_ReusesId_AndNeverDeletesOriginalPayload()
     {
+        // NOTE: no timestamp pinning — the replay runs with a DIFFERENT sync id and
+        // timestamp, proving the content checksum (audit fields excluded) drives
+        // identity exactly as it will in production.
         var config = TestConfig();
         var queueDir = Path.Combine(_dir, "queue");
         var db = NewDb();
         var repo = new BatchQueueRepository(db);
         var builder = new BatchBuilder(repo, config, queueDir);
         var rows1 = new List<Dictionary<string, object?>> { new() { ["guid"] = "v-1" } };
-        const string FixedTs = "2026-07-30T00:00:00.000Z";
 
         var id1 = Assert.Single(builder.BuildAndEnqueue("vouchers", "Test Co", "sync1", rows1,
-            DateTime.UtcNow, DateTime.UtcNow, "2026-07-23", "2026-07-30", 5000, FixedTs));
+            DateTime.UtcNow, DateTime.UtcNow, "2026-07-23", "2026-07-30", 5000));
         var payload = Assert.Single(repo.ListByStatus("pending")).PayloadPath;
         var originalBytes = File.ReadAllBytes(payload);
         var originalWriteTime = File.GetLastWriteTimeUtc(payload);
@@ -167,12 +171,13 @@ public class BatchQueueTests : IDisposable
             cmd.ExecuteNonQuery();
         }
 
-        // Replay the identical extraction (same rows, same sync id + timestamp).
+        // Replay the identical extraction with a NEW sync id (fresh cycle after crash).
         var rows2 = new List<Dictionary<string, object?>> { new() { ["guid"] = "v-1" } };
-        var id2 = Assert.Single(builder.BuildAndEnqueue("vouchers", "Test Co", "sync1", rows2,
-            DateTime.UtcNow, DateTime.UtcNow, "2026-07-23", "2026-07-30", 5000, FixedTs));
+        var id2 = Assert.Single(builder.BuildAndEnqueue("vouchers", "Test Co", "sync2", rows2,
+            DateTime.UtcNow, DateTime.UtcNow, "2026-07-23", "2026-07-30", 5000));
 
         Assert.Equal(id1, id2);                                              // same deterministic id
+                                                                             // despite new sync id/ts
         Assert.Equal(originalBytes, File.ReadAllBytes(payload));             // original untouched
         Assert.Equal(originalWriteTime, File.GetLastWriteTimeUtc(payload));  // not rewritten
         Assert.Empty(Directory.GetFiles(queueDir, "*.tmp"));                 // redundant tmp removed
@@ -188,17 +193,16 @@ public class BatchQueueTests : IDisposable
         var repo = new BatchQueueRepository(db);
         var builder = new BatchBuilder(repo, config, queueDir);
         var rows = new List<Dictionary<string, object?>> { new() { ["guid"] = "v-1" } };
-        const string FixedTs = "2026-07-30T00:00:00.000Z";
 
         var first = builder.BuildAndEnqueue("vouchers", "Test Co", "sync1", rows,
-            DateTime.UtcNow, DateTime.UtcNow, "2026-07-23", "2026-07-30", 5000, FixedTs);
+            DateTime.UtcNow, DateTime.UtcNow, "2026-07-23", "2026-07-30", 5000);
         Assert.Single(first);
 
-        // Identical build while the original row is still pending. NOTE: sequence has
-        // NOT advanced (no ack), so the id collides and TryEnqueue declines it.
-        var second = builder.BuildAndEnqueue("vouchers", "Test Co", "sync1",
+        // Identical build (new sync id) while the original row is still pending:
+        // the equivalent-active-batch suppression matches on content checksum.
+        var second = builder.BuildAndEnqueue("vouchers", "Test Co", "sync2",
             new List<Dictionary<string, object?>> { new() { ["guid"] = "v-1" } },
-            DateTime.UtcNow, DateTime.UtcNow, "2026-07-23", "2026-07-30", 5000, FixedTs);
+            DateTime.UtcNow, DateTime.UtcNow, "2026-07-23", "2026-07-30", 5000);
 
         Assert.Empty(second);                                                // duplicate excluded
         Assert.Single(repo.ListByStatus("pending"));                         // still exactly one row
@@ -238,13 +242,16 @@ public class BatchQueueTests : IDisposable
     }
 
     [Fact]
-    public void SchemaMigration_V2_AddsSequenceToHistory()
+    public void SchemaMigrations_AddSequenceAndContentChecksum()
     {
         var db = NewDb();
         using var conn = db.Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT sequence_no FROM batch_history LIMIT 0";
         cmd.ExecuteReader();                                                 // throws if column missing
-        Assert.Equal(AgentDatabase.CurrentSchemaVersion, 2);
+        using var cmd2 = conn.CreateCommand();
+        cmd2.CommandText = "SELECT content_checksum FROM upload_batches LIMIT 0";
+        cmd2.ExecuteReader();                                                // v3 column present
+        Assert.Equal(3, AgentDatabase.CurrentSchemaVersion);
     }
 }

@@ -29,7 +29,7 @@ public sealed class SyncEngine(
     BatchBuilder batchBuilder,
     CheckpointRepository checkpoints,
     BatchQueueRepository queue,
-    ErrorLogRepository errors,
+    ErrorReporter reporter,
     AgentDatabase db,
     ILogger<SyncEngine> log)
 {
@@ -50,12 +50,32 @@ public sealed class SyncEngine(
             CurrentOperation = "preflight";
             CheckDiskSpace();
 
+            // Force Full Sync with a configured company: reset the checkpoint
+            // BEFORE the probe, so the request survives even if Tally happens to
+            // be closed right now (a likely moment when someone is fiddling).
+            if (mode == "full-forced" && !string.IsNullOrWhiteSpace(config.Tally.Company))
+                ResetVoucherCheckpoint(config.Tally.Company);
+
             var probe = await tally.ProbeAsync(ct);
             if (!probe.Ok)
             {
+                if (mode == "full-forced" && string.IsNullOrWhiteSpace(config.Tally.Company))
+                {
+                    // Auto-discover company: the reset hasn't happened yet — re-arm
+                    // the trigger so the request isn't silently lost.
+                    try
+                    {
+                        File.WriteAllText(Path.Combine(AgentInfo.TriggerDir, "force-full.trigger"),
+                            DateTime.UtcNow.ToString("O"));
+                    }
+                    catch { /* best effort */ }
+                }
                 var category = probe.Category ?? ErrorCategory.TallyNotRunning;
-                errors.Insert(category, ErrorSeverity.Error, probe.Error ?? "Tally probe failed",
-                    operation: "preflight");
+                // Routed through ErrorReporter (C6): repeated Tally-down cycles are
+                // grouped into digests; the reporter also owns critical dispatch.
+                await reporter.ReportAsync(category, ErrorSeverity.Error,
+                    probe.Error ?? "Tally probe failed",
+                    operation: "preflight", ct: CancellationToken.None);
                 RecordRunFinish(syncId, "failed", 0, probe.Error);
                 return new SyncResult(syncId, "failed", 0, 0, 0, [probe.Error ?? "Tally unavailable"]);
             }
@@ -65,7 +85,34 @@ public sealed class SyncEngine(
             log.LogInformation("Sync {SyncId} ({Mode}) starting: company='{Company}', {N} datasets",
                 syncId, mode, company, enabled.Count);
 
+            // Force Full Sync (auto-discover path; idempotent when already reset above).
+            if (mode == "full-forced")
+                ResetVoucherCheckpoint(company);
+
+            // ── AlterID change gate (best-effort; null ⇒ always extract) ──
+            // ALTMSTID/ALTVCHID are company-wide watermarks bumped on any master/
+            // voucher create-edit-delete. When unchanged since the last successful
+            // cycle, the corresponding phase is skipped entirely — this is the
+            // single biggest idle-load reduction for quiet companies. Gating only
+            // applies to steady-state incremental cycles.
+            (long Masters, long Vouchers)? alterIds = null;
+            if (mode == "incremental")
+            {
+                try { alterIds = await tally.GetCompanyAlterIdsAsync(ct); }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    log.LogDebug("AlterID gate unavailable ({Msg}) — extracting unconditionally", ex.Message);
+                }
+            }
+            var mastersUnchanged = alterIds is { } a1 &&
+                checkpoints.Get("_alter_gate_masters", company)?.LastAlterId == a1.Masters;
+            var vouchersUnchanged = alterIds is { } a2 &&
+                checkpoints.Get("_alter_gate_vouchers", company)?.LastAlterId == a2.Vouchers;
+
             // ── Masters & snapshots (cheap full re-extract each cycle) ──
+            if (mastersUnchanged && vouchersUnchanged)
+                log.LogInformation("AlterID gate: no master or voucher changes — skipping masters/snapshots");
+            else
             foreach (var ds in enabled.Where(d => d.Kind is DatasetKind.Master or DatasetKind.Snapshot))
             {
                 ct.ThrowIfCancellationRequested();
@@ -80,22 +127,56 @@ public sealed class SyncEngine(
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     failed++;
-                    HandleDatasetError(ds.Name, ex, ref errorList);
+                    await HandleDatasetErrorAsync(ds.Name, ex, errorList);
                 }
             }
 
             // ── Vouchers (windowed Day Book fan-out) ───────────────
             if (enabled.Any(d => d.Kind == DatasetKind.Voucher))
             {
-                var windows = PlanVoucherWindows(company);
-                if (windows.Count > 0)
+                var plan = PlanVouchers(company);
+                // AlterID gate first: when ALTVCHID is unchanged, Tally itself
+                // asserts no voucher was created/edited/deleted — including during
+                // any apparent "gap" — so skipping is safe and the checkpoint is
+                // advanced to today to keep the planner's high-water mark moving.
+                // (Without the advance, an idle company would raise a false
+                // "extraction gap" alert every lookback+2 days, forever.)
+                var skipVouchers = vouchersUnchanged && !plan.IsFullSync;
+                if (skipVouchers)
+                {
+                    log.LogInformation("AlterID gate: no voucher changes — skipping voucher extraction");
+                    var todayD = DateOnly.FromDateTime(DateTime.Today);
+                    AdvanceVoucherWindowCheckpoint(company, todayD, todayD);
+                }
+                else if (plan.RecoveredGapDays > 0)
+                {
+                    // A real outage longer than the lookback: the planner is
+                    // re-extracting the missed days. Surface it — silent gaps were
+                    // the old (data-losing) behaviour.
+                    log.LogWarning(
+                        "Recovering {Days}-day extraction gap beyond the {Lookback}-day lookback " +
+                        "(agent or Tally was unavailable). Missed days are being re-extracted.",
+                        plan.RecoveredGapDays, config.Tally.IncrementalLookbackDays);
+                    await reporter.ReportAsync(ErrorCategory.ServiceStopped, ErrorSeverity.Warning,
+                        $"Extraction gap of {plan.RecoveredGapDays} day(s) beyond the lookback window " +
+                        "detected and recovered — verify the agent/Tally uptime.",
+                        operation: "plan:vouchers", ct: CancellationToken.None);
+                }
+
+                if (!skipVouchers && plan.Windows.Count > 0)
                 {
                     HashSet<string> bankLedgers;
                     try { bankLedgers = await reports.BankLedgerNames(ct); }
                     catch { bankLedgers = []; }
 
-                    foreach (var (from, to) in windows)
+                    // Adaptive windowing: a window that times out is split in half
+                    // and retried (down to single days) instead of being retried
+                    // at the same size forever — large companies/heavy months no
+                    // longer livelock the sync.
+                    var pending = new Queue<(DateOnly From, DateOnly To)>(plan.Windows);
+                    while (pending.Count > 0)
                     {
+                        var (from, to) = pending.Dequeue();
                         ct.ThrowIfCancellationRequested();
                         CurrentOperation = $"extract:vouchers {from:yyyy-MM-dd}..{to:yyyy-MM-dd}";
                         try
@@ -114,14 +195,37 @@ public sealed class SyncEngine(
                             AdvanceVoucherWindowCheckpoint(company, from, to);
                             ok++;
                         }
+                        catch (TallyException tex) when (
+                            tex.Category == ErrorCategory.TallyTimeout && to > from)
+                        {
+                            var mid = from.AddDays((to.DayNumber - from.DayNumber) / 2);
+                            log.LogWarning(
+                                "Window {From}..{To} timed out — splitting into {From}..{Mid} and {MidNext}..{To}",
+                                from, to, mid, mid.AddDays(1));
+                            var rest = pending.ToList();
+                            pending.Clear();
+                            pending.Enqueue((from, mid));
+                            pending.Enqueue((mid.AddDays(1), to));
+                            foreach (var w in rest) pending.Enqueue(w);
+                        }
                         catch (Exception ex) when (ex is not OperationCanceledException)
                         {
                             failed++;
-                            HandleDatasetError($"vouchers[{from:yyyy-MM-dd}..{to:yyyy-MM-dd}]", ex, ref errorList);
+                            await HandleDatasetErrorAsync($"vouchers[{from:yyyy-MM-dd}..{to:yyyy-MM-dd}]", ex, errorList);
                             break; // windows are sequential; resume from checkpoint next cycle
                         }
                     }
                 }
+            }
+
+            // Advance the AlterID gate watermarks only after a fully successful cycle
+            // (any failure leaves them unchanged so the next cycle re-extracts).
+            if (alterIds is { } finalIds && failed == 0)
+            {
+                checkpoints.Upsert(new SyncCheckpoint("_alter_gate_masters", company,
+                    null, null, finalIds.Masters, DateTime.UtcNow.ToString("O"), true));
+                checkpoints.Upsert(new SyncCheckpoint("_alter_gate_vouchers", company,
+                    null, null, finalIds.Vouchers, DateTime.UtcNow.ToString("O"), true));
             }
 
             var status = failed == 0 ? "success" : ok > 0 ? "partial" : "failed";
@@ -138,8 +242,8 @@ public sealed class SyncEngine(
         }
         catch (Exception ex)
         {
-            errors.Insert(ErrorCategory.UnexpectedException, ErrorSeverity.Critical,
-                ex.Message, ex.StackTrace, operation: CurrentOperation);
+            await reporter.ReportAsync(ErrorCategory.UnexpectedException, ErrorSeverity.Critical,
+                ex.Message, ex.StackTrace, operation: CurrentOperation, ct: CancellationToken.None);
             RecordRunFinish(syncId, "failed", totalRows, ex.Message);
             return new SyncResult(syncId, "failed", ok, failed + 1, totalRows, [ex.Message]);
         }
@@ -158,39 +262,20 @@ public sealed class SyncEngine(
     {
         var today = DateOnly.FromDateTime(DateTime.Today);
         var cp = checkpoints.Get("_vouchers_window", company);
-        var windows = new List<(DateOnly, DateOnly)>();
-
-        if (cp is not { FullSyncDone: true })
-        {
-            // Initial full sync (possibly resuming)
-            var start = ResolveExtractionStart(cp);
-            var chunk = Math.Max(1, config.Tally.FullSyncChunkDays);
-            for (var from = start; from <= today; from = from.AddDays(chunk))
-            {
-                var to = from.AddDays(chunk - 1);
-                if (to > today) to = today;
-                windows.Add((from, to));
-            }
-        }
-        else
-        {
-            var lookback = Math.Max(0, config.Tally.IncrementalLookbackDays);
-            windows.Add((today.AddDays(-lookback), today));
-        }
-        return windows;
+        return SyncPlanner.PlanVoucherWindows(config.Tally, cp, today).Windows;
     }
 
-    private DateOnly ResolveExtractionStart(SyncCheckpoint? cp)
+    /// <summary>Checkpoint-aware voucher planning (SyncPlanner is the pure core).</summary>
+    public VoucherPlan PlanVouchers(string company) =>
+        SyncPlanner.PlanVoucherWindows(config.Tally,
+            checkpoints.Get("_vouchers_window", company),
+            DateOnly.FromDateTime(DateTime.Today));
+
+    private void ResetVoucherCheckpoint(string company)
     {
-        // Resume after crash: continue from day after last completed window
-        if (cp?.LastToDate is { } lastTo && DateOnly.TryParse(lastTo, out var resume))
-            return resume.AddDays(1);
-        if (DateOnly.TryParse(config.Tally.ExtractionStartDate, out var configured))
-            return configured;
-        // Default: start of current financial year (April 1, India)
-        var today = DateOnly.FromDateTime(DateTime.Today);
-        var fyYear = today.Month >= 4 ? today.Year : today.Year - 1;
-        return new DateOnly(fyYear, 4, 1);
+        checkpoints.Upsert(new SyncCheckpoint("_vouchers_window", company,
+            null, null, null, null, FullSyncDone: false));
+        log.LogWarning("Force Full Sync — voucher checkpoint reset for '{Company}'", company);
     }
 
     private void AdvanceVoucherWindowCheckpoint(string company, DateOnly from, DateOnly to)
@@ -253,6 +338,7 @@ public sealed class SyncEngine(
         yield return ("sales_register", r.SalesRegister);
         yield return ("purchase_register", r.PurchaseRegister);
         yield return ("sales_invoice_lines", r.SalesInvoiceLines);
+        yield return ("voucher_guid_manifest", r.Manifest);
     }
 
     // ── persistence helpers ───────────────────────────────────────
@@ -291,12 +377,15 @@ public sealed class SyncEngine(
                 $"(limit {config.Advanced.QueueDiskLimitMb} MB). Uploads must drain before extracting more.");
     }
 
-    private void HandleDatasetError(string dataset, Exception ex, ref List<string> errorList)
+    private async Task HandleDatasetErrorAsync(string dataset, Exception ex, List<string> errorList)
     {
         var category = ex is TallyException tex ? tex.Category : ErrorCategory.UnexpectedException;
         var severity = category == ErrorCategory.DiskSpaceLow ? ErrorSeverity.Critical : ErrorSeverity.Error;
-        errors.Insert(category, severity, ex.Message, ex.StackTrace,
-            operation: CurrentOperation, dataset: dataset);
+        // ErrorReporter logs locally AND dispatches criticals immediately (with
+        // per-group cooldown); non-criticals join the periodic digest. Previously
+        // these rows went straight to error_log and criticals were never alerted.
+        await reporter.ReportAsync(category, severity, ex.Message, ex.StackTrace,
+            operation: CurrentOperation, dataset: dataset, ct: CancellationToken.None);
         errorList.Add($"{dataset}: {ex.Message}");
         log.LogError(ex, "Dataset {Dataset} failed", dataset);
     }

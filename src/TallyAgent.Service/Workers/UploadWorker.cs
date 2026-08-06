@@ -58,6 +58,32 @@ public sealed class UploadWorker(
                 continue;
             }
 
+            // Verify the transport checksum before shipping — a corrupted payload
+            // (disk fault, partial write) must never reach the cloud.
+            try
+            {
+                string actual;
+                using (var fs = File.OpenRead(batch.PayloadPath))
+                    actual = Convert.ToHexString(
+                        System.Security.Cryptography.SHA256.HashData(fs)).ToLowerInvariant();
+                if (!string.Equals(actual, batch.ChecksumSha256, StringComparison.OrdinalIgnoreCase))
+                {
+                    log.LogError("Checksum mismatch for batch {BatchId} — marking failed", batch.BatchId);
+                    queue.MarkFailed(batch.BatchId,
+                        $"Payload checksum mismatch (expected {batch.ChecksumSha256[..12]}…, got {actual[..12]}…)");
+                    await errors.ReportAsync(ErrorCategory.LocalDatabaseFailure, ErrorSeverity.Critical,
+                        $"Batch {batch.BatchId} payload corrupted on disk (checksum mismatch).",
+                        dataset: batch.Dataset, batchId: batch.BatchId, ct: CancellationToken.None);
+                    continue;
+                }
+            }
+            catch (IOException ex)
+            {
+                queue.ScheduleRetry(batch.BatchId, $"Payload read failed: {ex.Message}",
+                    TimeSpan.FromMinutes(1));
+                continue;
+            }
+
             try
             {
                 var resp = await api.UploadBatchAsync(batch, ct);

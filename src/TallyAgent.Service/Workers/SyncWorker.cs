@@ -21,8 +21,6 @@ public sealed class SyncWorker(
     AgentState state,
     ILogger<SyncWorker> log) : BackgroundService
 {
-    private static string TriggerPath => Path.Combine(AgentInfo.TriggerDir, "sync-now.trigger");
-
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
         log.LogInformation("SyncWorker started: every {N} min, lookback {L} days",
@@ -36,7 +34,8 @@ public sealed class SyncWorker(
 
         while (!ct.IsCancellationRequested)
         {
-            var manual = ConsumeTrigger();
+            var forceFull = ConsumeTrigger("force-full");
+            var manual = ConsumeTrigger("sync-now") || forceFull;
             if (DateTime.UtcNow >= nextRun || manual)
             {
                 nextRun = DateTime.UtcNow + interval;
@@ -47,7 +46,8 @@ public sealed class SyncWorker(
                     state.TallyConnected = probe.Ok || probe.Category == Core.Notifications.ErrorCategory.TallyCompanyNotOpen;
                     state.TallyCompanyOpen = probe.Ok;
 
-                    var mode = manual ? "manual"
+                    var mode = forceFull ? "full-forced"
+                        : manual ? "manual"
                         : checkpoints.Get("_vouchers_window", ResolvedCompany(probe)) is { FullSyncDone: true }
                             ? "incremental" : "full";
                     state.CurrentOperation = $"sync ({mode})";
@@ -79,13 +79,14 @@ public sealed class SyncWorker(
         !string.IsNullOrWhiteSpace(config.Tally.Company) ? config.Tally.Company
         : probe.Companies.Count > 0 ? probe.Companies[0] : "";
 
-    private bool ConsumeTrigger()
+    private bool ConsumeTrigger(string name)
     {
         try
         {
-            if (!File.Exists(TriggerPath)) return false;
-            File.Delete(TriggerPath);
-            log.LogInformation("Manual sync trigger received");
+            var path = Path.Combine(AgentInfo.TriggerDir, $"{name}.trigger");
+            if (!File.Exists(path)) return false;
+            File.Delete(path);
+            log.LogInformation("Trigger '{Name}' received", name);
             return true;
         }
         catch { return false; }

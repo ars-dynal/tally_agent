@@ -40,9 +40,13 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
     public async Task<List<Row>> Groups(CancellationToken ct)
     {
         var doc = await FetchCollection("Group",
-            ["NAME","PARENT","ISREVENUE","ISDEEMEDPOSITIVE","ISSUBLEDGER"], ct);
+            [
+            "GUID","MASTERID","ALTERID","NAME","PARENT","ISREVENUE","ISDEEMEDPOSITIVE","ISSUBLEDGER"], ct);
         var rows = doc.Descendants("GROUP").Select(el => new Row
         {
+            ["master_guid"] = Text(el, "GUID"),
+            ["master_id"] = Int(el, "MASTERID"),
+            ["alter_id"] = Int(el, "ALTERID"),
             ["group_name"] = Text(el, "NAME"),
             ["parent"] = Text(el, "PARENT"),
             ["is_revenue"] = Bool(el, "ISREVENUE"),
@@ -56,6 +60,7 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
     public async Task<List<Row>> Ledgers(CancellationToken ct)
     {
         var doc = await FetchCollection("Ledger", [
+            "GUID","MASTERID","ALTERID",
             "NAME","PARENT","OPENINGBALANCE","CLOSINGBALANCE","PARTYGSTIN","GSTIN",
             "GSTREGISTRATIONNUMBER","INCOMETAXNUMBER","LEDSTATENAME","COUNTRYNAME","ADDRESS",
             "PINCODE","LEDGERMOBILE","LEDGERPHONE","EMAIL","LEDGERCONTACT","BANKACCOUNTNUMBER",
@@ -68,7 +73,10 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
             if (gstin.Length == 0) gstin = Text(el, "GSTREGISTRATIONNUMBER");
             rows.Add(new Row
             {
-                ["ledger_name"] = Text(el, "NAME"),
+                ["master_guid"] = Text(el, "GUID"),
+            ["master_id"] = Int(el, "MASTERID"),
+            ["alter_id"] = Int(el, "ALTERID"),
+            ["ledger_name"] = Text(el, "NAME"),
                 ["parent_group"] = Text(el, "PARENT"),
                 ["opening_balance"] = Num(el, "OPENINGBALANCE"),
                 ["closing_balance"] = Num(el, "CLOSINGBALANCE"),
@@ -97,9 +105,13 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
     public async Task<List<Row>> VoucherTypes(CancellationToken ct)
     {
         var doc = await FetchCollection("VoucherType",
-            ["NAME","PARENT","ADDITIONALNAME","NUMBERINGMETHOD"], ct);
+            [
+            "GUID","MASTERID","ALTERID","NAME","PARENT","ADDITIONALNAME","NUMBERINGMETHOD"], ct);
         return doc.Descendants("VOUCHERTYPE").Select(el => new Row
         {
+            ["master_guid"] = Text(el, "GUID"),
+            ["master_id"] = Int(el, "MASTERID"),
+            ["alter_id"] = Int(el, "ALTERID"),
             ["voucher_type_name"] = Text(el, "NAME"),
             ["parent"] = Text(el, "PARENT"),
             ["alias"] = Text(el, "ADDITIONALNAME"),
@@ -109,9 +121,13 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
 
     public async Task<List<Row>> CostCentres(CancellationToken ct)
     {
-        var doc = await FetchCollection("CostCentre", ["NAME","PARENT","CATEGORY"], ct);
+        var doc = await FetchCollection("CostCentre", [
+            "GUID","MASTERID","ALTERID","NAME","PARENT","CATEGORY"], ct);
         return doc.Descendants("COSTCENTRE").Select(el => new Row
         {
+            ["master_guid"] = Text(el, "GUID"),
+            ["master_id"] = Int(el, "MASTERID"),
+            ["alter_id"] = Int(el, "ALTERID"),
             ["cost_centre_name"] = Text(el, "NAME"),
             ["parent"] = Text(el, "PARENT"),
             ["category"] = Text(el, "CATEGORY"),
@@ -120,18 +136,26 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
 
     public async Task<List<Row>> CostCategories(CancellationToken ct)
     {
-        var doc = await FetchCollection("CostCategory", ["NAME"], ct);
+        var doc = await FetchCollection("CostCategory", [
+            "GUID","MASTERID","ALTERID","NAME"], ct);
         return doc.Descendants("COSTCATEGORY")
-            .Select(el => new Row { ["category_name"] = Text(el, "NAME") })
+            .Select(el => new Row { ["master_guid"] = Text(el, "GUID"),
+            ["master_id"] = Int(el, "MASTERID"),
+            ["alter_id"] = Int(el, "ALTERID"),
+            ["category_name"] = Text(el, "NAME") })
             .ToList();
     }
 
     public async Task<List<Row>> Currencies(CancellationToken ct)
     {
         var doc = await FetchCollection("Currency",
-            ["NAME","MAILINGNAME","EXPANDEDSYMBOL","DECIMALPLACES"], ct);
+            [
+            "GUID","MASTERID","ALTERID","NAME","MAILINGNAME","EXPANDEDSYMBOL","DECIMALPLACES"], ct);
         return doc.Descendants("CURRENCY").Select(el => new Row
         {
+            ["master_guid"] = Text(el, "GUID"),
+            ["master_id"] = Int(el, "MASTERID"),
+            ["alter_id"] = Int(el, "ALTERID"),
             ["currency_name"] = Text(el, "NAME"),
             ["symbol"] = Text(el, "EXPANDEDSYMBOL"),
             ["formal_name"] = Text(el, "MAILINGNAME"),
@@ -142,10 +166,14 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
     public async Task<List<Row>> Units(CancellationToken ct)
     {
         var doc = await FetchCollection("Unit", [
+            "GUID","MASTERID","ALTERID",
             "NAME","ORIGINALNAME","BASEUNITS","ADDITIONALUNITS","CONVERSION",
             "ISSIMPLEUNIT","DECIMALPLACES"], ct);
         return doc.Descendants("UNIT").Select(el => new Row
         {
+            ["master_guid"] = Text(el, "GUID"),
+            ["master_id"] = Int(el, "MASTERID"),
+            ["alter_id"] = Int(el, "ALTERID"),
             ["uom_name"] = Text(el, "NAME"),
             ["original_name"] = Text(el, "ORIGINALNAME"),
             ["base_units"] = Text(el, "BASEUNITS"),
@@ -158,9 +186,13 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
 
     public async Task<List<Row>> StockGroups(CancellationToken ct)
     {
-        var doc = await FetchCollection("StockGroup", ["NAME","PARENT"], ct);
+        var doc = await FetchCollection("StockGroup", [
+            "GUID","MASTERID","ALTERID","NAME","PARENT"], ct);
         return doc.Descendants("STOCKGROUP").Select(el => new Row
         {
+            ["master_guid"] = Text(el, "GUID"),
+            ["master_id"] = Int(el, "MASTERID"),
+            ["alter_id"] = Int(el, "ALTERID"),
             ["stock_group_name"] = Text(el, "NAME"),
             ["parent"] = Text(el, "PARENT"),
         }).ToList();
@@ -169,6 +201,7 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
     public async Task<List<Row>> StockItems(CancellationToken ct)
     {
         var doc = await FetchCollection("StockItem", [
+            "GUID","MASTERID","ALTERID",
             "NAME","PARENT","CATEGORY","BASEUNITS","OPENINGBALANCE","OPENINGVALUE",
             "OPENINGRATE","CLOSINGBALANCE","CLOSINGVALUE","CLOSINGRATE","GSTRATE",
             "HSNCODE","DESCRIPTION","ADDITIONALNAME"], ct);
@@ -179,7 +212,10 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
             if (name.Length == 0) continue;
             rows.Add(new Row
             {
-                ["item_name"] = name,
+                ["master_guid"] = Text(el, "GUID"),
+            ["master_id"] = Int(el, "MASTERID"),
+            ["alter_id"] = Int(el, "ALTERID"),
+            ["item_name"] = name,
                 ["parent_group"] = Text(el, "PARENT"),
                 ["category"] = Text(el, "CATEGORY"),
                 ["uom"] = Text(el, "BASEUNITS"),
@@ -202,9 +238,13 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
     public async Task<List<Row>> Godowns(CancellationToken ct)
     {
         var doc = await FetchCollection("Godown",
-            ["NAME","PARENT","ADDRESS","HASNOSPACE","HASNOSTOCK"], ct);
+            [
+            "GUID","MASTERID","ALTERID","NAME","PARENT","ADDRESS","HASNOSPACE","HASNOSTOCK"], ct);
         return doc.Descendants("GODOWN").Select(el => new Row
         {
+            ["master_guid"] = Text(el, "GUID"),
+            ["master_id"] = Int(el, "MASTERID"),
+            ["alter_id"] = Int(el, "ALTERID"),
             ["godown_name"] = Text(el, "NAME"),
             ["parent"] = Text(el, "PARENT"),
             ["address"] = Text(el, "ADDRESS"),
@@ -218,6 +258,7 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
     public async Task<List<Row>> GstRates(CancellationToken ct)
     {
         var doc = await FetchCollection("StockItem", [
+            "GUID","MASTERID","ALTERID",
             "NAME","GSTRATE","HSNCODE","GSTAPPLICABLE","GSTTYPEOFSUPPLY",
             "TAXCLASSIFICATIONNAME","GSTDETAILS.LIST"], ct);
         var rows = new List<Row>();
@@ -252,7 +293,10 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
 
             rows.Add(new Row
             {
-                ["item_name"] = name,
+                ["master_guid"] = Text(el, "GUID"),
+            ["master_id"] = Int(el, "MASTERID"),
+            ["alter_id"] = Int(el, "ALTERID"),
+            ["item_name"] = name,
                 ["gst_rate"] = rate,
                 ["hsn_code"] = hsn,
                 ["gst_applicable"] = gstApplicable,
@@ -267,7 +311,8 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
     public async Task<List<Row>> OpeningBills(CancellationToken ct)
     {
         var doc = await FetchCollection("Ledger",
-            ["NAME","BILLALLOCATIONS.LIST"], ct);
+            [
+            "GUID","MASTERID","ALTERID","NAME","BILLALLOCATIONS.LIST"], ct);
         var rows = new List<Row>();
         foreach (var el in doc.Descendants("LEDGER"))
         {
@@ -278,7 +323,10 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
                 if (billRef.Length == 0) continue;
                 rows.Add(new Row
                 {
-                    ["ledger_name"] = ledger,
+                    ["master_guid"] = Text(el, "GUID"),
+            ["master_id"] = Int(el, "MASTERID"),
+            ["alter_id"] = Int(el, "ALTERID"),
+            ["ledger_name"] = ledger,
                     ["bill_ref"] = billRef,
                     ["bill_type"] = Text(ba, "BILLTYPE"),
                     ["opening_amount"] = Num(ba, "OPENINGBALANCE"),
@@ -297,7 +345,8 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
 
     private async Task<List<Row>> StandardRates(string listTag, CancellationToken ct)
     {
-        var doc = await FetchCollection("StockItem", ["NAME", listTag], ct);
+        var doc = await FetchCollection("StockItem", [
+            "GUID","MASTERID","ALTERID","NAME", listTag], ct);
         var rows = new List<Row>();
         foreach (var el in doc.Descendants("STOCKITEM"))
         {
@@ -306,7 +355,10 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
             {
                 rows.Add(new Row
                 {
-                    ["item_name"] = item,
+                    ["master_guid"] = Text(el, "GUID"),
+            ["master_id"] = Int(el, "MASTERID"),
+            ["alter_id"] = Int(el, "ALTERID"),
+            ["item_name"] = item,
                     ["effective_date"] = Date(entry, "DATE"),
                     ["rate"] = Num(entry, "RATE"),
                 });

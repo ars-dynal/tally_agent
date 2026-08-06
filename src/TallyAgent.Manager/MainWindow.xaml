@@ -70,6 +70,7 @@
             <Button x:Name="StopBtn" Content="Stop Service" Click="StopService_Click"/>
             <Button x:Name="RestartBtn" Content="Restart Service" Click="RestartService_Click"/>
             <Button x:Name="SyncNowBtn" Content="Sync Now" Click="SyncNow_Click"/>
+            <Button x:Name="ForceFullBtn" Content="Force Full Sync" Click="ForceFull_Click"/>
             <Button x:Name="RetryBtn" Content="Retry Failed Batches" Click="RetryFailed_Click"/>
             <Button Content="Open Log Folder" Click="OpenLogs_Click"/>
             <Button Content="Export Diagnostics" Click="ExportDiag_Click"/>
