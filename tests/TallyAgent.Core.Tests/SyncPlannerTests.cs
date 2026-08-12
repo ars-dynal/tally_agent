@@ -15,27 +15,67 @@ public class SyncPlannerTests
     private static SyncCheckpoint Cp(string? lastTo, bool fullDone) =>
         new("_vouchers_window", "Co", null, lastTo, null, null, fullDone);
 
+    private static SyncCheckpoint NewestFirstCp(string lastFrom, string lastTo) =>
+        new("_vouchers_window", "Co", lastFrom, lastTo,
+            SyncPlanner.NewestFirstCheckpointMarker, null, false);
+
+    // ── full sync: newest-first ───────────────────────────────────
+
     [Fact]
-    public void FirstRun_PlansChunkedFullSync_FromConfiguredStart()
+    public void FirstRun_PlansNewestFirstFullSync_TodayBackToConfiguredStart()
     {
         var plan = SyncPlanner.PlanVoucherWindows(Settings(), null, Today);
         Assert.True(plan.IsFullSync);
-        Assert.Equal(new DateOnly(2026, 4, 1), plan.Windows[0].From);
-        Assert.Equal(Today, plan.Windows[^1].To);
+        Assert.Equal(new DateOnly(2026, 4, 1), plan.TargetStart);
+
+        // Newest window first, oldest last.
+        Assert.Equal(Today, plan.Windows[0].To);
+        Assert.Equal(new DateOnly(2026, 4, 1), plan.Windows[^1].From);
+
+        Assert.All(plan.Windows, w => Assert.True(w.From <= w.To));
         Assert.All(plan.Windows, w => Assert.True(
             w.To.DayNumber - w.From.DayNumber + 1 <= 31, "chunk exceeded 31 days"));
-        // windows are contiguous
+
+        // Windows are contiguous going backwards with no gaps or overlaps.
         for (var i = 1; i < plan.Windows.Count; i++)
-            Assert.Equal(plan.Windows[i - 1].To.AddDays(1), plan.Windows[i].From);
+            Assert.Equal(plan.Windows[i - 1].From.AddDays(-1), plan.Windows[i].To);
     }
 
     [Fact]
-    public void InterruptedFullSync_ResumesFromDayAfterCheckpoint()
+    public void InterruptedNewestFirstFullSync_ResumesBackwardsFromFrontier()
     {
-        var plan = SyncPlanner.PlanVoucherWindows(Settings(), Cp("2026-05-31", fullDone: false), Today);
+        // Walk got down to 2026-06-01 before the interruption: next windows
+        // continue at 2026-05-31 going backwards; nothing newer is re-planned.
+        var plan = SyncPlanner.PlanVoucherWindows(
+            Settings(), NewestFirstCp("2026-06-01", "2026-07-30"), Today);
         Assert.True(plan.IsFullSync);
-        Assert.Equal(new DateOnly(2026, 6, 1), plan.Windows[0].From);
+        Assert.Equal(new DateOnly(2026, 5, 31), plan.Windows[0].To);
+        Assert.Equal(new DateOnly(2026, 4, 1), plan.Windows[^1].From);
     }
+
+    [Fact]
+    public void NewestFirstFullSync_FrontierAtTarget_PlansNothing()
+    {
+        var plan = SyncPlanner.PlanVoucherWindows(
+            Settings(), NewestFirstCp("2026-04-01", "2026-07-30"), Today);
+        Assert.True(plan.IsFullSync);
+        Assert.Empty(plan.Windows);
+    }
+
+    [Fact]
+    public void LegacyForwardCheckpoint_IsIgnored_AndWalkRestartsNewestFirst()
+    {
+        // Old (pre-v2.0.2) full-sync checkpoints walked forward; they cannot be
+        // resumed backwards, so the planner restarts (batch dedup absorbs the
+        // re-extraction cost).
+        var legacy = Cp("2026-05-31", fullDone: false);
+        var plan = SyncPlanner.PlanVoucherWindows(Settings(), legacy, Today);
+        Assert.True(plan.IsFullSync);
+        Assert.Equal(Today, plan.Windows[0].To);
+        Assert.Equal(new DateOnly(2026, 4, 1), plan.Windows[^1].From);
+    }
+
+    // ── incremental (unchanged, forward) ──────────────────────────
 
     [Fact]
     public void SteadyState_Incremental_CoversLookbackWindow()
@@ -43,6 +83,7 @@ public class SyncPlannerTests
         // Checkpoint is current (yesterday) — plain lookback window, no gap.
         var plan = SyncPlanner.PlanVoucherWindows(Settings(lookback: 7), Cp("2026-07-29", fullDone: true), Today);
         Assert.False(plan.IsFullSync);
+        Assert.Null(plan.TargetStart);
         Assert.Equal(0, plan.RecoveredGapDays);
         Assert.Equal(Today.AddDays(-7), plan.Windows[0].From);
         Assert.Equal(Today, plan.Windows[^1].To);
@@ -83,9 +124,9 @@ public class SyncPlannerTests
     public void NoConfiguredStart_DefaultsToFinancialYearStart()
     {
         var plan = SyncPlanner.PlanVoucherWindows(Settings(start: ""), null, Today);
-        Assert.Equal(new DateOnly(2026, 4, 1), plan.Windows[0].From);
+        Assert.Equal(new DateOnly(2026, 4, 1), plan.Windows[^1].From);
         var febPlan = SyncPlanner.PlanVoucherWindows(Settings(start: ""), null, new DateOnly(2026, 2, 10));
-        Assert.Equal(new DateOnly(2025, 4, 1), febPlan.Windows[0].From); // FY rolls back before April
+        Assert.Equal(new DateOnly(2025, 4, 1), febPlan.Windows[^1].From); // FY rolls back before April
     }
 
     [Fact]

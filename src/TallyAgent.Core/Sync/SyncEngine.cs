@@ -193,7 +193,7 @@ public sealed class SyncEngine(
                                 EnqueueAndCheckpoint(name, company, syncId, rows, wf, wt,
                                     fullDone: false);
                             }
-                            AdvanceVoucherWindowCheckpoint(company, from, to);
+                            AdvanceVoucherWindowCheckpoint(company, from, to, plan.TargetStart);
                             ok++;
                         }
                         catch (TallyException tex) when (
@@ -212,8 +212,18 @@ public sealed class SyncEngine(
 
                             var rest = pending.ToList();
                             pending.Clear();
-                            pending.Enqueue((from, mid));
-                            pending.Enqueue((secondFrom, to));
+                            if (plan.TargetStart is not null)
+                            {
+                                // Newest-first walk: extract the newer half first.
+                                pending.Enqueue((secondFrom, to));
+                                pending.Enqueue((from, mid));
+                            }
+                            else
+                            {
+                                // Forward incremental: keep chronological order.
+                                pending.Enqueue((from, mid));
+                                pending.Enqueue((secondFrom, to));
+                            }
                             foreach (var w in rest) pending.Enqueue(w);
                         }
                         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -281,16 +291,37 @@ public sealed class SyncEngine(
         log.LogWarning("Force Full Sync — voucher checkpoint reset for '{Company}'", company);
     }
 
-    private void AdvanceVoucherWindowCheckpoint(string company, DateOnly from, DateOnly to)
+    private void AdvanceVoucherWindowCheckpoint(string company, DateOnly from, DateOnly to,
+        DateOnly? fullSyncTarget = null)
     {
-        var today = DateOnly.FromDateTime(DateTime.Today);
         var existing = checkpoints.Get("_vouchers_window", company);
+
+        if (fullSyncTarget is { } target)
+        {
+            // Newest-first history walk: LastFromDate is the backward frontier
+            // (oldest date extracted so far), LastToDate the newest covered date.
+            // The walk is complete when the frontier reaches the target start.
+            var existingFrom = SyncPlanner.TryParseIsoDate(existing?.LastFromDate);
+            var existingTo = SyncPlanner.TryParseIsoDate(existing?.LastToDate);
+            var frontier = existingFrom is { } ef && ef < from ? ef : from;
+            var top = existingTo is { } et && et > to ? et : to;
+            checkpoints.Upsert(new SyncCheckpoint(
+                "_vouchers_window", company,
+                frontier.ToString("yyyy-MM-dd"),
+                top.ToString("yyyy-MM-dd"),
+                SyncPlanner.NewestFirstCheckpointMarker,
+                DateTime.UtcNow.ToString("O"),
+                FullSyncDone: frontier <= target));
+            return;
+        }
+
+        var today = DateOnly.FromDateTime(DateTime.Today);
         var fullDone = (existing?.FullSyncDone ?? false) || to >= today;
         checkpoints.Upsert(new SyncCheckpoint(
             "_vouchers_window", company,
             existing?.LastFromDate ?? from.ToString("yyyy-MM-dd"),
             to.ToString("yyyy-MM-dd"),
-            null, DateTime.UtcNow.ToString("O"), fullDone));
+            existing?.LastAlterId, DateTime.UtcNow.ToString("O"), fullDone));
     }
 
     // ── extraction dispatch ───────────────────────────────────────
