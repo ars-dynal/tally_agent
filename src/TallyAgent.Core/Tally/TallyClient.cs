@@ -11,12 +11,12 @@ public sealed record TallyProbeResult(bool Ok, IReadOnlyList<string> Companies, 
     ErrorCategory? Category = null);
 
 /// <summary>
-/// HTTP transport to the local TallyPrime XML server with categorized failures
-/// and bounded retries (10s / 30s / 60s backoff).
+/// HTTP transport to the local TallyPrime XML server with categorized failures,
+/// bounded timeout retries and bounded auto-reconnect for temporary server drops.
 /// </summary>
 public sealed class TallyClient
 {
-    private static readonly TimeSpan[] RetryBackoff =
+    private static readonly TimeSpan[] TimeoutRetryBackoff =
         [TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(60)];
 
     private readonly HttpClient _http;
@@ -84,7 +84,6 @@ public sealed class TallyClient
         }
     }
 
-    /// <summary>POST an envelope with bounded retries; parses + sanitizes the response.</summary>
     /// <summary>POST an envelope and return the RAW sanitized response text —
     /// used by the capture-xml diagnostics verb to persist real Tally responses
     /// as validation fixtures (ARCHITECTURE §8.4 extraction-validation gate).</summary>
@@ -113,28 +112,54 @@ public sealed class TallyClient
         return null;
     }
 
+    /// <summary>
+    /// POST an envelope with two resilience modes:
+    ///  • slow/heavy request timeout: retry 10s/30s/60s, then return TallyTimeout
+    ///    so the SyncEngine can split the voucher window;
+    ///  • Tally temporarily unreachable: keep probing the same request at a
+    ///    bounded interval for up to reconnectMaxMinutes, then continue exactly
+    ///    where the sync stopped when Tally comes back.
+    /// </summary>
     public async Task<XDocument> PostAsync(string envelope, CancellationToken ct = default)
     {
-        TallyException? last = null;
-        for (var attempt = 0; attempt <= RetryBackoff.Length; attempt++)
+        var reconnectDeadline = DateTime.UtcNow.AddMinutes(Math.Max(1, _settings.ReconnectMaxMinutes));
+        var reconnectDelay = TimeSpan.FromSeconds(Math.Max(5, _settings.ReconnectRetrySeconds));
+        var timeoutAttempt = 0;
+
+        while (true)
         {
             try
             {
                 return await PostOnceAsync(envelope, ct);
             }
-            catch (TallyException tex) when (tex.Category is ErrorCategory.TallyTimeout
-                or ErrorCategory.TallyNotRunning or ErrorCategory.TallyPortUnavailable)
+            catch (TallyException tex) when (tex.Category == ErrorCategory.TallyTimeout)
             {
-                last = tex;
-                if (attempt < RetryBackoff.Length)
+                if (timeoutAttempt >= TimeoutRetryBackoff.Length)
+                    throw;
+
+                var delay = TimeoutRetryBackoff[timeoutAttempt++];
+                _log.LogWarning("Tally request timed out (attempt {N}): {Msg} — retrying in {Delay}s",
+                    timeoutAttempt, tex.Message, delay.TotalSeconds);
+                await Task.Delay(delay, ct);
+            }
+            catch (TallyException tex) when (tex.Category is ErrorCategory.TallyNotRunning
+                or ErrorCategory.TallyPortUnavailable)
+            {
+                if (DateTime.UtcNow >= reconnectDeadline)
                 {
-                    _log.LogWarning("Tally request failed (attempt {N}): {Msg} — retrying in {Delay}s",
-                        attempt + 1, tex.Message, RetryBackoff[attempt].TotalSeconds);
-                    await Task.Delay(RetryBackoff[attempt], ct);
+                    _log.LogError("Tally did not recover within {Minutes} minute(s); preserving checkpoint for resume",
+                        Math.Max(1, _settings.ReconnectMaxMinutes));
+                    throw;
                 }
+
+                timeoutAttempt = 0;
+                var remaining = Math.Max(0, (int)Math.Ceiling((reconnectDeadline - DateTime.UtcNow).TotalMinutes));
+                _log.LogWarning(
+                    "Tally connection dropped: {Msg} — auto-reconnect in {Delay}s (up to {Remaining} min remaining)",
+                    tex.Message, reconnectDelay.TotalSeconds, remaining);
+                await Task.Delay(reconnectDelay, ct);
             }
         }
-        throw last!;
     }
 
     private async Task<XDocument> PostOnceAsync(string envelope, CancellationToken ct)
