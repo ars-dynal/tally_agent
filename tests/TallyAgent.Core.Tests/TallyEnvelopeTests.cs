@@ -23,8 +23,14 @@ public sealed class TallyEnvelopeTests
         // collection must stay period-bound via SVFROMDATE/SVTODATE only.
         Assert.DoesNotContain("<FILTER>", xml);
         Assert.DoesNotContain("##SVFromDate", xml);
-        Assert.Contains("ALLLEDGERENTRIES.*", xml);
-        Assert.Contains("ALLINVENTORYENTRIES.*", xml);
+        // Wildcard sub-object fetches made Tally serialize every nested field
+        // (huge XML, frozen UI). Only the explicit dotted fields the extractor
+        // actually reads may be requested.
+        Assert.DoesNotContain(".*", xml);
+        Assert.Contains("ALLLEDGERENTRIES.LEDGERNAME", xml);
+        Assert.Contains("ALLLEDGERENTRIES.BILLALLOCATIONS.NAME", xml);
+        Assert.Contains("ALLINVENTORYENTRIES.STOCKITEMNAME", xml);
+        Assert.Contains("ALLINVENTORYENTRIES.BATCHALLOCATIONS.GODOWNNAME", xml);
     }
 
     [Fact]

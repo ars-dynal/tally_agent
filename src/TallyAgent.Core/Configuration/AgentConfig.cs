@@ -31,6 +31,11 @@ public sealed class TallySettings
     [JsonPropertyName("reconnectMaxMinutes")] public int ReconnectMaxMinutes { get; set; } = 30;
     /// <summary>Delay between Tally reachability probes while auto-reconnecting.</summary>
     [JsonPropertyName("reconnectRetrySeconds")] public int ReconnectRetrySeconds { get; set; } = 30;
+    /// <summary>Pause between voucher window extractions so the Tally UI gets
+    /// breathing room during a long history walk. Tally's XML server shares the
+    /// application thread — while a request runs, operators feel it; the gap
+    /// between requests is when the UI catches up. 0 disables the pause.</summary>
+    [JsonPropertyName("windowPauseSeconds")] public int WindowPauseSeconds { get; set; } = 3;
     [JsonPropertyName("autoDiscoverCompanies")] public bool AutoDiscoverCompanies { get; set; } = true;
     [JsonPropertyName("enableMasters")] public bool EnableMasters { get; set; } = true;
     [JsonPropertyName("enableVouchers")] public bool EnableVouchers { get; set; } = true;

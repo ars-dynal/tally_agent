@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.0.3 — Low-impact extraction (Tally stays usable during sync)
+
+Response to live feedback: clicking Force Full Sync made the interactive Tally
+session noticeably slow for operators. Techniques adopted from the proven
+open-source tally-database-loader project (dhananjay1405), which reports
+~2x extraction performance and 40% lower RAM use inside Tally with the same
+change.
+
+* **Explicit dotted FETCH fields for vouchers**: the collection previously
+  requested `ALLLEDGERENTRIES.*`, `ALLINVENTORYENTRIES.*`,
+  `BILLALLOCATIONS.*`, ... which makes Tally serialize EVERY field of EVERY
+  nested object (deep GST/tax structures included) even though the agent reads
+  ~30 fields. The request now lists exactly the fields the extractor consumes —
+  far less CPU and RAM inside Tally per window and much smaller XML responses.
+* **Breathing gap between windows**: new `tally.windowPauseSeconds` (default 3)
+  pauses between voucher windows. Tally's XML server shares the application
+  thread, so operators feel each request; the gaps are when their screens catch
+  up. Set to 0 for fastest wall-clock completion (e.g. overnight runs).
+* Reality check: Tally will always slow somewhat WHILE a request is being
+  served — that is Tally's architecture, not the agent's. The changes shrink
+  each request and add recovery gaps; running big backfills after hours is
+  still the smoothest option.
+
 ## 2.0.2 — Resilient newest-first backfill
 
 Diagnosed from the 2026-08-12 15:07 live Force Full Sync: every voucher window

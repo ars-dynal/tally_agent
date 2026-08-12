@@ -195,6 +195,13 @@ public sealed class SyncEngine(
                             }
                             AdvanceVoucherWindowCheckpoint(company, from, to, plan.TargetStart);
                             ok++;
+
+                            // Low-impact mode: give the Tally UI room to breathe
+                            // between windows (its XML server shares the app
+                            // thread — the gap is when operators' screens catch up).
+                            if (pending.Count > 0 && config.Tally.WindowPauseSeconds > 0)
+                                await Task.Delay(
+                                    TimeSpan.FromSeconds(config.Tally.WindowPauseSeconds), ct);
                         }
                         catch (TallyException tex) when (
                             tex.Category == ErrorCategory.TallyTimeout && to > from)
