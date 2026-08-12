@@ -25,6 +25,26 @@ public sealed class CheckpointRepository(AgentDatabase db)
             r.GetInt64(r.GetOrdinal("full_sync_done")) == 1);
     }
 
+    /// <summary>All checkpoints (diagnostics export).</summary>
+    public List<SyncCheckpoint> All()
+    {
+        using var conn = db.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT * FROM sync_checkpoints ORDER BY dataset, company";
+        using var r = cmd.ExecuteReader();
+        var rows = new List<SyncCheckpoint>();
+        while (r.Read())
+            rows.Add(new SyncCheckpoint(
+                r.GetString(r.GetOrdinal("dataset")),
+                r.GetString(r.GetOrdinal("company")),
+                r.IsDBNull(r.GetOrdinal("last_from_date")) ? null : r.GetString(r.GetOrdinal("last_from_date")),
+                r.IsDBNull(r.GetOrdinal("last_to_date")) ? null : r.GetString(r.GetOrdinal("last_to_date")),
+                r.IsDBNull(r.GetOrdinal("last_alter_id")) ? null : r.GetInt64(r.GetOrdinal("last_alter_id")),
+                r.IsDBNull(r.GetOrdinal("last_success_utc")) ? null : r.GetString(r.GetOrdinal("last_success_utc")),
+                r.GetInt64(r.GetOrdinal("full_sync_done")) == 1));
+        return rows;
+    }
+
     public void Upsert(SyncCheckpoint cp)
     {
         using var conn = db.Open();

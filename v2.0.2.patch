@@ -1,0 +1,824 @@
+From 860f5ceb6c9997bd6f1400ce4e8c42d1f2289298 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 12 Aug 2026 10:47:33 +0000
+Subject: [PATCH 1/5] =?UTF-8?q?fix(tally):=20remove=20full-scan=20voucher?=
+ =?UTF-8?q?=20date=20filter=20=E2=80=94=20root=20cause=20of=20window=20tim?=
+ =?UTF-8?q?eouts?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The explicit TDL FILTER ($Date >= ## AND $Date <= ##) forced Tally to
+materialize and scan the ENTIRE voucher file on every window, which is why
+1-month and 4-day windows timed out identically at 120s in the 2026-08-12
+15:07 Force Full Sync. Voucher collections are period-bound: SVFROMDATE/
+SVTODATE alone lets Tally serve the window from its date index. The
+extractor keeps validating each voucher's DATE client-side.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DCJhVDhastfZJHdA7bJSnU
+---
+ src/TallyAgent.Core/Tally/TallyEnvelopes.cs       | 15 +++++++++------
+ tests/TallyAgent.Core.Tests/TallyEnvelopeTests.cs |  9 ++++++---
+ 2 files changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/src/TallyAgent.Core/Tally/TallyEnvelopes.cs b/src/TallyAgent.Core/Tally/TallyEnvelopes.cs
+index 7db61ac..945754b 100644
+--- a/src/TallyAgent.Core/Tally/TallyEnvelopes.cs
++++ b/src/TallyAgent.Core/Tally/TallyEnvelopes.cs
+@@ -52,8 +52,14 @@ public static class TallyEnvelopes
+     /// <summary>
+     /// Export vouchers through an explicit TDL collection instead of relying on
+     /// the currently selected Day Book period in the interactive Tally session.
+-    /// The date formula is applied at collection level and the same dates are also
+-    /// supplied through SVFROMDATE/SVTODATE for compatibility across Tally versions.
++    /// The window is applied ONLY through SVFROMDATE/SVTODATE: a Voucher-type
++    /// collection is period-bound, so Tally serves it from the voucher date
++    /// index. The previous explicit &lt;FILTER&gt; formula ($Date &gt;= ... AND
++    /// $Date &lt;= ...) forced Tally to materialize and scan the ENTIRE voucher
++    /// file (all years) on every window, which is why even 4-day windows timed
++    /// out identically — the cost was company-wide, not window-bound. The
++    /// extractor still validates each voucher's DATE client-side, so any
++    /// out-of-window voucher a Tally build might leak is skipped and logged.
+     /// </summary>
+     public static string VoucherCollection(DateOnly from, DateOnly to, string? company)
+     {
+@@ -73,10 +79,7 @@ public static class TallyEnvelopes
+           .Append("<FETCH>DATE,VOUCHERTYPENAME,VOUCHERNUMBER,REFERENCE,NARRATION,PARTYLEDGERNAME,GUID,MASTERID,ALTERID,ISCANCELLED,ISOPTIONAL,AMOUNT</FETCH>")
+           .Append("<FETCH>ALLLEDGERENTRIES.*,LEDGERENTRIES.*,ALLINVENTORYENTRIES.*,INVENTORYENTRIES.*</FETCH>")
+           .Append("<FETCH>BILLALLOCATIONS.*,BANKALLOCATIONS.*,CATEGORYALLOCATIONS.*,COSTCENTREALLOCATIONS.*,BATCHALLOCATIONS.*</FETCH>")
+-          .Append("<FILTER>AgentVoucherDateFilter</FILTER></COLLECTION>")
+-          .Append("<SYSTEM TYPE=\"Formulae\" NAME=\"AgentVoucherDateFilter\">")
+-          .Append("$Date &gt;= ##SVFromDate AND $Date &lt;= ##SVToDate")
+-          .Append("</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>");
++          .Append("</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>");
+         return sb.ToString();
+     }
+ 
+diff --git a/tests/TallyAgent.Core.Tests/TallyEnvelopeTests.cs b/tests/TallyAgent.Core.Tests/TallyEnvelopeTests.cs
+index 26d68f9..426b2fd 100644
+--- a/tests/TallyAgent.Core.Tests/TallyEnvelopeTests.cs
++++ b/tests/TallyAgent.Core.Tests/TallyEnvelopeTests.cs
+@@ -6,7 +6,7 @@ namespace TallyAgent.Core.Tests;
+ public sealed class TallyEnvelopeTests
+ {
+     [Fact]
+-    public void VoucherCollection_UsesExplicitDateFilterAndCompany()
++    public void VoucherCollection_IsPeriodBoundWithoutFullScanFilter()
+     {
+         var xml = TallyEnvelopes.VoucherCollection(
+             new DateOnly(2019, 4, 1),
+@@ -18,8 +18,11 @@ public sealed class TallyEnvelopeTests
+         Assert.Contains("<SVFROMDATE>20190401</SVFROMDATE>", xml);
+         Assert.Contains("<SVTODATE>20190501</SVTODATE>", xml);
+         Assert.Contains("<SVCURRENTCOMPANY>Dynalektric Equipment Private Limited</SVCURRENTCOMPANY>", xml);
+-        Assert.Contains("<FILTER>AgentVoucherDateFilter</FILTER>", xml);
+-        Assert.Contains("$Date &gt;= ##SVFromDate AND $Date &lt;= ##SVToDate", xml);
++        // The explicit $Date filter forced Tally to scan the ENTIRE voucher
++        // file on every window (any window size timed out identically). The
++        // collection must stay period-bound via SVFROMDATE/SVTODATE only.
++        Assert.DoesNotContain("<FILTER>", xml);
++        Assert.DoesNotContain("##SVFromDate", xml);
+         Assert.Contains("ALLLEDGERENTRIES.*", xml);
+         Assert.Contains("ALLINVENTORYENTRIES.*", xml);
+     }
+-- 
+2.43.0
+
+
+From 498d42cb1ddb5dd5f4f50f47e7f5feaa9107391d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 12 Aug 2026 10:47:33 +0000
+Subject: [PATCH 2/5] feat(sync): newest-first full-sync walk (latest year
+ lands first)
+
+Full sync now plans chunked windows from today BACKWARDS to the extraction
+start. The checkpoint frontier is LastFromDate (oldest date extracted),
+marked with LastAlterId=2; interruptions resume going further back, so the
+most recent data is always in BigQuery first. Legacy forward checkpoints
+are detected and the walk restarts (idempotent batch IDs absorb overlap).
+Timed-out windows split newer-half-first during the walk; forward
+incremental keeps chronological split order.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DCJhVDhastfZJHdA7bJSnU
+---
+ src/TallyAgent.Core/Sync/SyncEngine.cs        | 43 +++++++++++--
+ src/TallyAgent.Core/Sync/SyncPlanner.cs       | 62 +++++++++++++++----
+ .../TallyAgent.Core.Tests/SyncPlannerTests.cs | 61 +++++++++++++++---
+ 3 files changed, 138 insertions(+), 28 deletions(-)
+
+diff --git a/src/TallyAgent.Core/Sync/SyncEngine.cs b/src/TallyAgent.Core/Sync/SyncEngine.cs
+index 9e272d8..786e46f 100644
+--- a/src/TallyAgent.Core/Sync/SyncEngine.cs
++++ b/src/TallyAgent.Core/Sync/SyncEngine.cs
+@@ -193,7 +193,7 @@ public sealed class SyncEngine(
+                                 EnqueueAndCheckpoint(name, company, syncId, rows, wf, wt,
+                                     fullDone: false);
+                             }
+-                            AdvanceVoucherWindowCheckpoint(company, from, to);
++                            AdvanceVoucherWindowCheckpoint(company, from, to, plan.TargetStart);
+                             ok++;
+                         }
+                         catch (TallyException tex) when (
+@@ -212,8 +212,18 @@ public sealed class SyncEngine(
+ 
+                             var rest = pending.ToList();
+                             pending.Clear();
+-                            pending.Enqueue((from, mid));
+-                            pending.Enqueue((secondFrom, to));
++                            if (plan.TargetStart is not null)
++                            {
++                                // Newest-first walk: extract the newer half first.
++                                pending.Enqueue((secondFrom, to));
++                                pending.Enqueue((from, mid));
++                            }
++                            else
++                            {
++                                // Forward incremental: keep chronological order.
++                                pending.Enqueue((from, mid));
++                                pending.Enqueue((secondFrom, to));
++                            }
+                             foreach (var w in rest) pending.Enqueue(w);
+                         }
+                         catch (Exception ex) when (ex is not OperationCanceledException)
+@@ -281,16 +291,37 @@ public sealed class SyncEngine(
+         log.LogWarning("Force Full Sync — voucher checkpoint reset for '{Company}'", company);
+     }
+ 
+-    private void AdvanceVoucherWindowCheckpoint(string company, DateOnly from, DateOnly to)
++    private void AdvanceVoucherWindowCheckpoint(string company, DateOnly from, DateOnly to,
++        DateOnly? fullSyncTarget = null)
+     {
+-        var today = DateOnly.FromDateTime(DateTime.Today);
+         var existing = checkpoints.Get("_vouchers_window", company);
++
++        if (fullSyncTarget is { } target)
++        {
++            // Newest-first history walk: LastFromDate is the backward frontier
++            // (oldest date extracted so far), LastToDate the newest covered date.
++            // The walk is complete when the frontier reaches the target start.
++            var existingFrom = SyncPlanner.TryParseIsoDate(existing?.LastFromDate);
++            var existingTo = SyncPlanner.TryParseIsoDate(existing?.LastToDate);
++            var frontier = existingFrom is { } ef && ef < from ? ef : from;
++            var top = existingTo is { } et && et > to ? et : to;
++            checkpoints.Upsert(new SyncCheckpoint(
++                "_vouchers_window", company,
++                frontier.ToString("yyyy-MM-dd"),
++                top.ToString("yyyy-MM-dd"),
++                SyncPlanner.NewestFirstCheckpointMarker,
++                DateTime.UtcNow.ToString("O"),
++                FullSyncDone: frontier <= target));
++            return;
++        }
++
++        var today = DateOnly.FromDateTime(DateTime.Today);
+         var fullDone = (existing?.FullSyncDone ?? false) || to >= today;
+         checkpoints.Upsert(new SyncCheckpoint(
+             "_vouchers_window", company,
+             existing?.LastFromDate ?? from.ToString("yyyy-MM-dd"),
+             to.ToString("yyyy-MM-dd"),
+-            null, DateTime.UtcNow.ToString("O"), fullDone));
++            existing?.LastAlterId, DateTime.UtcNow.ToString("O"), fullDone));
+     }
+ 
+     // ── extraction dispatch ───────────────────────────────────────
+diff --git a/src/TallyAgent.Core/Sync/SyncPlanner.cs b/src/TallyAgent.Core/Sync/SyncPlanner.cs
+index bc57376..8f0d953 100644
+--- a/src/TallyAgent.Core/Sync/SyncPlanner.cs
++++ b/src/TallyAgent.Core/Sync/SyncPlanner.cs
+@@ -10,20 +10,35 @@ public sealed record VoucherPlan(
+     /// <summary>Days between the checkpointed high-water mark and the lookback
+     /// horizon that would have been silently skipped by lookback-only planning.
+     /// &gt; 0 means the agent recovered an outage gap this cycle.</summary>
+-    int RecoveredGapDays);
++    int RecoveredGapDays,
++    /// <summary>For a full sync: the oldest date the walk must reach. The
++    /// engine marks the full sync done when a completed window's From reaches
++    /// this date. Null for incremental plans.</summary>
++    DateOnly? TargetStart = null);
+ 
+ /// <summary>
+ /// Pure voucher-window planning (extracted from SyncEngine for testability).
+ ///
+-/// Full sync: chunked [start → today] windows, resuming from the checkpoint.
++/// Full sync is NEWEST-FIRST: chunked windows walk from today BACKWARDS to the
++/// extraction start, so the most recent (most valuable) data lands in BigQuery
++/// first and an interrupted history walk resumes from where it stopped going
++/// further back. The checkpoint frontier is LastFromDate (the oldest date
++/// extracted so far); LastToDate records the newest date covered.
++///
+ /// Incremental: the window ALWAYS starts at the earlier of
+ ///   (checkpoint.LastToDate + 1)  and  (today − lookbackDays)
+ /// so an outage longer than the lookback can never create a silent gap —
+ /// the missed days are re-extracted and the gap is surfaced to the caller
+-/// for alerting. Long gaps are chunked like a full sync.
++/// for alerting. Long gaps are chunked (oldest-first, as they are small).
+ /// </summary>
+ public static class SyncPlanner
+ {
++    /// <summary>Sentinel written to SyncCheckpoint.LastAlterId marking a
++    /// checkpoint produced by the newest-first (v2) full-sync walk. Older
++    /// forward-walk checkpoints (null/other) cannot be resumed backwards and
++    /// are ignored, restarting the walk (batch dedup makes that cheap).</summary>
++    public const long NewestFirstCheckpointMarker = 2;
++
+     public static VoucherPlan PlanVoucherWindows(
+         TallySettings settings, SyncCheckpoint? checkpoint, DateOnly today)
+     {
+@@ -32,9 +47,21 @@ public static class SyncPlanner
+ 
+         if (checkpoint is not { FullSyncDone: true })
+         {
+-            var start = ResolveExtractionStart(settings, checkpoint, today);
+-            AddChunked(windows, start, today, chunk);
+-            return new VoucherPlan(windows, IsFullSync: true, RecoveredGapDays: 0);
++            var target = ResolveExtractionStart(settings, today);
++
++            // Resume a newest-first walk: continue backwards from the day
++            // before the oldest window already completed.
++            var top = today;
++            if (checkpoint?.LastAlterId == NewestFirstCheckpointMarker &&
++                TryParseIsoDate(checkpoint.LastFromDate) is { } frontier)
++            {
++                if (frontier <= target) // walk already reached the start
++                    return new VoucherPlan(windows, IsFullSync: true, 0, target);
++                top = frontier.AddDays(-1);
++            }
++
++            AddChunkedNewestFirst(windows, target, top, chunk);
++            return new VoucherPlan(windows, IsFullSync: true, 0, target);
+         }
+ 
+         var lookback = Math.Max(0, settings.IncrementalLookbackDays);
+@@ -52,7 +79,7 @@ public static class SyncPlanner
+             : 0;
+ 
+         AddChunked(windows, start2, today, chunk);
+-        return new VoucherPlan(windows, IsFullSync: false, RecoveredGapDays: gapDays);
++        return new VoucherPlan(windows, IsFullSync: false, gapDays);
+     }
+ 
+     private static void AddChunked(List<(DateOnly, DateOnly)> windows,
+@@ -66,12 +93,23 @@ public static class SyncPlanner
+         }
+     }
+ 
+-    private static DateOnly ResolveExtractionStart(
+-        TallySettings settings, SyncCheckpoint? checkpoint, DateOnly today)
++    /// <summary>Chunked windows ordered newest-first: the first window ends at
++    /// <paramref name="end"/> and each subsequent window is the chunk before,
++    /// down to <paramref name="start"/>. Windows stay internally ascending
++    /// (From ≤ To) so extraction and checkpoints are unchanged.</summary>
++    private static void AddChunkedNewestFirst(List<(DateOnly, DateOnly)> windows,
++        DateOnly start, DateOnly end, int chunkDays)
++    {
++        for (var to = end; to >= start; to = to.AddDays(-chunkDays))
++        {
++            var from = to.AddDays(-(chunkDays - 1));
++            if (from < start) from = start;
++            windows.Add((from, to));
++        }
++    }
++
++    private static DateOnly ResolveExtractionStart(TallySettings settings, DateOnly today)
+     {
+-        // Resume after crash: continue from day after last completed window
+-        if (TryParseIsoDate(checkpoint?.LastToDate) is { } lastTo)
+-            return lastTo.AddDays(1);
+         if (TryParseIsoDate(settings.ExtractionStartDate) is { } configured)
+             return configured;
+         // Default: start of current financial year (April 1, India)
+diff --git a/tests/TallyAgent.Core.Tests/SyncPlannerTests.cs b/tests/TallyAgent.Core.Tests/SyncPlannerTests.cs
+index e0f9055..f6cfe3e 100644
+--- a/tests/TallyAgent.Core.Tests/SyncPlannerTests.cs
++++ b/tests/TallyAgent.Core.Tests/SyncPlannerTests.cs
+@@ -15,34 +15,75 @@ public class SyncPlannerTests
+     private static SyncCheckpoint Cp(string? lastTo, bool fullDone) =>
+         new("_vouchers_window", "Co", null, lastTo, null, null, fullDone);
+ 
++    private static SyncCheckpoint NewestFirstCp(string lastFrom, string lastTo) =>
++        new("_vouchers_window", "Co", lastFrom, lastTo,
++            SyncPlanner.NewestFirstCheckpointMarker, null, false);
++
++    // ── full sync: newest-first ───────────────────────────────────
++
+     [Fact]
+-    public void FirstRun_PlansChunkedFullSync_FromConfiguredStart()
++    public void FirstRun_PlansNewestFirstFullSync_TodayBackToConfiguredStart()
+     {
+         var plan = SyncPlanner.PlanVoucherWindows(Settings(), null, Today);
+         Assert.True(plan.IsFullSync);
+-        Assert.Equal(new DateOnly(2026, 4, 1), plan.Windows[0].From);
+-        Assert.Equal(Today, plan.Windows[^1].To);
++        Assert.Equal(new DateOnly(2026, 4, 1), plan.TargetStart);
++
++        // Newest window first, oldest last.
++        Assert.Equal(Today, plan.Windows[0].To);
++        Assert.Equal(new DateOnly(2026, 4, 1), plan.Windows[^1].From);
++
++        Assert.All(plan.Windows, w => Assert.True(w.From <= w.To));
+         Assert.All(plan.Windows, w => Assert.True(
+             w.To.DayNumber - w.From.DayNumber + 1 <= 31, "chunk exceeded 31 days"));
+-        // windows are contiguous
++
++        // Windows are contiguous going backwards with no gaps or overlaps.
+         for (var i = 1; i < plan.Windows.Count; i++)
+-            Assert.Equal(plan.Windows[i - 1].To.AddDays(1), plan.Windows[i].From);
++            Assert.Equal(plan.Windows[i - 1].From.AddDays(-1), plan.Windows[i].To);
+     }
+ 
+     [Fact]
+-    public void InterruptedFullSync_ResumesFromDayAfterCheckpoint()
++    public void InterruptedNewestFirstFullSync_ResumesBackwardsFromFrontier()
+     {
+-        var plan = SyncPlanner.PlanVoucherWindows(Settings(), Cp("2026-05-31", fullDone: false), Today);
++        // Walk got down to 2026-06-01 before the interruption: next windows
++        // continue at 2026-05-31 going backwards; nothing newer is re-planned.
++        var plan = SyncPlanner.PlanVoucherWindows(
++            Settings(), NewestFirstCp("2026-06-01", "2026-07-30"), Today);
+         Assert.True(plan.IsFullSync);
+-        Assert.Equal(new DateOnly(2026, 6, 1), plan.Windows[0].From);
++        Assert.Equal(new DateOnly(2026, 5, 31), plan.Windows[0].To);
++        Assert.Equal(new DateOnly(2026, 4, 1), plan.Windows[^1].From);
+     }
+ 
++    [Fact]
++    public void NewestFirstFullSync_FrontierAtTarget_PlansNothing()
++    {
++        var plan = SyncPlanner.PlanVoucherWindows(
++            Settings(), NewestFirstCp("2026-04-01", "2026-07-30"), Today);
++        Assert.True(plan.IsFullSync);
++        Assert.Empty(plan.Windows);
++    }
++
++    [Fact]
++    public void LegacyForwardCheckpoint_IsIgnored_AndWalkRestartsNewestFirst()
++    {
++        // Old (pre-v2.0.2) full-sync checkpoints walked forward; they cannot be
++        // resumed backwards, so the planner restarts (batch dedup absorbs the
++        // re-extraction cost).
++        var legacy = Cp("2026-05-31", fullDone: false);
++        var plan = SyncPlanner.PlanVoucherWindows(Settings(), legacy, Today);
++        Assert.True(plan.IsFullSync);
++        Assert.Equal(Today, plan.Windows[0].To);
++        Assert.Equal(new DateOnly(2026, 4, 1), plan.Windows[^1].From);
++    }
++
++    // ── incremental (unchanged, forward) ──────────────────────────
++
+     [Fact]
+     public void SteadyState_Incremental_CoversLookbackWindow()
+     {
+         // Checkpoint is current (yesterday) — plain lookback window, no gap.
+         var plan = SyncPlanner.PlanVoucherWindows(Settings(lookback: 7), Cp("2026-07-29", fullDone: true), Today);
+         Assert.False(plan.IsFullSync);
++        Assert.Null(plan.TargetStart);
+         Assert.Equal(0, plan.RecoveredGapDays);
+         Assert.Equal(Today.AddDays(-7), plan.Windows[0].From);
+         Assert.Equal(Today, plan.Windows[^1].To);
+@@ -83,9 +124,9 @@ public class SyncPlannerTests
+     public void NoConfiguredStart_DefaultsToFinancialYearStart()
+     {
+         var plan = SyncPlanner.PlanVoucherWindows(Settings(start: ""), null, Today);
+-        Assert.Equal(new DateOnly(2026, 4, 1), plan.Windows[0].From);
++        Assert.Equal(new DateOnly(2026, 4, 1), plan.Windows[^1].From);
+         var febPlan = SyncPlanner.PlanVoucherWindows(Settings(start: ""), null, new DateOnly(2026, 2, 10));
+-        Assert.Equal(new DateOnly(2025, 4, 1), febPlan.Windows[0].From); // FY rolls back before April
++        Assert.Equal(new DateOnly(2025, 4, 1), febPlan.Windows[^1].From); // FY rolls back before April
+     }
+ 
+     [Fact]
+-- 
+2.43.0
+
+
+From dfb68ca73d336a74fdf12000a50e0c208d59a851 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 12 Aug 2026 10:47:33 +0000
+Subject: [PATCH 3/5] feat(tally): voucher request budget + split-first timeout
+ policy
+
+- new tally.voucherTimeoutSeconds (default 300) gives heavy voucher windows
+  a fair budget without slowing light master/report calls (still 120s);
+  timeouts are now enforced per request via linked CTS
+- multi-day voucher windows no longer retry a timeout at the same size
+  (10/30/60s ladder = ~10 wasted minutes per identical heavy request);
+  the engine splits immediately. Single-day windows keep the full ladder.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DCJhVDhastfZJHdA7bJSnU
+---
+ .../Configuration/AgentConfig.cs              |  4 ++
+ .../Tally/Extractors/VoucherExtractor.cs      |  9 +++-
+ src/TallyAgent.Core/Tally/TallyClient.cs      | 48 +++++++++++++++----
+ 3 files changed, 51 insertions(+), 10 deletions(-)
+
+diff --git a/src/TallyAgent.Core/Configuration/AgentConfig.cs b/src/TallyAgent.Core/Configuration/AgentConfig.cs
+index c37635e..133b4a3 100644
+--- a/src/TallyAgent.Core/Configuration/AgentConfig.cs
++++ b/src/TallyAgent.Core/Configuration/AgentConfig.cs
+@@ -23,6 +23,10 @@ public sealed class TallySettings
+     [JsonPropertyName("extractionStartDate")] public string ExtractionStartDate { get; set; } = "";
+     [JsonPropertyName("syncFrequencyMinutes")] public int SyncFrequencyMinutes { get; set; } = 15;
+     [JsonPropertyName("requestTimeoutSeconds")] public int RequestTimeoutSeconds { get; set; } = 120;
++    /// <summary>Timeout for windowed voucher extraction requests, which are the
++    /// heaviest calls the agent makes. Defaults higher than requestTimeoutSeconds
++    /// so a large month gets a fair chance before the window is split.</summary>
++    [JsonPropertyName("voucherTimeoutSeconds")] public int VoucherTimeoutSeconds { get; set; } = 300;
+     /// <summary>How long an active sync waits for a temporarily unavailable Tally server before giving up.</summary>
+     [JsonPropertyName("reconnectMaxMinutes")] public int ReconnectMaxMinutes { get; set; } = 30;
+     /// <summary>Delay between Tally reachability probes while auto-reconnecting.</summary>
+diff --git a/src/TallyAgent.Core/Tally/Extractors/VoucherExtractor.cs b/src/TallyAgent.Core/Tally/Extractors/VoucherExtractor.cs
+index 1795134..4aa6243 100644
+--- a/src/TallyAgent.Core/Tally/Extractors/VoucherExtractor.cs
++++ b/src/TallyAgent.Core/Tally/Extractors/VoucherExtractor.cs
+@@ -38,8 +38,15 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
+     public async Task<DayBookResult> ExtractWindow(DateOnly from, DateOnly to,
+         ISet<string> bankLedgerNames, CancellationToken ct)
+     {
++        // Multi-day windows do NOT retry a timeout at the same size — the
++        // SyncEngine splits the window instead (retrying an identical heavy
++        // request is deterministic waste). Single-day windows can't be split,
++        // so they keep the full retry ladder.
++        var days = to.DayNumber - from.DayNumber + 1;
+         var doc = await client.PostAsync(
+-            TallyEnvelopes.VoucherCollection(from, to, client.Company), ct);
++            TallyEnvelopes.VoucherCollection(from, to, client.Company),
++            requestTimeout: client.VoucherRequestTimeout,
++            maxTimeoutRetries: days > 1 ? 0 : null, ct);
+         var result = new DayBookResult();
+         var seenVoucherKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+         var outOfWindow = 0;
+diff --git a/src/TallyAgent.Core/Tally/TallyClient.cs b/src/TallyAgent.Core/Tally/TallyClient.cs
+index 6891ad2..689e1c2 100644
+--- a/src/TallyAgent.Core/Tally/TallyClient.cs
++++ b/src/TallyAgent.Core/Tally/TallyClient.cs
+@@ -28,11 +28,19 @@ public sealed class TallyClient
+         _settings = settings;
+         _log = log;
+         _http = http ?? new HttpClient();
+-        _http.Timeout = TimeSpan.FromSeconds(settings.RequestTimeoutSeconds);
++        // Timeouts are enforced per request (PostOnceAsync) so heavy voucher
++        // windows can use a longer budget than light master/report calls.
++        _http.Timeout = Timeout.InfiniteTimeSpan;
+     }
+ 
+     public string Company => _settings.Company;
+ 
++    /// <summary>Request budget for windowed voucher extraction — the heaviest
++    /// Tally call. Never below the general request timeout.</summary>
++    public TimeSpan VoucherRequestTimeout =>
++        TimeSpan.FromSeconds(Math.Max(_settings.RequestTimeoutSeconds,
++            _settings.VoucherTimeoutSeconds));
++
+     /// <summary>Fast TCP probe + company list. Distinguishes "not running" from
+     /// "port blocked" from "company not open".</summary>
+     public async Task<TallyProbeResult> ProbeAsync(CancellationToken ct = default)
+@@ -120,21 +128,34 @@ public sealed class TallyClient
+     ///    bounded interval for up to reconnectMaxMinutes, then continue exactly
+     ///    where the sync stopped when Tally comes back.
+     /// </summary>
+-    public async Task<XDocument> PostAsync(string envelope, CancellationToken ct = default)
++    public Task<XDocument> PostAsync(string envelope, CancellationToken ct = default) =>
++        PostAsync(envelope, null, null, ct);
++
++    /// <summary>
++    /// As <see cref="PostAsync(string, CancellationToken)"/> but with a caller-set
++    /// timeout budget and timeout-retry count. Voucher window extraction passes
++    /// maxTimeoutRetries: 0 for multi-day windows — retrying an identical heavy
++    /// request at the same size is deterministic waste (~10 min per ladder);
++    /// splitting the window immediately converges far faster.
++    /// </summary>
++    public async Task<XDocument> PostAsync(string envelope, TimeSpan? requestTimeout,
++        int? maxTimeoutRetries, CancellationToken ct = default)
+     {
+         var reconnectDeadline = DateTime.UtcNow.AddMinutes(Math.Max(1, _settings.ReconnectMaxMinutes));
+         var reconnectDelay = TimeSpan.FromSeconds(Math.Max(5, _settings.ReconnectRetrySeconds));
++        var timeoutRetries = Math.Clamp(maxTimeoutRetries ?? TimeoutRetryBackoff.Length,
++            0, TimeoutRetryBackoff.Length);
+         var timeoutAttempt = 0;
+ 
+         while (true)
+         {
+             try
+             {
+-                return await PostOnceAsync(envelope, ct);
++                return await PostOnceAsync(envelope, requestTimeout, ct);
+             }
+             catch (TallyException tex) when (tex.Category == ErrorCategory.TallyTimeout)
+             {
+-                if (timeoutAttempt >= TimeoutRetryBackoff.Length)
++                if (timeoutAttempt >= timeoutRetries)
+                     throw;
+ 
+                 var delay = TimeoutRetryBackoff[timeoutAttempt++];
+@@ -162,21 +183,30 @@ public sealed class TallyClient
+         }
+     }
+ 
+-    private async Task<XDocument> PostOnceAsync(string envelope, CancellationToken ct)
++    private Task<XDocument> PostOnceAsync(string envelope, CancellationToken ct) =>
++        PostOnceAsync(envelope, null, ct);
++
++    private async Task<XDocument> PostOnceAsync(string envelope, TimeSpan? requestTimeout,
++        CancellationToken ct)
+     {
++        var budget = requestTimeout
++            ?? TimeSpan.FromSeconds(Math.Max(1, _settings.RequestTimeoutSeconds));
++        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
++        timeoutCts.CancelAfter(budget);
++
+         HttpResponseMessage resp;
+         byte[] body;
+         try
+         {
+             using var content = new ByteArrayContent(Encoding.UTF8.GetBytes(envelope));
+             content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("text/xml");
+-            resp = await _http.PostAsync(_settings.BaseUri, content, ct);
+-            body = await resp.Content.ReadAsByteArrayAsync(ct);
++            resp = await _http.PostAsync(_settings.BaseUri, content, timeoutCts.Token);
++            body = await resp.Content.ReadAsByteArrayAsync(timeoutCts.Token);
+         }
+-        catch (TaskCanceledException) when (!ct.IsCancellationRequested)
++        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+         {
+             throw new TallyException(ErrorCategory.TallyTimeout,
+-                $"Tally request timed out after {_settings.RequestTimeoutSeconds}s " +
++                $"Tally request timed out after {(int)budget.TotalSeconds}s " +
+                 $"({_settings.Host}:{_settings.Port}).");
+         }
+         catch (HttpRequestException ex)
+-- 
+2.43.0
+
+
+From 24615e428b302114134c7930f6f7dcde96fa1fb4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 12 Aug 2026 10:47:33 +0000
+Subject: [PATCH 4/5] feat(reports): dated-collection fallbacks for empty
+ report exports
+
+Trial Balance -> Ledger collection, Balance Sheet/P&L -> Group collection
+(ISREVENUE split), Stock Summary -> StockItem collection, all period-bound
+so closing figures honour SVTODATE. Fixes the persistent 0-row snapshots
+seen on the live Dynalektric company (2472 ledgers, 0-row reports).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DCJhVDhastfZJHdA7bJSnU
+---
+ .../Tally/Extractors/ReportExtractor.cs       | 102 ++++++++++++++++++
+ 1 file changed, 102 insertions(+)
+
+diff --git a/src/TallyAgent.Core/Tally/Extractors/ReportExtractor.cs b/src/TallyAgent.Core/Tally/Extractors/ReportExtractor.cs
+index 8eb010f..492a877 100644
+--- a/src/TallyAgent.Core/Tally/Extractors/ReportExtractor.cs
++++ b/src/TallyAgent.Core/Tally/Extractors/ReportExtractor.cs
+@@ -42,10 +42,41 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
+                 ["parent_group"] = "",
+             };
+         });
++        if (rows.Count == 0)
++            rows = await TrialBalanceFromLedgers(from, to, ct);
+         log.LogInformation("Trial balance: {N} rows", rows.Count);
+         return rows;
+     }
+ 
++    /// <summary>Fallback when the "Trial Balance" report export yields no rows
++    /// (report layouts vary across TallyPrime builds): derive the trial balance
++    /// from a period-bound Ledger collection — CLOSINGBALANCE honours SVTODATE,
++    /// so the figures are as-of the requested period end.</summary>
++    private async Task<List<Row>> TrialBalanceFromLedgers(DateOnly from, DateOnly to, CancellationToken ct)
++    {
++        log.LogInformation("Trial balance report export was empty — falling back to dated Ledger collection");
++        var doc = await client.PostAsync(TallyEnvelopes.Collection(
++            "Ledger", ["NAME", "PARENT", "CLOSINGBALANCE"], client.Company, from, to), ct);
++        var rows = new List<Row>();
++        foreach (var el in doc.Descendants().Where(e => Is(e, "LEDGER")))
++        {
++            var name = Text(el, "NAME");
++            if (name.Length == 0) continue;
++            var closing = Num(el, "CLOSINGBALANCE");
++            if (closing == 0) continue;
++            // Tally sign convention: positive = credit, negative = debit.
++            rows.Add(new Row
++            {
++                ["ledger_name"] = name,
++                ["closing_debit"] = closing < 0 ? Math.Abs(closing) : 0,
++                ["closing_credit"] = closing > 0 ? closing : 0,
++                ["net_amount"] = -closing,
++                ["parent_group"] = Text(el, "PARENT"),
++            });
++        }
++        return rows;
++    }
++
+     public async Task<List<Row>> BalanceSheet(DateOnly from, DateOnly to, CancellationToken ct)
+     {
+         var doc = await client.PostAsync(
+@@ -62,6 +93,8 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
+                 ["category"] = amount >= 0 ? "Liabilities" : "Assets",
+             };
+         });
++        if (rows.Count == 0)
++            rows = await GroupBalances(from, to, revenueGroups: false, ct);
+         log.LogInformation("Balance sheet: {N} rows", rows.Count);
+         return rows;
+     }
+@@ -81,10 +114,43 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
+                 ["parent_group"] = "",
+             };
+         });
++        if (rows.Count == 0)
++            rows = await GroupBalances(from, to, revenueGroups: true, ct);
+         log.LogInformation("P&L: {N} rows", rows.Count);
+         return rows;
+     }
+ 
++    /// <summary>Fallback for empty Balance Sheet / P&amp;L report exports:
++    /// period-bound Group collection closing balances. Balance sheet keeps
++    /// non-revenue groups; P&amp;L keeps revenue groups (ISREVENUE).</summary>
++    private async Task<List<Row>> GroupBalances(DateOnly from, DateOnly to,
++        bool revenueGroups, CancellationToken ct)
++    {
++        log.LogInformation("{Report} report export was empty — falling back to dated Group collection",
++            revenueGroups ? "P&L" : "Balance sheet");
++        var doc = await client.PostAsync(TallyEnvelopes.Collection(
++            "Group", ["NAME", "PARENT", "ISREVENUE", "CLOSINGBALANCE"], client.Company, from, to), ct);
++        var rows = new List<Row>();
++        foreach (var el in doc.Descendants().Where(e => Is(e, "GROUP")))
++        {
++            var name = Text(el, "NAME");
++            if (name.Length == 0) continue;
++            if (Bool(el, "ISREVENUE") != revenueGroups) continue;
++            var amount = Num(el, "CLOSINGBALANCE");
++            if (amount == 0) continue;
++            var row = new Row
++            {
++                ["ledger_name"] = name,
++                ["amount"] = amount,
++                ["parent_group"] = Text(el, "PARENT"),
++            };
++            if (!revenueGroups)
++                row["category"] = amount >= 0 ? "Liabilities" : "Assets";
++            rows.Add(row);
++        }
++        return rows;
++    }
++
+     public async Task<List<Row>> StockSummary(DateOnly from, DateOnly to, CancellationToken ct)
+     {
+         var doc = await client.PostAsync(
+@@ -116,10 +182,46 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
+                     ? NumByLocalName(cl, "DSPCLAMTA") : NumByLocalName(cl, "DSPSTKCLAMT"),
+             });
+         }
++        if (rows.Count == 0)
++            rows = await StockSummaryFromItems(from, to, ct);
+         log.LogInformation("Stock summary: {N} rows", rows.Count);
+         return rows;
+     }
+ 
++    /// <summary>Fallback for an empty "Stock Summary" report export: period-bound
++    /// StockItem collection — closing qty/value honour SVTODATE.</summary>
++    private async Task<List<Row>> StockSummaryFromItems(DateOnly from, DateOnly to, CancellationToken ct)
++    {
++        log.LogInformation("Stock summary report export was empty — falling back to dated StockItem collection");
++        var doc = await client.PostAsync(TallyEnvelopes.Collection(
++            "StockItem",
++            ["NAME", "PARENT", "OPENINGBALANCE", "OPENINGVALUE", "CLOSINGBALANCE", "CLOSINGVALUE"],
++            client.Company, from, to), ct);
++        var rows = new List<Row>();
++        foreach (var el in doc.Descendants().Where(e => Is(e, "STOCKITEM")))
++        {
++            var name = Text(el, "NAME");
++            if (name.Length == 0) continue;
++            var closingQty = Num(el, "CLOSINGBALANCE");
++            var closingValue = Num(el, "CLOSINGVALUE");
++            if (closingQty == 0 && closingValue == 0) continue;
++            rows.Add(new Row
++            {
++                ["item_name"] = name,
++                ["stock_group"] = Text(el, "PARENT"),
++                ["opening_qty"] = Num(el, "OPENINGBALANCE"),
++                ["opening_value"] = Num(el, "OPENINGVALUE"),
++                ["inward_qty"] = 0d,
++                ["inward_value"] = 0d,
++                ["outward_qty"] = 0d,
++                ["outward_value"] = 0d,
++                ["closing_qty"] = closingQty,
++                ["closing_value"] = closingValue,
++            });
++        }
++        return rows;
++    }
++
+     /// <summary>Outstanding = closing balances of ledgers under the given parent groups.</summary>
+     public async Task<List<Row>> Outstanding(string parentGroupContains, CancellationToken ct)
+     {
+-- 
+2.43.0
+
+
+From 8160c360d5b1babaeae2d289f902006c28bcc116 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 12 Aug 2026 10:47:33 +0000
+Subject: [PATCH 5/5] =?UTF-8?q?chore(release):=20v2.0.2=20=E2=80=94=20vers?=
+ =?UTF-8?q?ion=20bump=20+=20changelog=20(AgentInfo.Version=20was=20stuck?=
+ =?UTF-8?q?=20at=202.0.0)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DCJhVDhastfZJHdA7bJSnU
+---
+ CHANGELOG.md                        | 46 +++++++++++++++++++++++++++++
+ Directory.Build.props               |  2 +-
+ src/TallyAgent.Core/AgentVersion.cs |  2 +-
+ 3 files changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c67a224..a4aa638 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,51 @@
+ # Changelog
+ 
++## 2.0.2 — Resilient newest-first backfill
++
++Diagnosed from the 2026-08-12 15:07 live Force Full Sync: every voucher window
++(one month down to four days) timed out identically at 120 s, which proves the
++cost was company-wide, not window-bound.
++
++### The extraction stall, fixed at the root
++
++* **Voucher collection no longer full-scans Tally**: the explicit TDL
++  `$Date >= ## AND $Date <= ##` FILTER forced Tally to materialize and walk the
++  ENTIRE voucher file (all years) for every window. The collection is now
++  period-bound through SVFROMDATE/SVTODATE only, so Tally serves each window
++  from its date index. The extractor still validates every voucher's DATE
++  client-side and skips/logs anything outside the window.
++* **No same-size timeout retries for splittable windows**: a multi-day window
++  that times out is split immediately instead of burning ~10 minutes retrying
++  the identical request at 10/30/60 s intervals. Single-day windows (which
++  cannot split) keep the full retry ladder.
++* **Dedicated voucher request budget**: new `tally.voucherTimeoutSeconds`
++  (default 300) gives heavy month windows a fair chance before splitting,
++  without slowing down light master/report calls (still 120 s).
++
++### Newest-first history walk
++
++* **Full sync now walks from today BACKWARDS to the extraction start**, so the
++  latest year lands in BigQuery first and every interruption resumes going
++  further back — the most valuable data is always synced first.
++* Timed-out windows split newer-half-first during the walk.
++* The backward frontier is checkpointed (`LastFromDate` + marker); legacy
++  forward checkpoints from interrupted pre-2.0.2 walks are detected and the
++  walk restarts newest-first (idempotent batch IDs absorb the overlap).
++
++### Auto-reconnect during active sync
++
++* If Tally stops responding mid-sync (closed, restarting, machine busy), the
++  agent probes at `tally.reconnectRetrySeconds` (default 30 s) for up to
++  `tally.reconnectMaxMinutes` (default 30 min) and continues the same window
++  exactly where it stopped — no failed cycle, no lost progress.
++
++### Report fallbacks (0-row snapshots)
++
++* Trial Balance falls back to a period-bound Ledger collection, Balance Sheet
++  and P&L to a Group collection (revenue split via ISREVENUE), and Stock
++  Summary to a StockItem collection whenever the report-form export returns
++  0 rows — closing figures honour SVTODATE, so period semantics are kept.
++
+ ## 2.0.1 — Runtime hardening after first live Force Full Sync
+ 
+ Validated against the first real v2.0.0 production Force Full Sync on 2026-08-12.
+diff --git a/Directory.Build.props b/Directory.Build.props
+index 204edc8..ee984b6 100644
+--- a/Directory.Build.props
++++ b/Directory.Build.props
+@@ -1,6 +1,6 @@
+ <Project>
+   <PropertyGroup>
+-    <Version>2.0.1</Version>
++    <Version>2.0.2</Version>
+     <Company>Dynalektric</Company>
+     <Product>Tally BigQuery Agent</Product>
+     <Copyright>Copyright © 2026</Copyright>
+diff --git a/src/TallyAgent.Core/AgentVersion.cs b/src/TallyAgent.Core/AgentVersion.cs
+index 233c102..f14c03e 100644
+--- a/src/TallyAgent.Core/AgentVersion.cs
++++ b/src/TallyAgent.Core/AgentVersion.cs
+@@ -3,7 +3,7 @@ namespace TallyAgent.Core;
+ /// <summary>Central version + well-known path constants for the agent.</summary>
+ public static class AgentInfo
+ {
+-    public const string Version = "2.0.0";
++    public const string Version = "2.0.2";
+     public const string SchemaVersion = "1.0";
+     public const string ServiceName = "TallyBigQueryAgent";
+     public const string ServiceDisplayName = "Tally BigQuery Data Sync Agent";
+-- 
+2.43.0
+

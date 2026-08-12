@@ -52,6 +52,11 @@ public sealed class DiagnosticsExporter(
                                    LastError = SecretMasker.Scrub(b.LastError ?? "") }),
         }, new JsonSerializerOptions { WriteIndented = true }));
 
+        // Sync progress (the class contract promises checkpoints in the ZIP;
+        // this also keeps the primary-constructor parameter in use).
+        AddText(zip, "checkpoints.json", JsonSerializer.Serialize(
+            checkpoints.All(), new JsonSerializerOptions { WriteIndented = true }));
+
         AddText(zip, "recent-errors.json", JsonSerializer.Serialize(
             errors.Recent(100).Select(e => new
             {

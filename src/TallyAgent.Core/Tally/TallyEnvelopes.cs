@@ -16,10 +16,10 @@ public static class TallyEnvelopes
           .Append("<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>");
         if (!string.IsNullOrEmpty(company))
             sb.Append("<SVCURRENTCOMPANY>").Append(TallyXml.XmlEscape(company)).Append("</SVCURRENTCOMPANY>");
-        if (from is { } f)
-            sb.Append("<SVFROMDATE>").Append(f.ToString("yyyyMMdd")).Append("</SVFROMDATE>");
-        if (to is { } t)
-            sb.Append("<SVTODATE>").Append(t.ToString("yyyyMMdd")).Append("</SVTODATE>");
+        if (from is { } fromDate)
+            sb.Append("<SVFROMDATE>").Append(fromDate.ToString("yyyyMMdd")).Append("</SVFROMDATE>");
+        if (to is { } toDate)
+            sb.Append("<SVTODATE>").Append(toDate.ToString("yyyyMMdd")).Append("</SVTODATE>");
         sb.Append("</STATICVARIABLES><TDL><TDLMESSAGE>")
           .Append("<COLLECTION NAME=\"AgentCollection\"><TYPE>")
           .Append(collectionType).Append("</TYPE>");
