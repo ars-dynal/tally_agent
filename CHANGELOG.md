@@ -1,5 +1,51 @@
 # Changelog
 
+## 2.0.2 — Resilient newest-first backfill
+
+Diagnosed from the 2026-08-12 15:07 live Force Full Sync: every voucher window
+(one month down to four days) timed out identically at 120 s, which proves the
+cost was company-wide, not window-bound.
+
+### The extraction stall, fixed at the root
+
+* **Voucher collection no longer full-scans Tally**: the explicit TDL
+  `$Date >= ## AND $Date <= ##` FILTER forced Tally to materialize and walk the
+  ENTIRE voucher file (all years) for every window. The collection is now
+  period-bound through SVFROMDATE/SVTODATE only, so Tally serves each window
+  from its date index. The extractor still validates every voucher's DATE
+  client-side and skips/logs anything outside the window.
+* **No same-size timeout retries for splittable windows**: a multi-day window
+  that times out is split immediately instead of burning ~10 minutes retrying
+  the identical request at 10/30/60 s intervals. Single-day windows (which
+  cannot split) keep the full retry ladder.
+* **Dedicated voucher request budget**: new `tally.voucherTimeoutSeconds`
+  (default 300) gives heavy month windows a fair chance before splitting,
+  without slowing down light master/report calls (still 120 s).
+
+### Newest-first history walk
+
+* **Full sync now walks from today BACKWARDS to the extraction start**, so the
+  latest year lands in BigQuery first and every interruption resumes going
+  further back — the most valuable data is always synced first.
+* Timed-out windows split newer-half-first during the walk.
+* The backward frontier is checkpointed (`LastFromDate` + marker); legacy
+  forward checkpoints from interrupted pre-2.0.2 walks are detected and the
+  walk restarts newest-first (idempotent batch IDs absorb the overlap).
+
+### Auto-reconnect during active sync
+
+* If Tally stops responding mid-sync (closed, restarting, machine busy), the
+  agent probes at `tally.reconnectRetrySeconds` (default 30 s) for up to
+  `tally.reconnectMaxMinutes` (default 30 min) and continues the same window
+  exactly where it stopped — no failed cycle, no lost progress.
+
+### Report fallbacks (0-row snapshots)
+
+* Trial Balance falls back to a period-bound Ledger collection, Balance Sheet
+  and P&L to a Group collection (revenue split via ISREVENUE), and Stock
+  Summary to a StockItem collection whenever the report-form export returns
+  0 rows — closing figures honour SVTODATE, so period semantics are kept.
+
 ## 2.0.1 — Runtime hardening after first live Force Full Sync
 
 Validated against the first real v2.0.0 production Force Full Sync on 2026-08-12.
