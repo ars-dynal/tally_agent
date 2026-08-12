@@ -71,6 +71,8 @@ public sealed class ErrorReportRequest
     [JsonPropertyName("agent_version")] public string AgentVersion { get; set; } = "";
     [JsonPropertyName("is_summary")] public bool IsSummary { get; set; }
     [JsonPropertyName("occurrences")] public long Occurrences { get; set; } = 1;
+    /// <summary>Optional server-side fan-out target. The agent never sends SMTP credentials.</summary>
+    [JsonPropertyName("recipient_email")] public string? RecipientEmail { get; set; }
 }
 
 public sealed class UpdateInfo
