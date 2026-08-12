@@ -23,6 +23,9 @@ public sealed class AgentDatabase
         {
             DataSource = dbPath ?? AgentInfo.DatabasePath,
             Mode = SqliteOpenMode.ReadWriteCreate,
+            // Match the PRAGMA busy timeout below. SQLite is shared by sync,
+            // upload, heartbeat and UI readers; short write bursts should wait
+            // rather than surface SQLITE_BUSY as an agent health failure.
             DefaultTimeout = 15,
         }.ToString();
         Initialize();
@@ -33,7 +36,7 @@ public sealed class AgentDatabase
         var conn = new SqliteConnection(_connectionString);
         conn.Open();
         using var pragma = conn.CreateCommand();
-        pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;";
+        pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=15000; PRAGMA foreign_keys=ON;";
         pragma.ExecuteNonQuery();
         return conn;
     }
@@ -170,8 +173,7 @@ public sealed class AgentDatabase
     }
 
     /// <summary>V2: batch_history carries sequence_no so per-dataset sequence
-    /// numbers stay monotonic after acked rows leave upload_batches
-    /// (sequence feeds the deterministic batch ID — it must never regress).</summary>
+    /// numbers stay monotonic after acked rows leave upload_batches.</summary>
     private static void MigrateToV2(SqliteConnection conn, SqliteTransaction tx)
     {
         Exec(conn, tx, """
@@ -179,11 +181,7 @@ public sealed class AgentDatabase
             """);
     }
 
-    /// <summary>V3: content_checksum — SHA-256 over the batch's business rows
-    /// EXCLUDING audit fields (_sync_timestamp/_sync_id/source_last_seen_at).
-    /// This is the identity/dedup checksum; checksum_sha256 remains the
-    /// transport checksum of the final gzip bytes. Pre-existing rows keep ''
-    /// (they never participate in equivalence matching, IDs are unchanged).</summary>
+    /// <summary>V3: content_checksum — SHA-256 over business rows excluding audit fields.</summary>
     private static void MigrateToV3(SqliteConnection conn, SqliteTransaction tx)
     {
         Exec(conn, tx, """

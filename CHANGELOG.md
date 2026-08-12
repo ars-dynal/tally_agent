@@ -1,5 +1,57 @@
 # Changelog
 
+## 2.0.1 — Runtime hardening after first live Force Full Sync
+
+Validated against the first real v2.0.0 production Force Full Sync on 2026-08-12.
+This hotfix addresses runtime failures and data-quality red flags that only appeared
+under the live Dynalektric Tally workload.
+
+### Runtime fixes
+
+* **Adaptive window split crash fixed**: the v2.0.0 timeout-split logger had six
+  message-template placeholders but only four arguments, so the logger itself
+  threw before the window could split. The template now has one argument per
+  placeholder, so a timed-out voucher window can split and continue.
+* **Force Full Sync checkpoint reset de-duplicated**: configured-company runs no
+  longer reset the voucher checkpoint twice.
+* **SQLite writer contention hardened**: WAL busy timeout increased to 15 seconds;
+  dequeue and ack now use IMMEDIATE write transactions to avoid the deferred
+  read-to-write upgrade race that can return SQLITE_BUSY while SyncWorker writes.
+
+### Extraction fixes and validation
+
+* **Master attribute fallback**: TallyXml scalar readers now fall back to
+  same-named attributes when child elements are absent. This specifically fixes
+  Group/StockItem masters where Tally emits `NAME` as an attribute — the live
+  v2.0.0 run returned 0 groups/stock items while related data existed.
+* **Nested report parsing**: Trial Balance, Balance Sheet, P&L and Stock Summary
+  no longer assume DSP report rows are direct root children; nested layouts and
+  local-name matching are supported.
+* **Cross-dataset validation**: a full sync now flags contradictory counts (for
+  example ledgers > 0 but groups = 0, or standard stock prices/costs > 0 but
+  stock_items = 0) instead of silently certifying the baseline as successful.
+
+### Remote health
+
+* Missing `/heartbeat` is treated as **DEGRADED monitoring**, not cloud-offline.
+  `/health` is probed to distinguish a missing optional route from a real outage;
+  unsupported-heartbeat retries back off to hourly to avoid five-minute log spam.
+* Added once-daily health summaries (default 08:00 server local time) containing
+  agent version, Tally status, current operation, last successful sync,
+  pending/failed batches, disk/memory and latest error.
+* Daily summaries go to configured direct webhooks immediately and are also sent
+  to the cloud notification endpoint with optional `recipient_email` for
+  server-side email fan-out. SMTP credentials are never stored in the agent.
+* Cloud Run still needs compatible `/heartbeat` and `/errors` routes before
+  remote heartbeat history and email fan-out are fully operational.
+
+### Release procedure
+
+Install v2.0.1 **over** v2.0.0; do not delete `agent.db`, queue state or existing
+GCS objects. After connection tests pass, trigger Force Full Sync exactly once
+and verify adaptive splitting plus key dataset counts before accepting the new
+GCS baseline or loading it into BigQuery.
+
 ## 2.0.0 — Production hardening release (branch `release/v2.0-production`)
 
 Based on `main` @ `9a1b6a3` (Merge PR #12, fix/tally-voucher-full-load) — the

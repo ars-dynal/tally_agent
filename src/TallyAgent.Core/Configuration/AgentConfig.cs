@@ -57,6 +57,9 @@ public sealed class NotificationSettings
     [JsonPropertyName("slackWebhookUrl")] public string SlackWebhookUrl { get; set; } = "";
     [JsonPropertyName("criticalAlertCooldownMinutes")] public int CriticalAlertCooldownMinutes { get; set; } = 30;
     [JsonPropertyName("summaryIntervalMinutes")] public int SummaryIntervalMinutes { get; set; } = 60;
+    [JsonPropertyName("enableDailyHealthSummary")] public bool EnableDailyHealthSummary { get; set; } = true;
+    /// <summary>Server-local hour (0-23) for the once-daily remote health summary.</summary>
+    [JsonPropertyName("dailyHealthHourLocal")] public int DailyHealthHourLocal { get; set; } = 8;
 }
 
 public sealed class AdvancedSettings

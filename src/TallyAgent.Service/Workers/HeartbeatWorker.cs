@@ -8,10 +8,10 @@ using TallyAgent.Core.Diagnostics;
 namespace TallyAgent.Service.Workers;
 
 /// <summary>
-/// Sends the full health heartbeat every heartbeatMinutes (default 5).
-/// Offline heartbeats are buffered in SQLite so the dashboard's history stays
-/// complete. Server responses may carry commands (sync_now) which are honoured
-/// via the trigger-file mechanism.
+/// Sends health heartbeats at the configured cadence. When the deployed cloud API
+/// does not expose /heartbeat (HTTP 404), the worker verifies /health, marks the
+/// monitoring channel degraded, and backs off heartbeat attempts to hourly so a
+/// missing optional route cannot flood logs every five minutes.
 /// </summary>
 public sealed class HeartbeatWorker(
     AgentConfig config,
@@ -23,14 +23,20 @@ public sealed class HeartbeatWorker(
     AgentState state,
     ILogger<HeartbeatWorker> log) : BackgroundService
 {
+    private DateTime _nextHeartbeatAttemptUtc = DateTime.MinValue;
+    private bool _unsupportedLogged;
+
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
         var interval = TimeSpan.FromMinutes(Math.Max(1, config.Cloud.HeartbeatMinutes));
-        log.LogInformation("HeartbeatWorker started (every {Interval})", interval);
+        log.LogInformation("HeartbeatWorker started (every {Interval}; unsupported endpoint backs off hourly)", interval);
 
         using var timer = new PeriodicTimer(interval);
         do
         {
+            if (DateTime.UtcNow < _nextHeartbeatAttemptUtc)
+                continue;
+
             try
             {
                 var hb = Build();
@@ -43,14 +49,43 @@ public sealed class HeartbeatWorker(
                 {
                     var resp = await api.SendHeartbeatAsync(hb, ct);
                     state.InternetConnected = true;
+                    state.CloudDegraded = false;
+                    _nextHeartbeatAttemptUtc = DateTime.UtcNow + interval;
+                    _unsupportedLogged = false;
                     if (rowId > 0) heartbeats.MarkDelivered(rowId);
 
                     foreach (var cmd in resp.Commands ?? [])
                         HandleCommand(cmd);
                 }
+                catch (CloudApiException ex) when (IsMissingHeartbeatRoute(ex))
+                {
+                    state.CloudDegraded = true;
+
+                    // Distinguish "monitoring route missing" from "cloud offline".
+                    try
+                    {
+                        await api.PingAsync(ct);
+                        state.InternetConnected = true;
+                    }
+                    catch
+                    {
+                        state.InternetConnected = false;
+                    }
+
+                    _nextHeartbeatAttemptUtc = DateTime.UtcNow.AddHours(1);
+                    if (!_unsupportedLogged)
+                    {
+                        log.LogWarning(
+                            "Cloud /health is reachable but /heartbeat is not deployed (HTTP 404). " +
+                            "Agent remains operational; remote monitoring is DEGRADED. Retrying heartbeat hourly.");
+                        _unsupportedLogged = true;
+                    }
+                }
                 catch (CloudApiException ex)
                 {
                     state.InternetConnected = ex.Category != Core.Notifications.ErrorCategory.InternetUnavailable;
+                    state.CloudDegraded = true;
+                    _nextHeartbeatAttemptUtc = DateTime.UtcNow + interval;
                     log.LogWarning("Heartbeat not delivered ({Category}): {Msg}", ex.Category, ex.Message);
                 }
 
@@ -59,10 +94,16 @@ public sealed class HeartbeatWorker(
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
-                log.LogError(ex, "Heartbeat cycle failed");
+                state.CloudDegraded = true;
+                log.LogWarning("Heartbeat cycle failed: {Message}", ex.Message);
             }
         } while (await SafeWait(timer, ct));
     }
+
+    private static bool IsMissingHeartbeatRoute(CloudApiException ex) =>
+        ex.Message.Contains("heartbeat returned HTTP 404", StringComparison.OrdinalIgnoreCase)
+        || ex.Message.Contains("HTTP 404", StringComparison.OrdinalIgnoreCase)
+           && ex.Message.Contains("heartbeat", StringComparison.OrdinalIgnoreCase);
 
     private HeartbeatRequest Build()
     {

@@ -20,8 +20,6 @@ using TallyAgent.Service.Workers;
 
 AgentInfo.EnsureDirectories();
 
-// Serilog: rolling files under C:\ProgramData\TallyBigQueryAgent\Logs\
-// Every event message is scrubbed of secrets before it is written.
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Information()
     .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
@@ -58,8 +56,6 @@ try
         });
     }
 
-    // ── configuration (fail-soft: service runs in "unconfigured" mode and
-    //    reports via Event Log until config exists, instead of crash-looping) ──
     var configStore = new ConfigStore();
     AgentConfig config;
     try
@@ -80,7 +76,6 @@ try
     {
         ApplyLogLevel(config.Advanced.LogLevel);
 
-        // Core singletons
         builder.Services.AddSingleton(config);
         builder.Services.AddSingleton<AgentDatabase>();
         builder.Services.AddSingleton<BatchQueueRepository>();
@@ -101,16 +96,15 @@ try
         builder.Services.AddSingleton<DiagnosticsExporter>();
         builder.Services.AddSingleton<AgentState>();
 
-        // Workers
         builder.Services.AddHostedService<SyncWorker>();
         builder.Services.AddHostedService<UploadWorker>();
         builder.Services.AddHostedService<HeartbeatWorker>();
         builder.Services.AddHostedService<ErrorSummaryWorker>();
+        builder.Services.AddHostedService<DailyHealthWorker>();
     }
 
     var host = builder.Build();
 
-    // Crash-recovery: batches stuck 'uploading' from a previous crash → pending
     if (config is not null)
     {
         var queue = host.Services.GetRequiredService<BatchQueueRepository>();
@@ -130,12 +124,12 @@ try
 
     await host.RunAsync();
     Log.Information("Tally BigQuery Agent stopped (exit code {Code})", Environment.ExitCode);
-    return Environment.ExitCode; // 0 normally; 1 when UnconfiguredWorker requests a restart
+    return Environment.ExitCode;
 }
 catch (Exception ex)
 {
     Log.Fatal(ex, "Tally BigQuery Agent terminated unexpectedly");
-    return 1; // non-zero → SCM failure actions restart us (sc failureflag = 1)
+    return 1;
 }
 finally
 {
@@ -144,7 +138,6 @@ finally
 
 static void ApplyLogLevel(string level)
 {
-    // Rebuild the static logger if a non-default level is configured.
     var parsed = level.ToLowerInvariant() switch
     {
         "debug" => LogEventLevel.Debug,
@@ -168,18 +161,18 @@ static void ApplyLogLevel(string level)
         .CreateLogger();
 }
 
-/// <summary>Shared mutable state surfaced to heartbeats and the manager app.</summary>
+/// <summary>Shared mutable health state surfaced to workers and diagnostics.</summary>
 public sealed class AgentState
 {
     public volatile bool TallyConnected;
     public volatile bool TallyCompanyOpen;
     public volatile bool InternetConnected = true;
+    /// <summary>True when /health works but optional monitoring/notification routes do not.</summary>
+    public volatile bool CloudDegraded;
     public string? LastAttemptedSyncUtc;
     public string CurrentOperation = "starting";
 }
 
-/// <summary>Runs when no valid config exists: logs a reminder, exits idle loop
-/// once config appears (SCM restart picks it up), never crash-loops.</summary>
 public sealed class UnconfiguredWorker(ILogger<UnconfiguredWorker> log,
     IHostApplicationLifetime lifetime) : BackgroundService
 {
@@ -190,8 +183,6 @@ public sealed class UnconfiguredWorker(ILogger<UnconfiguredWorker> log,
             if (File.Exists(AgentInfo.ConfigPath))
             {
                 log.LogInformation("Configuration detected — restarting service to load it");
-                // Exit non-zero so SCM failure actions restart us with the new config
-                // (a clean exit would leave the service stopped forever).
                 Environment.ExitCode = 1;
                 lifetime.StopApplication();
                 return;

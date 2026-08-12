@@ -47,14 +47,32 @@ public static partial class TallyXml
         return XDocument.Parse(text, LoadOptions.None);
     }
 
-    // ── field readers (direct children only, mirroring findtext) ──
+    // ── field readers (direct children first; attributes as a Tally master fallback) ──
 
-    public static string Text(XElement el, string tag, string fallback = "") =>
-        el.Element(tag)?.Value.Trim() ?? fallback;
+    /// <summary>
+    /// Read a direct child field. Tally master exports frequently emit NAME (and
+    /// occasionally other scalar fields) as an attribute on the master element
+    /// instead of a child node. Falling back to a same-named attribute prevents
+    /// valid Group/StockItem masters from being silently discarded as unnamed.
+    /// </summary>
+    public static string Text(XElement el, string tag, string fallback = "")
+    {
+        var child = el.Element(tag)?.Value.Trim();
+        if (!string.IsNullOrEmpty(child)) return child;
+
+        var attr = el.Attribute(tag)?.Value.Trim();
+        if (!string.IsNullOrEmpty(attr)) return attr;
+
+        // Be tolerant of case differences introduced by some Tally builds/TDL.
+        attr = el.Attributes()
+            .FirstOrDefault(a => a.Name.LocalName.Equals(tag, StringComparison.OrdinalIgnoreCase))?
+            .Value.Trim();
+        return !string.IsNullOrEmpty(attr) ? attr : fallback;
+    }
 
     public static double Num(XElement el, string tag)
     {
-        var raw = (el.Element(tag)?.Value ?? "0").Replace(",", "").Trim();
+        var raw = Text(el, tag, "0").Replace(",", "").Trim();
         raw = NonNumeric().Replace(raw, "");
         return double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : 0.0;
     }
@@ -63,7 +81,7 @@ public static partial class TallyXml
 
     public static bool Bool(XElement el, string tag)
     {
-        var v = (el.Element(tag)?.Value ?? "").Trim().ToUpperInvariant();
+        var v = Text(el, tag).Trim().ToUpperInvariant();
         return v is "YES" or "TRUE" or "1";
     }
 
@@ -72,7 +90,7 @@ public static partial class TallyXml
     /// <summary>ISO yyyy-MM-dd or null.</summary>
     public static string? Date(XElement el, string tag)
     {
-        var raw = (el.Element(tag)?.Value ?? "").Trim();
+        var raw = Text(el, tag).Trim();
         if (raw.Length == 0) return null;
         foreach (var fmt in DateFormats)
             if (DateTime.TryParseExact(raw, fmt, CultureInfo.InvariantCulture, DateTimeStyles.None, out var d))
