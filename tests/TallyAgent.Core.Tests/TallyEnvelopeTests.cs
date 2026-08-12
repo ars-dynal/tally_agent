@@ -6,7 +6,7 @@ namespace TallyAgent.Core.Tests;
 public sealed class TallyEnvelopeTests
 {
     [Fact]
-    public void VoucherCollection_UsesExplicitDateFilterAndCompany()
+    public void VoucherCollection_IsPeriodBoundWithoutFullScanFilter()
     {
         var xml = TallyEnvelopes.VoucherCollection(
             new DateOnly(2019, 4, 1),
@@ -18,8 +18,11 @@ public sealed class TallyEnvelopeTests
         Assert.Contains("<SVFROMDATE>20190401</SVFROMDATE>", xml);
         Assert.Contains("<SVTODATE>20190501</SVTODATE>", xml);
         Assert.Contains("<SVCURRENTCOMPANY>Dynalektric Equipment Private Limited</SVCURRENTCOMPANY>", xml);
-        Assert.Contains("<FILTER>AgentVoucherDateFilter</FILTER>", xml);
-        Assert.Contains("$Date &gt;= ##SVFromDate AND $Date &lt;= ##SVToDate", xml);
+        // The explicit $Date filter forced Tally to scan the ENTIRE voucher
+        // file on every window (any window size timed out identically). The
+        // collection must stay period-bound via SVFROMDATE/SVTODATE only.
+        Assert.DoesNotContain("<FILTER>", xml);
+        Assert.DoesNotContain("##SVFromDate", xml);
         Assert.Contains("ALLLEDGERENTRIES.*", xml);
         Assert.Contains("ALLINVENTORYENTRIES.*", xml);
     }

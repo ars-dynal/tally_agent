@@ -52,8 +52,14 @@ public static class TallyEnvelopes
     /// <summary>
     /// Export vouchers through an explicit TDL collection instead of relying on
     /// the currently selected Day Book period in the interactive Tally session.
-    /// The date formula is applied at collection level and the same dates are also
-    /// supplied through SVFROMDATE/SVTODATE for compatibility across Tally versions.
+    /// The window is applied ONLY through SVFROMDATE/SVTODATE: a Voucher-type
+    /// collection is period-bound, so Tally serves it from the voucher date
+    /// index. The previous explicit &lt;FILTER&gt; formula ($Date &gt;= ... AND
+    /// $Date &lt;= ...) forced Tally to materialize and scan the ENTIRE voucher
+    /// file (all years) on every window, which is why even 4-day windows timed
+    /// out identically — the cost was company-wide, not window-bound. The
+    /// extractor still validates each voucher's DATE client-side, so any
+    /// out-of-window voucher a Tally build might leak is skipped and logged.
     /// </summary>
     public static string VoucherCollection(DateOnly from, DateOnly to, string? company)
     {
@@ -73,10 +79,7 @@ public static class TallyEnvelopes
           .Append("<FETCH>DATE,VOUCHERTYPENAME,VOUCHERNUMBER,REFERENCE,NARRATION,PARTYLEDGERNAME,GUID,MASTERID,ALTERID,ISCANCELLED,ISOPTIONAL,AMOUNT</FETCH>")
           .Append("<FETCH>ALLLEDGERENTRIES.*,LEDGERENTRIES.*,ALLINVENTORYENTRIES.*,INVENTORYENTRIES.*</FETCH>")
           .Append("<FETCH>BILLALLOCATIONS.*,BANKALLOCATIONS.*,CATEGORYALLOCATIONS.*,COSTCENTREALLOCATIONS.*,BATCHALLOCATIONS.*</FETCH>")
-          .Append("<FILTER>AgentVoucherDateFilter</FILTER></COLLECTION>")
-          .Append("<SYSTEM TYPE=\"Formulae\" NAME=\"AgentVoucherDateFilter\">")
-          .Append("$Date &gt;= ##SVFromDate AND $Date &lt;= ##SVToDate")
-          .Append("</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>");
+          .Append("</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>");
         return sb.ToString();
     }
 
