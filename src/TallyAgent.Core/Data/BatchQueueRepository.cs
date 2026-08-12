@@ -63,16 +63,11 @@ public sealed class BatchQueueRepository(AgentDatabase db)
         return Convert.ToInt64(cmd.ExecuteScalar());
     }
 
-    /// <summary>Find an equivalent active batch before allocating a new sequence.
-    /// This prevents an identical re-extraction from receiving a different sequence
-    /// number and therefore a different deterministic batch ID.</summary>
+    /// <summary>Find an equivalent active batch before allocating a new sequence.</summary>
     public QueuedBatch? FindEquivalentActiveBatch(
         string dataset, string company, string? windowFrom, string? windowTo,
         string contentChecksum, long recordCount)
     {
-        // Matches on content_checksum (business rows only, audit fields excluded)
-        // so a re-extraction with a new _sync_id/_sync_timestamp still matches.
-        // Rows migrated from schema v2 have '' and never match — safe.
         if (string.IsNullOrEmpty(contentChecksum)) return null;
         using var conn = db.Open();
         using var cmd = conn.CreateCommand();
@@ -98,10 +93,6 @@ public sealed class BatchQueueRepository(AgentDatabase db)
         return r.Read() ? Map(r) : null;
     }
 
-    /// <summary>Idempotent enqueue: returns false (without throwing) when a batch
-    /// with the same deterministic batch_id already exists — i.e. a byte-identical
-    /// re-extraction of the same window/sequence. The caller keeps the payload file
-    /// (same name, same bytes) and skips the duplicate row.</summary>
     public bool TryEnqueue(QueuedBatch b)
     {
         try
@@ -109,17 +100,22 @@ public sealed class BatchQueueRepository(AgentDatabase db)
             Enqueue(b);
             return true;
         }
-        catch (SqliteException ex) when (ex.SqliteErrorCode == 19) // SQLITE_CONSTRAINT
+        catch (SqliteException ex) when (ex.SqliteErrorCode == 19)
         {
             return false;
         }
     }
 
-    /// <summary>Oldest due batch (per-dataset sequence order preserved). Marks it 'uploading'.</summary>
+    /// <summary>
+    /// Oldest due batch (per-dataset sequence order preserved). Uses an IMMEDIATE
+    /// transaction because this code always performs a write after the SELECT.
+    /// This avoids SQLite's deferred read→write upgrade race, which can surface
+    /// SQLITE_BUSY immediately while SyncWorker is enqueueing.
+    /// </summary>
     public QueuedBatch? DequeueNextDue(DateTime nowUtc)
     {
         using var conn = db.Open();
-        using var tx = conn.BeginTransaction();
+        using var tx = conn.BeginTransaction(deferred: false);
         using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
         cmd.CommandText = """
@@ -131,7 +127,11 @@ public sealed class BatchQueueRepository(AgentDatabase db)
             """;
         cmd.Parameters.AddWithValue("$now", nowUtc.ToString("O"));
         using var r = cmd.ExecuteReader();
-        if (!r.Read()) return null;
+        if (!r.Read())
+        {
+            tx.Commit();
+            return null;
+        }
         var batch = Map(r);
         r.Close();
 
@@ -148,7 +148,8 @@ public sealed class BatchQueueRepository(AgentDatabase db)
     public void Ack(string batchId)
     {
         using var conn = db.Open();
-        using var tx = conn.BeginTransaction();
+        // Ack always mutates history + queue, so acquire write intent up front.
+        using var tx = conn.BeginTransaction(deferred: false);
         string? payloadPath = null;
 
         using (var sel = conn.CreateCommand())
@@ -183,14 +184,12 @@ public sealed class BatchQueueRepository(AgentDatabase db)
         }
         tx.Commit();
 
-        // Payload deleted only after the DB transaction committed the ack.
         if (payloadPath is not null && File.Exists(payloadPath))
         {
-            try { File.Delete(payloadPath); } catch { /* orphan cleanup sweeps later */ }
+            try { File.Delete(payloadPath); } catch { }
         }
     }
 
-    /// <summary>Transient failure: schedule retry with the supplied delay.</summary>
     public void ScheduleRetry(string batchId, string error, TimeSpan delay)
     {
         using var conn = db.Open();
@@ -207,7 +206,6 @@ public sealed class BatchQueueRepository(AgentDatabase db)
         cmd.ExecuteNonQuery();
     }
 
-    /// <summary>Permanent failure (schema rejection): parked for human attention, payload kept.</summary>
     public void MarkFailed(string batchId, string error)
     {
         using var conn = db.Open();
@@ -220,7 +218,6 @@ public sealed class BatchQueueRepository(AgentDatabase db)
         cmd.ExecuteNonQuery();
     }
 
-    /// <summary>Requeue all failed batches (Manager "Retry failed batches").</summary>
     public int RetryAllFailed()
     {
         using var conn = db.Open();
@@ -233,7 +230,6 @@ public sealed class BatchQueueRepository(AgentDatabase db)
         return cmd.ExecuteNonQuery();
     }
 
-    /// <summary>Reset 'uploading' rows left behind by a crash back to 'pending'.</summary>
     public int RecoverStuckUploads()
     {
         using var conn = db.Open();
@@ -242,9 +238,7 @@ public sealed class BatchQueueRepository(AgentDatabase db)
         return cmd.ExecuteNonQuery();
     }
 
-    /// <summary>ALL payload file names referenced by ANY queue row, regardless of
-    /// status and with NO row limit. Used by the startup orphan sweep — an
-    /// incomplete list here would cause live payload files to be deleted.</summary>
+    /// <summary>ALL payload file names referenced by ANY queue row, regardless of status.</summary>
     public HashSet<string> GetAllReferencedPayloadFileNames()
     {
         var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -260,8 +254,6 @@ public sealed class BatchQueueRepository(AgentDatabase db)
         return set;
     }
 
-    /// <summary>Mark 'failed' any queue row whose payload file is missing on disk.
-    /// Returns the affected batch ids (startup integrity check).</summary>
     public List<string> MarkRowsWithMissingPayloads()
     {
         var missing = new List<string>();
