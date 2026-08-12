@@ -10,20 +10,35 @@ public sealed record VoucherPlan(
     /// <summary>Days between the checkpointed high-water mark and the lookback
     /// horizon that would have been silently skipped by lookback-only planning.
     /// &gt; 0 means the agent recovered an outage gap this cycle.</summary>
-    int RecoveredGapDays);
+    int RecoveredGapDays,
+    /// <summary>For a full sync: the oldest date the walk must reach. The
+    /// engine marks the full sync done when a completed window's From reaches
+    /// this date. Null for incremental plans.</summary>
+    DateOnly? TargetStart = null);
 
 /// <summary>
 /// Pure voucher-window planning (extracted from SyncEngine for testability).
 ///
-/// Full sync: chunked [start → today] windows, resuming from the checkpoint.
+/// Full sync is NEWEST-FIRST: chunked windows walk from today BACKWARDS to the
+/// extraction start, so the most recent (most valuable) data lands in BigQuery
+/// first and an interrupted history walk resumes from where it stopped going
+/// further back. The checkpoint frontier is LastFromDate (the oldest date
+/// extracted so far); LastToDate records the newest date covered.
+///
 /// Incremental: the window ALWAYS starts at the earlier of
 ///   (checkpoint.LastToDate + 1)  and  (today − lookbackDays)
 /// so an outage longer than the lookback can never create a silent gap —
 /// the missed days are re-extracted and the gap is surfaced to the caller
-/// for alerting. Long gaps are chunked like a full sync.
+/// for alerting. Long gaps are chunked (oldest-first, as they are small).
 /// </summary>
 public static class SyncPlanner
 {
+    /// <summary>Sentinel written to SyncCheckpoint.LastAlterId marking a
+    /// checkpoint produced by the newest-first (v2) full-sync walk. Older
+    /// forward-walk checkpoints (null/other) cannot be resumed backwards and
+    /// are ignored, restarting the walk (batch dedup makes that cheap).</summary>
+    public const long NewestFirstCheckpointMarker = 2;
+
     public static VoucherPlan PlanVoucherWindows(
         TallySettings settings, SyncCheckpoint? checkpoint, DateOnly today)
     {
@@ -32,9 +47,21 @@ public static class SyncPlanner
 
         if (checkpoint is not { FullSyncDone: true })
         {
-            var start = ResolveExtractionStart(settings, checkpoint, today);
-            AddChunked(windows, start, today, chunk);
-            return new VoucherPlan(windows, IsFullSync: true, RecoveredGapDays: 0);
+            var target = ResolveExtractionStart(settings, today);
+
+            // Resume a newest-first walk: continue backwards from the day
+            // before the oldest window already completed.
+            var top = today;
+            if (checkpoint?.LastAlterId == NewestFirstCheckpointMarker &&
+                TryParseIsoDate(checkpoint.LastFromDate) is { } frontier)
+            {
+                if (frontier <= target) // walk already reached the start
+                    return new VoucherPlan(windows, IsFullSync: true, 0, target);
+                top = frontier.AddDays(-1);
+            }
+
+            AddChunkedNewestFirst(windows, target, top, chunk);
+            return new VoucherPlan(windows, IsFullSync: true, 0, target);
         }
 
         var lookback = Math.Max(0, settings.IncrementalLookbackDays);
@@ -52,7 +79,7 @@ public static class SyncPlanner
             : 0;
 
         AddChunked(windows, start2, today, chunk);
-        return new VoucherPlan(windows, IsFullSync: false, RecoveredGapDays: gapDays);
+        return new VoucherPlan(windows, IsFullSync: false, gapDays);
     }
 
     private static void AddChunked(List<(DateOnly, DateOnly)> windows,
@@ -66,12 +93,23 @@ public static class SyncPlanner
         }
     }
 
-    private static DateOnly ResolveExtractionStart(
-        TallySettings settings, SyncCheckpoint? checkpoint, DateOnly today)
+    /// <summary>Chunked windows ordered newest-first: the first window ends at
+    /// <paramref name="end"/> and each subsequent window is the chunk before,
+    /// down to <paramref name="start"/>. Windows stay internally ascending
+    /// (From ≤ To) so extraction and checkpoints are unchanged.</summary>
+    private static void AddChunkedNewestFirst(List<(DateOnly, DateOnly)> windows,
+        DateOnly start, DateOnly end, int chunkDays)
     {
-        // Resume after crash: continue from day after last completed window
-        if (TryParseIsoDate(checkpoint?.LastToDate) is { } lastTo)
-            return lastTo.AddDays(1);
+        for (var to = end; to >= start; to = to.AddDays(-chunkDays))
+        {
+            var from = to.AddDays(-(chunkDays - 1));
+            if (from < start) from = start;
+            windows.Add((from, to));
+        }
+    }
+
+    private static DateOnly ResolveExtractionStart(TallySettings settings, DateOnly today)
+    {
         if (TryParseIsoDate(settings.ExtractionStartDate) is { } configured)
             return configured;
         // Default: start of current financial year (April 1, India)

@@ -11,12 +11,12 @@ public sealed record TallyProbeResult(bool Ok, IReadOnlyList<string> Companies, 
     ErrorCategory? Category = null);
 
 /// <summary>
-/// HTTP transport to the local TallyPrime XML server with categorized failures
-/// and bounded retries (10s / 30s / 60s backoff).
+/// HTTP transport to the local TallyPrime XML server with categorized failures,
+/// bounded timeout retries and bounded auto-reconnect for temporary server drops.
 /// </summary>
 public sealed class TallyClient
 {
-    private static readonly TimeSpan[] RetryBackoff =
+    private static readonly TimeSpan[] TimeoutRetryBackoff =
         [TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(60)];
 
     private readonly HttpClient _http;
@@ -28,10 +28,18 @@ public sealed class TallyClient
         _settings = settings;
         _log = log;
         _http = http ?? new HttpClient();
-        _http.Timeout = TimeSpan.FromSeconds(settings.RequestTimeoutSeconds);
+        // Timeouts are enforced per request (PostOnceAsync) so heavy voucher
+        // windows can use a longer budget than light master/report calls.
+        _http.Timeout = Timeout.InfiniteTimeSpan;
     }
 
     public string Company => _settings.Company;
+
+    /// <summary>Request budget for windowed voucher extraction — the heaviest
+    /// Tally call. Never below the general request timeout.</summary>
+    public TimeSpan VoucherRequestTimeout =>
+        TimeSpan.FromSeconds(Math.Max(_settings.RequestTimeoutSeconds,
+            _settings.VoucherTimeoutSeconds));
 
     /// <summary>Fast TCP probe + company list. Distinguishes "not running" from
     /// "port blocked" from "company not open".</summary>
@@ -84,7 +92,6 @@ public sealed class TallyClient
         }
     }
 
-    /// <summary>POST an envelope with bounded retries; parses + sanitizes the response.</summary>
     /// <summary>POST an envelope and return the RAW sanitized response text —
     /// used by the capture-xml diagnostics verb to persist real Tally responses
     /// as validation fixtures (ARCHITECTURE §8.4 extraction-validation gate).</summary>
@@ -113,45 +120,93 @@ public sealed class TallyClient
         return null;
     }
 
-    public async Task<XDocument> PostAsync(string envelope, CancellationToken ct = default)
+    /// <summary>
+    /// POST an envelope with two resilience modes:
+    ///  • slow/heavy request timeout: retry 10s/30s/60s, then return TallyTimeout
+    ///    so the SyncEngine can split the voucher window;
+    ///  • Tally temporarily unreachable: keep probing the same request at a
+    ///    bounded interval for up to reconnectMaxMinutes, then continue exactly
+    ///    where the sync stopped when Tally comes back.
+    /// </summary>
+    public Task<XDocument> PostAsync(string envelope, CancellationToken ct = default) =>
+        PostAsync(envelope, null, null, ct);
+
+    /// <summary>
+    /// As <see cref="PostAsync(string, CancellationToken)"/> but with a caller-set
+    /// timeout budget and timeout-retry count. Voucher window extraction passes
+    /// maxTimeoutRetries: 0 for multi-day windows — retrying an identical heavy
+    /// request at the same size is deterministic waste (~10 min per ladder);
+    /// splitting the window immediately converges far faster.
+    /// </summary>
+    public async Task<XDocument> PostAsync(string envelope, TimeSpan? requestTimeout,
+        int? maxTimeoutRetries, CancellationToken ct = default)
     {
-        TallyException? last = null;
-        for (var attempt = 0; attempt <= RetryBackoff.Length; attempt++)
+        var reconnectDeadline = DateTime.UtcNow.AddMinutes(Math.Max(1, _settings.ReconnectMaxMinutes));
+        var reconnectDelay = TimeSpan.FromSeconds(Math.Max(5, _settings.ReconnectRetrySeconds));
+        var timeoutRetries = Math.Clamp(maxTimeoutRetries ?? TimeoutRetryBackoff.Length,
+            0, TimeoutRetryBackoff.Length);
+        var timeoutAttempt = 0;
+
+        while (true)
         {
             try
             {
-                return await PostOnceAsync(envelope, ct);
+                return await PostOnceAsync(envelope, requestTimeout, ct);
             }
-            catch (TallyException tex) when (tex.Category is ErrorCategory.TallyTimeout
-                or ErrorCategory.TallyNotRunning or ErrorCategory.TallyPortUnavailable)
+            catch (TallyException tex) when (tex.Category == ErrorCategory.TallyTimeout)
             {
-                last = tex;
-                if (attempt < RetryBackoff.Length)
+                if (timeoutAttempt >= timeoutRetries)
+                    throw;
+
+                var delay = TimeoutRetryBackoff[timeoutAttempt++];
+                _log.LogWarning("Tally request timed out (attempt {N}): {Msg} — retrying in {Delay}s",
+                    timeoutAttempt, tex.Message, delay.TotalSeconds);
+                await Task.Delay(delay, ct);
+            }
+            catch (TallyException tex) when (tex.Category is ErrorCategory.TallyNotRunning
+                or ErrorCategory.TallyPortUnavailable)
+            {
+                if (DateTime.UtcNow >= reconnectDeadline)
                 {
-                    _log.LogWarning("Tally request failed (attempt {N}): {Msg} — retrying in {Delay}s",
-                        attempt + 1, tex.Message, RetryBackoff[attempt].TotalSeconds);
-                    await Task.Delay(RetryBackoff[attempt], ct);
+                    _log.LogError("Tally did not recover within {Minutes} minute(s); preserving checkpoint for resume",
+                        Math.Max(1, _settings.ReconnectMaxMinutes));
+                    throw;
                 }
+
+                timeoutAttempt = 0;
+                var remaining = Math.Max(0, (int)Math.Ceiling((reconnectDeadline - DateTime.UtcNow).TotalMinutes));
+                _log.LogWarning(
+                    "Tally connection dropped: {Msg} — auto-reconnect in {Delay}s (up to {Remaining} min remaining)",
+                    tex.Message, reconnectDelay.TotalSeconds, remaining);
+                await Task.Delay(reconnectDelay, ct);
             }
         }
-        throw last!;
     }
 
-    private async Task<XDocument> PostOnceAsync(string envelope, CancellationToken ct)
+    private Task<XDocument> PostOnceAsync(string envelope, CancellationToken ct) =>
+        PostOnceAsync(envelope, null, ct);
+
+    private async Task<XDocument> PostOnceAsync(string envelope, TimeSpan? requestTimeout,
+        CancellationToken ct)
     {
+        var budget = requestTimeout
+            ?? TimeSpan.FromSeconds(Math.Max(1, _settings.RequestTimeoutSeconds));
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(budget);
+
         HttpResponseMessage resp;
         byte[] body;
         try
         {
             using var content = new ByteArrayContent(Encoding.UTF8.GetBytes(envelope));
             content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("text/xml");
-            resp = await _http.PostAsync(_settings.BaseUri, content, ct);
-            body = await resp.Content.ReadAsByteArrayAsync(ct);
+            resp = await _http.PostAsync(_settings.BaseUri, content, timeoutCts.Token);
+            body = await resp.Content.ReadAsByteArrayAsync(timeoutCts.Token);
         }
-        catch (TaskCanceledException) when (!ct.IsCancellationRequested)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             throw new TallyException(ErrorCategory.TallyTimeout,
-                $"Tally request timed out after {_settings.RequestTimeoutSeconds}s " +
+                $"Tally request timed out after {(int)budget.TotalSeconds}s " +
                 $"({_settings.Host}:{_settings.Port}).");
         }
         catch (HttpRequestException ex)

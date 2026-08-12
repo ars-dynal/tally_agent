@@ -23,6 +23,14 @@ public sealed class TallySettings
     [JsonPropertyName("extractionStartDate")] public string ExtractionStartDate { get; set; } = "";
     [JsonPropertyName("syncFrequencyMinutes")] public int SyncFrequencyMinutes { get; set; } = 15;
     [JsonPropertyName("requestTimeoutSeconds")] public int RequestTimeoutSeconds { get; set; } = 120;
+    /// <summary>Timeout for windowed voucher extraction requests, which are the
+    /// heaviest calls the agent makes. Defaults higher than requestTimeoutSeconds
+    /// so a large month gets a fair chance before the window is split.</summary>
+    [JsonPropertyName("voucherTimeoutSeconds")] public int VoucherTimeoutSeconds { get; set; } = 300;
+    /// <summary>How long an active sync waits for a temporarily unavailable Tally server before giving up.</summary>
+    [JsonPropertyName("reconnectMaxMinutes")] public int ReconnectMaxMinutes { get; set; } = 30;
+    /// <summary>Delay between Tally reachability probes while auto-reconnecting.</summary>
+    [JsonPropertyName("reconnectRetrySeconds")] public int ReconnectRetrySeconds { get; set; } = 30;
     [JsonPropertyName("autoDiscoverCompanies")] public bool AutoDiscoverCompanies { get; set; } = true;
     [JsonPropertyName("enableMasters")] public bool EnableMasters { get; set; } = true;
     [JsonPropertyName("enableVouchers")] public bool EnableVouchers { get; set; } = true;

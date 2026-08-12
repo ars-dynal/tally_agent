@@ -6,7 +6,8 @@ namespace TallyAgent.Core.Tally;
 public static class TallyEnvelopes
 {
     /// <summary>Collection request: &lt;TYPE&gt;Ledger&lt;/TYPE&gt; + FETCH list.</summary>
-    public static string Collection(string collectionType, IEnumerable<string> fetchFields, string? company)
+    public static string Collection(string collectionType, IEnumerable<string> fetchFields, string? company,
+        DateOnly? from = null, DateOnly? to = null)
     {
         var sb = new StringBuilder(1024);
         sb.Append("<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>")
@@ -15,6 +16,10 @@ public static class TallyEnvelopes
           .Append("<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>");
         if (!string.IsNullOrEmpty(company))
             sb.Append("<SVCURRENTCOMPANY>").Append(TallyXml.XmlEscape(company)).Append("</SVCURRENTCOMPANY>");
+        if (from is { } f)
+            sb.Append("<SVFROMDATE>").Append(f.ToString("yyyyMMdd")).Append("</SVFROMDATE>");
+        if (to is { } t)
+            sb.Append("<SVTODATE>").Append(t.ToString("yyyyMMdd")).Append("</SVTODATE>");
         sb.Append("</STATICVARIABLES><TDL><TDLMESSAGE>")
           .Append("<COLLECTION NAME=\"AgentCollection\"><TYPE>")
           .Append(collectionType).Append("</TYPE>");
@@ -47,8 +52,14 @@ public static class TallyEnvelopes
     /// <summary>
     /// Export vouchers through an explicit TDL collection instead of relying on
     /// the currently selected Day Book period in the interactive Tally session.
-    /// The date formula is applied at collection level and the same dates are also
-    /// supplied through SVFROMDATE/SVTODATE for compatibility across Tally versions.
+    /// The window is applied ONLY through SVFROMDATE/SVTODATE: a Voucher-type
+    /// collection is period-bound, so Tally serves it from the voucher date
+    /// index. The previous explicit &lt;FILTER&gt; formula ($Date &gt;= ... AND
+    /// $Date &lt;= ...) forced Tally to materialize and scan the ENTIRE voucher
+    /// file (all years) on every window, which is why even 4-day windows timed
+    /// out identically — the cost was company-wide, not window-bound. The
+    /// extractor still validates each voucher's DATE client-side, so any
+    /// out-of-window voucher a Tally build might leak is skipped and logged.
     /// </summary>
     public static string VoucherCollection(DateOnly from, DateOnly to, string? company)
     {
@@ -68,10 +79,7 @@ public static class TallyEnvelopes
           .Append("<FETCH>DATE,VOUCHERTYPENAME,VOUCHERNUMBER,REFERENCE,NARRATION,PARTYLEDGERNAME,GUID,MASTERID,ALTERID,ISCANCELLED,ISOPTIONAL,AMOUNT</FETCH>")
           .Append("<FETCH>ALLLEDGERENTRIES.*,LEDGERENTRIES.*,ALLINVENTORYENTRIES.*,INVENTORYENTRIES.*</FETCH>")
           .Append("<FETCH>BILLALLOCATIONS.*,BANKALLOCATIONS.*,CATEGORYALLOCATIONS.*,COSTCENTREALLOCATIONS.*,BATCHALLOCATIONS.*</FETCH>")
-          .Append("<FILTER>AgentVoucherDateFilter</FILTER></COLLECTION>")
-          .Append("<SYSTEM TYPE=\"Formulae\" NAME=\"AgentVoucherDateFilter\">")
-          .Append("$Date &gt;= ##SVFromDate AND $Date &lt;= ##SVToDate")
-          .Append("</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>");
+          .Append("</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>");
         return sb.ToString();
     }
 

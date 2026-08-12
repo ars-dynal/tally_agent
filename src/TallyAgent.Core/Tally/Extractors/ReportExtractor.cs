@@ -42,7 +42,38 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
                 ["parent_group"] = "",
             };
         });
+        if (rows.Count == 0)
+            rows = await TrialBalanceFromLedgers(from, to, ct);
         log.LogInformation("Trial balance: {N} rows", rows.Count);
+        return rows;
+    }
+
+    /// <summary>Fallback when the "Trial Balance" report export yields no rows
+    /// (report layouts vary across TallyPrime builds): derive the trial balance
+    /// from a period-bound Ledger collection — CLOSINGBALANCE honours SVTODATE,
+    /// so the figures are as-of the requested period end.</summary>
+    private async Task<List<Row>> TrialBalanceFromLedgers(DateOnly from, DateOnly to, CancellationToken ct)
+    {
+        log.LogInformation("Trial balance report export was empty — falling back to dated Ledger collection");
+        var doc = await client.PostAsync(TallyEnvelopes.Collection(
+            "Ledger", ["NAME", "PARENT", "CLOSINGBALANCE"], client.Company, from, to), ct);
+        var rows = new List<Row>();
+        foreach (var el in doc.Descendants().Where(e => Is(e, "LEDGER")))
+        {
+            var name = Text(el, "NAME");
+            if (name.Length == 0) continue;
+            var closing = Num(el, "CLOSINGBALANCE");
+            if (closing == 0) continue;
+            // Tally sign convention: positive = credit, negative = debit.
+            rows.Add(new Row
+            {
+                ["ledger_name"] = name,
+                ["closing_debit"] = closing < 0 ? Math.Abs(closing) : 0,
+                ["closing_credit"] = closing > 0 ? closing : 0,
+                ["net_amount"] = -closing,
+                ["parent_group"] = Text(el, "PARENT"),
+            });
+        }
         return rows;
     }
 
@@ -62,6 +93,8 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
                 ["category"] = amount >= 0 ? "Liabilities" : "Assets",
             };
         });
+        if (rows.Count == 0)
+            rows = await GroupBalances(from, to, revenueGroups: false, ct);
         log.LogInformation("Balance sheet: {N} rows", rows.Count);
         return rows;
     }
@@ -81,7 +114,40 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
                 ["parent_group"] = "",
             };
         });
+        if (rows.Count == 0)
+            rows = await GroupBalances(from, to, revenueGroups: true, ct);
         log.LogInformation("P&L: {N} rows", rows.Count);
+        return rows;
+    }
+
+    /// <summary>Fallback for empty Balance Sheet / P&amp;L report exports:
+    /// period-bound Group collection closing balances. Balance sheet keeps
+    /// non-revenue groups; P&amp;L keeps revenue groups (ISREVENUE).</summary>
+    private async Task<List<Row>> GroupBalances(DateOnly from, DateOnly to,
+        bool revenueGroups, CancellationToken ct)
+    {
+        log.LogInformation("{Report} report export was empty — falling back to dated Group collection",
+            revenueGroups ? "P&L" : "Balance sheet");
+        var doc = await client.PostAsync(TallyEnvelopes.Collection(
+            "Group", ["NAME", "PARENT", "ISREVENUE", "CLOSINGBALANCE"], client.Company, from, to), ct);
+        var rows = new List<Row>();
+        foreach (var el in doc.Descendants().Where(e => Is(e, "GROUP")))
+        {
+            var name = Text(el, "NAME");
+            if (name.Length == 0) continue;
+            if (Bool(el, "ISREVENUE") != revenueGroups) continue;
+            var amount = Num(el, "CLOSINGBALANCE");
+            if (amount == 0) continue;
+            var row = new Row
+            {
+                ["ledger_name"] = name,
+                ["amount"] = amount,
+                ["parent_group"] = Text(el, "PARENT"),
+            };
+            if (!revenueGroups)
+                row["category"] = amount >= 0 ? "Liabilities" : "Assets";
+            rows.Add(row);
+        }
         return rows;
     }
 
@@ -116,7 +182,43 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
                     ? NumByLocalName(cl, "DSPCLAMTA") : NumByLocalName(cl, "DSPSTKCLAMT"),
             });
         }
+        if (rows.Count == 0)
+            rows = await StockSummaryFromItems(from, to, ct);
         log.LogInformation("Stock summary: {N} rows", rows.Count);
+        return rows;
+    }
+
+    /// <summary>Fallback for an empty "Stock Summary" report export: period-bound
+    /// StockItem collection — closing qty/value honour SVTODATE.</summary>
+    private async Task<List<Row>> StockSummaryFromItems(DateOnly from, DateOnly to, CancellationToken ct)
+    {
+        log.LogInformation("Stock summary report export was empty — falling back to dated StockItem collection");
+        var doc = await client.PostAsync(TallyEnvelopes.Collection(
+            "StockItem",
+            ["NAME", "PARENT", "OPENINGBALANCE", "OPENINGVALUE", "CLOSINGBALANCE", "CLOSINGVALUE"],
+            client.Company, from, to), ct);
+        var rows = new List<Row>();
+        foreach (var el in doc.Descendants().Where(e => Is(e, "STOCKITEM")))
+        {
+            var name = Text(el, "NAME");
+            if (name.Length == 0) continue;
+            var closingQty = Num(el, "CLOSINGBALANCE");
+            var closingValue = Num(el, "CLOSINGVALUE");
+            if (closingQty == 0 && closingValue == 0) continue;
+            rows.Add(new Row
+            {
+                ["item_name"] = name,
+                ["stock_group"] = Text(el, "PARENT"),
+                ["opening_qty"] = Num(el, "OPENINGBALANCE"),
+                ["opening_value"] = Num(el, "OPENINGVALUE"),
+                ["inward_qty"] = 0d,
+                ["inward_value"] = 0d,
+                ["outward_qty"] = 0d,
+                ["outward_value"] = 0d,
+                ["closing_qty"] = closingQty,
+                ["closing_value"] = closingValue,
+            });
+        }
         return rows;
     }
 
