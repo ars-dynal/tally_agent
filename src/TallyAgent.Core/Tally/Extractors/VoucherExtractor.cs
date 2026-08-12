@@ -38,8 +38,15 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
     public async Task<DayBookResult> ExtractWindow(DateOnly from, DateOnly to,
         ISet<string> bankLedgerNames, CancellationToken ct)
     {
+        // Multi-day windows do NOT retry a timeout at the same size — the
+        // SyncEngine splits the window instead (retrying an identical heavy
+        // request is deterministic waste). Single-day windows can't be split,
+        // so they keep the full retry ladder.
+        var days = to.DayNumber - from.DayNumber + 1;
         var doc = await client.PostAsync(
-            TallyEnvelopes.VoucherCollection(from, to, client.Company), ct);
+            TallyEnvelopes.VoucherCollection(from, to, client.Company),
+            requestTimeout: client.VoucherRequestTimeout,
+            maxTimeoutRetries: days > 1 ? 0 : null, ct);
         var result = new DayBookResult();
         var seenVoucherKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var outOfWindow = 0;
