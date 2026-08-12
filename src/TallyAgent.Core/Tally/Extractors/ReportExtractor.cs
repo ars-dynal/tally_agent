@@ -7,14 +7,20 @@ namespace TallyAgent.Core.Tally.Extractors;
 using Row = Dictionary<string, object?>;
 
 /// <summary>Snapshot reports: Trial Balance, Balance Sheet, P&amp;L, Stock Summary,
-/// outstanding payables/receivables. Handles both the TallyPrime flat-sibling
-/// DSPACCNAME layout and the older nested layout.</summary>
+/// outstanding payables/receivables. Handles both flat-sibling and nested layouts
+/// and does not assume report rows are direct children of the XML root.</summary>
 public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor> log)
 {
+    private static bool Is(XElement el, string localName) =>
+        el.Name.LocalName.Equals(localName, StringComparison.OrdinalIgnoreCase);
+
+    private static XElement? Child(XElement el, string localName) =>
+        el.Elements().FirstOrDefault(e => Is(e, localName));
+
     /// <summary>DSPACCNAME → DSPDISPNAME (TallyPrime) or element text (legacy).</summary>
     private static string DspName(XElement el)
     {
-        var disp = el.Element("DSPDISPNAME")?.Value;
+        var disp = Child(el, "DSPDISPNAME")?.Value;
         return (disp ?? el.Value ?? "").Trim();
     }
 
@@ -24,9 +30,9 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
             TallyEnvelopes.Report("Trial Balance", from, to, client.Company), ct);
         var rows = WalkNameAmountPairs(doc, (name, amtEl) =>
         {
-            var dr = amtEl.Element("DSPCLDR") is not null ? Num(amtEl, "DSPCLDR") : 0;
-            var cr = amtEl.Element("DSPCLCR") is not null ? Num(amtEl, "DSPCLCR") : 0;
-            if (dr == 0 && cr == 0) dr = Num(amtEl, "BSMAINAMT");
+            var dr = Child(amtEl, "DSPCLDR") is not null ? NumByLocalName(amtEl, "DSPCLDR") : 0;
+            var cr = Child(amtEl, "DSPCLCR") is not null ? NumByLocalName(amtEl, "DSPCLCR") : 0;
+            if (dr == 0 && cr == 0) dr = NumByLocalName(amtEl, "BSMAINAMT");
             return new Row
             {
                 ["ledger_name"] = name,
@@ -46,8 +52,8 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
             TallyEnvelopes.Report("Balance Sheet", from, to, client.Company), ct);
         var rows = WalkNameAmountPairs(doc, (name, amtEl) =>
         {
-            var amount = Num(amtEl, "BSMAINAMT");
-            if (amount == 0) amount = Num(amtEl, "BSSUBAMT");
+            var amount = NumByLocalName(amtEl, "BSMAINAMT");
+            if (amount == 0) amount = NumByLocalName(amtEl, "BSSUBAMT");
             return new Row
             {
                 ["ledger_name"] = name,
@@ -66,8 +72,8 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
             TallyEnvelopes.Report("Profit and Loss A/c", from, to, client.Company), ct);
         var rows = WalkNameAmountPairs(doc, (name, amtEl) =>
         {
-            var amount = Num(amtEl, "PLAMT");
-            if (amount == 0) amount = Num(amtEl, "BSMAINAMT");
+            var amount = NumByLocalName(amtEl, "PLAMT");
+            if (amount == 0) amount = NumByLocalName(amtEl, "BSMAINAMT");
             return new Row
             {
                 ["ledger_name"] = name,
@@ -84,46 +90,43 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
         var doc = await client.PostAsync(
             TallyEnvelopes.Report("Stock Summary", from, to, client.Company), ct);
         var rows = new List<Row>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        // TallyPrime: DSPACCNAME followed by DSPSTKINFO sibling
-        var root = doc.Root;
-        if (root is null) return rows;
-        var children = root.Elements().ToList();
-        for (var i = 0; i < children.Count - 1; i++)
+        foreach (var nameEl in doc.Descendants().Where(e => Is(e, "DSPACCNAME")))
         {
-            if (children[i].Name.LocalName != "DSPACCNAME") continue;
-            var name = DspName(children[i]);
-            var info = children[i + 1];
-            if (name.Length == 0) continue;
+            var name = DspName(nameEl);
+            if (name.Length == 0 || !seen.Add(name)) continue;
 
-            var cl = info.Descendants("DSPSTKCL").FirstOrDefault() ?? info;
+            var info = FollowingSibling(nameEl) ?? nameEl.Parent;
+            if (info is null) continue;
+            var cl = info.Descendants().FirstOrDefault(e => Is(e, "DSPSTKCL")) ?? info;
+
             rows.Add(new Row
             {
                 ["item_name"] = name,
                 ["stock_group"] = "",
                 ["opening_qty"] = QtyNum(info, "DSPSTKOPQTY", "DSPOPENQTY"),
-                ["opening_value"] = Num(info, "DSPSTKOPAMT"),
+                ["opening_value"] = NumByLocalName(info, "DSPSTKOPAMT"),
                 ["inward_qty"] = QtyNum(info, "DSPSTKINQTY", "DSPINWQTY"),
-                ["inward_value"] = Num(info, "DSPSTKINAMT"),
+                ["inward_value"] = NumByLocalName(info, "DSPSTKINAMT"),
                 ["outward_qty"] = QtyNum(info, "DSPSTKOUTQTY", "DSPOUTQTY"),
-                ["outward_value"] = Num(info, "DSPSTKOUTAMT"),
+                ["outward_value"] = NumByLocalName(info, "DSPSTKOUTAMT"),
                 ["closing_qty"] = QtyNum(cl, "DSPCLQTY", "DSPSTKCLQTY"),
-                ["closing_value"] = Num(cl, "DSPCLAMTA") != 0 ? Num(cl, "DSPCLAMTA") : Num(cl, "DSPSTKCLAMT"),
+                ["closing_value"] = NumByLocalName(cl, "DSPCLAMTA") != 0
+                    ? NumByLocalName(cl, "DSPCLAMTA") : NumByLocalName(cl, "DSPSTKCLAMT"),
             });
         }
         log.LogInformation("Stock summary: {N} rows", rows.Count);
         return rows;
     }
 
-    /// <summary>Outstanding = closing balances of ledgers under the given parent groups
-    /// (Sundry Creditors / Sundry Debtors), derived from the Ledger collection so it
-    /// works uniformly across Tally versions.</summary>
+    /// <summary>Outstanding = closing balances of ledgers under the given parent groups.</summary>
     public async Task<List<Row>> Outstanding(string parentGroupContains, CancellationToken ct)
     {
         var doc = await client.PostAsync(
             TallyEnvelopes.Collection("Ledger", ["NAME", "PARENT", "CLOSINGBALANCE"], client.Company), ct);
         var rows = new List<Row>();
-        foreach (var el in doc.Descendants("LEDGER"))
+        foreach (var el in doc.Descendants().Where(e => Is(e, "LEDGER")))
         {
             var parent = Text(el, "PARENT");
             if (!parent.Contains(parentGroupContains, StringComparison.OrdinalIgnoreCase)) continue;
@@ -145,7 +148,7 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
         var doc = await client.PostAsync(
             TallyEnvelopes.Collection("Ledger", ["NAME", "PARENT"], client.Company), ct);
         var set = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var el in doc.Descendants("LEDGER"))
+        foreach (var el in doc.Descendants().Where(e => Is(e, "LEDGER")))
         {
             var parent = Text(el, "PARENT");
             if (parent.Contains("Bank", StringComparison.OrdinalIgnoreCase))
@@ -154,15 +157,31 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
         return set;
     }
 
+    private static XElement? FollowingSibling(XElement el)
+    {
+        var parent = el.Parent;
+        if (parent is null) return null;
+        var siblings = parent.Elements().ToList();
+        var index = siblings.IndexOf(el);
+        return index >= 0 && index + 1 < siblings.Count ? siblings[index + 1] : null;
+    }
+
+    private static double NumByLocalName(XElement el, string tag)
+    {
+        var target = el.Elements().FirstOrDefault(e => Is(e, tag))
+            ?? el.Descendants().FirstOrDefault(e => Is(e, tag));
+        if (target is null) return 0;
+        return TallyXml.Num(new XElement("X", new XElement(tag, target.Value)), tag);
+    }
+
     private static double QtyNum(XElement el, params string[] tags)
     {
         foreach (var tag in tags)
         {
-            foreach (var d in el.DescendantsAndSelf(tag))
-            {
-                var v = Num(d.Parent ?? d, tag);
-                if (v != 0) return v;
-            }
+            var target = el.DescendantsAndSelf().FirstOrDefault(e => Is(e, tag));
+            if (target is null) continue;
+            var v = TallyXml.Num(new XElement("X", new XElement(tag, target.Value)), tag);
+            if (v != 0) return v;
         }
         return 0;
     }
@@ -170,36 +189,24 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
     private List<Row> WalkNameAmountPairs(XDocument doc, Func<string, XElement, Row> mapPair)
     {
         var rows = new List<Row>();
-        var root = doc.Root;
-        if (root is null) return rows;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        var children = root.Elements().ToList();
-        var i = 0;
-        while (i < children.Count)
+        foreach (var nameEl in doc.Descendants().Where(e => Is(e, "DSPACCNAME")))
         {
-            var el = children[i];
-            if (el.Name.LocalName == "DSPACCNAME")
-            {
-                var name = DspName(el);
-                if (name.Length > 0 && i + 1 < children.Count)
-                {
-                    rows.Add(mapPair(name, children[i + 1]));
-                    i += 2;
-                    continue;
-                }
-            }
-            else if (el.Name.LocalName is "DSPTOTINFO" or "DSPACCINFO")
-            {
-                // legacy nested layout
-                var nameEl = el.Element("DSPACCNAME");
-                if (nameEl is not null)
-                {
-                    var name = DspName(nameEl);
-                    if (name.Length > 0) rows.Add(mapPair(name, el));
-                }
-            }
-            i++;
+            var name = DspName(nameEl);
+            if (name.Length == 0 || !seen.Add(name)) continue;
+
+            XElement? amountContainer = null;
+            var parent = nameEl.Parent;
+            if (parent is not null && (Is(parent, "DSPTOTINFO") || Is(parent, "DSPACCINFO")))
+                amountContainer = parent;
+            else
+                amountContainer = FollowingSibling(nameEl) ?? parent;
+
+            if (amountContainer is not null)
+                rows.Add(mapPair(name, amountContainer));
         }
+
         return rows;
     }
 }
