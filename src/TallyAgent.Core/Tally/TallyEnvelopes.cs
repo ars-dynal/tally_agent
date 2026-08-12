@@ -6,7 +6,8 @@ namespace TallyAgent.Core.Tally;
 public static class TallyEnvelopes
 {
     /// <summary>Collection request: &lt;TYPE&gt;Ledger&lt;/TYPE&gt; + FETCH list.</summary>
-    public static string Collection(string collectionType, IEnumerable<string> fetchFields, string? company)
+    public static string Collection(string collectionType, IEnumerable<string> fetchFields, string? company,
+        DateOnly? from = null, DateOnly? to = null)
     {
         var sb = new StringBuilder(1024);
         sb.Append("<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>")
@@ -15,6 +16,10 @@ public static class TallyEnvelopes
           .Append("<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>");
         if (!string.IsNullOrEmpty(company))
             sb.Append("<SVCURRENTCOMPANY>").Append(TallyXml.XmlEscape(company)).Append("</SVCURRENTCOMPANY>");
+        if (from is { } f)
+            sb.Append("<SVFROMDATE>").Append(f.ToString("yyyyMMdd")).Append("</SVFROMDATE>");
+        if (to is { } t)
+            sb.Append("<SVTODATE>").Append(t.ToString("yyyyMMdd")).Append("</SVTODATE>");
         sb.Append("</STATICVARIABLES><TDL><TDLMESSAGE>")
           .Append("<COLLECTION NAME=\"AgentCollection\"><TYPE>")
           .Append(collectionType).Append("</TYPE>");
