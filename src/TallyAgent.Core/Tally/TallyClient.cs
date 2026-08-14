@@ -250,7 +250,8 @@ public sealed class TallyClient : IDisposable
             {
                 using var content = new ByteArrayContent(Encoding.UTF8.GetBytes(envelope));
                 content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("text/xml");
-                resp = await _http.PostAsync(_settings.BaseUri, content, timeoutCts.Token);
+                using var request = new HttpRequestMessage(HttpMethod.Post, _settings.BaseUri) { Content = content };
+                resp = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token);
                 body = await ReadBoundedBodyAsync(resp, timeoutCts.Token);
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
@@ -380,3 +381,5 @@ public sealed class TallyClient : IDisposable
         _http.Dispose();
     }
 }
+
+
