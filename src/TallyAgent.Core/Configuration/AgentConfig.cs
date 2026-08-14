@@ -36,6 +36,19 @@ public sealed class TallySettings
     /// application thread — while a request runs, operators feel it; the gap
     /// between requests is when the UI catches up. 0 disables the pause.</summary>
     [JsonPropertyName("windowPauseSeconds")] public int WindowPauseSeconds { get; set; } = 3;
+    /// <summary>In-flight Tally request concurrency. Tally's XML server shares the
+    /// application thread — default 1; hard-bounded to 2 because anything higher is
+    /// known to stall TallyPrime. Raise to 2 only with observed evidence.</summary>
+    [JsonPropertyName("maxConcurrentTallyRequests")] public int MaxConcurrentTallyRequests { get; set; } = 1;
+    [JsonPropertyName("gateWaitSeconds")] public int GateWaitSeconds { get; set; } = 120;
+    /// <summary>Total timeout/reconnect retries permitted per sync run across ALL
+    /// datasets and windows — a stalling Tally ends the cycle instead of being
+    /// hammered; the run resumes from checkpoints next cycle.</summary>
+    [JsonPropertyName("maxRetriesPerRun")] public int MaxRetriesPerRun { get; set; } = 20;
+    [JsonPropertyName("maxResponseMb")] public int MaxResponseMb { get; set; } = 256;
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    public int EffectiveMaxConcurrentTallyRequests => Math.Clamp(MaxConcurrentTallyRequests, 1, 2);
     [JsonPropertyName("autoDiscoverCompanies")] public bool AutoDiscoverCompanies { get; set; } = true;
     [JsonPropertyName("enableMasters")] public bool EnableMasters { get; set; } = true;
     [JsonPropertyName("enableVouchers")] public bool EnableVouchers { get; set; } = true;
