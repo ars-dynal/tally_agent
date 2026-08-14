@@ -1,5 +1,41 @@
 # Changelog
 
+## 2.0.4 — Server protection & synchronization stability (fix/tally-agent-server-protection)
+
+Offline source-code phase; NOT yet validated against live Windows/Tally.
+
+- Phase C: machine-wide SyncCoordinator (crash-safe exclusive lock file +
+  in-process semaphore). One active run per machine across scheduled/manual/
+  force-full/retry-failed/startup-recovery; second requests return
+  sync_already_running with the active run id; stale sync_runs 'running'
+  rows marked 'abandoned' at cycle start.
+- Phase D: single-flight Tally request gate (in-process + cross-process,
+  default concurrency 1, hard max 2 via maxConcurrentTallyRequests) held for
+  the full request lifecycle by every process incl. Manager Test Tally and
+  CLI test-tally/capture-xml; bounded cancellation-aware gate waits surface
+  as transient TallyBusy without sending.
+- Phase E: preflight taxonomy adds tally_company_mismatch (distinct from
+  not-open); no raw XML/values in operator messages; double probe per cycle
+  removed.
+- Phase F: per-run Tally retry budget (maxRetriesPerRun, default 20) shared
+  by all datasets/windows; jittered timeout ladder; cancellation never
+  retried; probe-first reconnect (TCP probe, not full-payload re-posts).
+- Phase G: bounded response reads (maxResponseMb 16-1024, default 256) with
+  non-retryable TallyResponseTooLarge; empty SNAPSHOT reports no longer
+  advance checkpoints silently (warn + retry next cycle); durable
+  window_coverage evidence table (schema v4): requested window, actual
+  min/max voucher dates, records, run id, status.
+- Tests: +18 offline tests (coordinator exclusion/races/crash, gate
+  single-flight/timeout/cancel/budget/size-cap, preflight outcomes) with
+  injected delays — no real sleeps; coordinator logic additionally executed
+  standalone (8/8) during development.
+- Independent adversarial review found 4 defects (probe-timeout injection,
+  mismatch reported as disconnected, delete-pending UnauthorizedAccessException
+  wedging the semaphore, response leak on bounded-read failure) — all fixed.
+
+Known limitation: live Windows/Tally validation is a later controlled phase;
+unit tests passing does not prove the operational problem fixed.
+
 ## 2.0.3 — Low-impact extraction (Tally stays usable during sync)
 
 Response to live feedback: clicking Force Full Sync made the interactive Tally
