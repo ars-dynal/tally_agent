@@ -65,6 +65,7 @@ public sealed class SyncCoordinator : IDisposable
             // invoker inside one process without relying on worker structure.
             if (await _local.WaitAsync(TimeSpan.Zero, ct))
             {
+                var acquired = false;
                 try
                 {
                     var stream = new FileStream(_lockPath, FileMode.OpenOrCreate,
@@ -72,12 +73,19 @@ public sealed class SyncCoordinator : IDisposable
                     _held = stream;
                     _heldInfo = new SyncLeaseInfo(runId, kind, Environment.ProcessId,
                         DateTime.UtcNow.ToString("O"));
+                    acquired = true;
                     WriteMeta(_heldInfo);
                     return new SyncAcquireResult(true, _heldInfo);
                 }
-                catch (IOException)
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
-                    _local.Release(); // another PROCESS holds the machine lock
+                    // IOException: another PROCESS holds the machine lock.
+                    // UnauthorizedAccessException: Windows delete-pending window
+                    // while a DeleteOnClose holder is closing — treat as busy.
+                }
+                finally
+                {
+                    if (!acquired) _local.Release(); // semaphore can never wedge
                 }
             }
 

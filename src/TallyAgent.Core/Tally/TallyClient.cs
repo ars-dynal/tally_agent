@@ -244,7 +244,7 @@ public sealed class TallyClient : IDisposable
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeoutCts.CancelAfter(budget);
 
-            HttpResponseMessage resp;
+            HttpResponseMessage? resp = null;
             byte[] body;
             try
             {
@@ -255,9 +255,15 @@ public sealed class TallyClient : IDisposable
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
+                resp?.Dispose(); // connection not pinned while the retry loop runs
                 throw new TallyException(ErrorCategory.TallyTimeout,
                     $"Tally request timed out after {(int)budget.TotalSeconds}s " +
                     $"({_settings.Host}:{_settings.Port}).");
+            }
+            catch (TallyException)
+            {
+                resp?.Dispose(); // e.g. TallyResponseTooLarge from the bounded read
+                throw;
             }
             catch (HttpRequestException ex)
             {
@@ -304,8 +310,10 @@ public sealed class TallyClient : IDisposable
                 return new FileStream(_gateLockPath, FileMode.OpenOrCreate,
                     FileAccess.ReadWrite, FileShare.None, 1, FileOptions.DeleteOnClose);
             }
-            catch (IOException)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
+                // UnauthorizedAccessException covers the Windows delete-pending
+                // window while a DeleteOnClose holder is releasing the file.
                 if (DateTime.UtcNow >= deadline)
                     throw new TallyException(ErrorCategory.TallyBusy,
                         $"Another process is talking to Tally (gate busy for {wait.TotalSeconds:F0}s). " +
@@ -346,13 +354,13 @@ public sealed class TallyClient : IDisposable
         try
         {
             using var tcp = new TcpClient();
-            var connectTask = tcp.ConnectAsync(_settings.Host, _settings.Port, ct).AsTask();
-            var done = await Task.WhenAny(connectTask, DelayAsync(TimeSpan.FromSeconds(5), ct));
-            if (done != connectTask || !tcp.Connected) return false;
-            await connectTask; // surface exceptions
-            return true;
+            // Real 5s timeout via WaitAsync — deliberately NOT the injectable
+            // DelayAsync: an instant test delay must not zero the probe window.
+            await tcp.ConnectAsync(_settings.Host, _settings.Port, ct).AsTask()
+                .WaitAsync(TimeSpan.FromSeconds(5), ct);
+            return tcp.Connected;
         }
-        catch (OperationCanceledException) { throw; }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch { return false; }
     }
 

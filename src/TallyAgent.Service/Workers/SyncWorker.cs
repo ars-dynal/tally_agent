@@ -44,7 +44,9 @@ public sealed class SyncWorker(
                 try
                 {
                     var probe = await tally.ProbeAsync(ct);
-                    state.TallyConnected = probe.Ok || probe.Category == Core.Notifications.ErrorCategory.TallyCompanyNotOpen;
+                    state.TallyConnected = probe.Ok || probe.Category
+                        is Core.Notifications.ErrorCategory.TallyCompanyNotOpen
+                        or Core.Notifications.ErrorCategory.TallyCompanyMismatch;
                     state.TallyCompanyOpen = probe.Ok;
 
                     var mode = forceFull ? "full-forced"
