@@ -30,6 +30,9 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
         /// vouchers DELETED in Tally (they simply vanish from extraction and can
         /// only be found by comparison). See ARCHITECTURE §8.2.</summary>
         public List<Row> Manifest { get; } = [];
+        /// <summary>Actual voucher-date extent seen in this window (coverage evidence).</summary>
+        public string? MinVoucherDate { get; set; }
+        public string? MaxVoucherDate { get; set; }
     }
 
     /// <summary>Fetch vouchers for a window and fan out to all voucher datasets.
@@ -116,6 +119,12 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                 ["amount"] = Num(v, "AMOUNT"),
             };
             result.VoucherHeaders.Add(header);
+            if (result.MinVoucherDate is null ||
+                string.CompareOrdinal(voucherDateText, result.MinVoucherDate) < 0)
+                result.MinVoucherDate = voucherDateText;
+            if (result.MaxVoucherDate is null ||
+                string.CompareOrdinal(voucherDateText, result.MaxVoucherDate) > 0)
+                result.MaxVoucherDate = voucherDateText;
             result.Manifest.Add(new Row
             {
                 ["guid"] = guid,

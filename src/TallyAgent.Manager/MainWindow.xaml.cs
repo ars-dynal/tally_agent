@@ -244,7 +244,21 @@ public partial class MainWindow : Window
         if (_db is null) return;
         try
         {
-            var n = new BatchQueueRepository(_db).RetryAllFailed();
+            // Shares the machine-wide sync exclusion (Phase C2): queue mutation
+            // is refused while a sync run is active, with the active run named.
+            using var coordinator = new TallyAgent.Core.Sync.SyncCoordinator();
+            var lease = coordinator.TryAcquireAsync("retry-failed",
+                Guid.NewGuid().ToString("N")[..12], TimeSpan.Zero, CancellationToken.None)
+                .GetAwaiter().GetResult();
+            if (!lease.Acquired)
+            {
+                Warn($"A sync run is currently active (run {lease.ActiveRun?.RunId ?? "unknown"}). " +
+                     "Retry Failed Batches was not started — try again after the run completes.");
+                return;
+            }
+            int n;
+            try { n = new BatchQueueRepository(_db).RetryAllFailed(); }
+            finally { coordinator.Release(); }
             FooterText.Text = $"Requeued {n} failed batch(es).";
             RefreshStatus();
         }

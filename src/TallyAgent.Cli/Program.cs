@@ -207,8 +207,21 @@ static async Task<int> CaptureXml(List<string> a)
 
 static int RetryFailed(bool json)
 {
+    using var coordinator = new TallyAgent.Core.Sync.SyncCoordinator();
+    var lease = coordinator.TryAcquireAsync("retry-failed",
+        Guid.NewGuid().ToString("N")[..12], TimeSpan.Zero, CancellationToken.None)
+        .GetAwaiter().GetResult();
+    if (!lease.Acquired)
+    {
+        Emit(json, new { ok = false, status = TallyAgent.Core.Sync.SyncAcquireResult.AlreadyRunning,
+                         active_run = lease.ActiveRun?.RunId },
+            $"sync_already_running (run {lease.ActiveRun?.RunId ?? "unknown"}) — retry not started.");
+        return 1;
+    }
     var db = new AgentDatabase(NullLogger<AgentDatabase>.Instance);
-    var n = new BatchQueueRepository(db).RetryAllFailed();
+    int n;
+    try { n = new BatchQueueRepository(db).RetryAllFailed(); }
+    finally { coordinator.Release(); }
     Emit(json, new { ok = true, requeued = n }, $"Requeued {n} failed batch(es).");
     return 0;
 }

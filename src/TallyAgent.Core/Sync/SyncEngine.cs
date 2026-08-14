@@ -35,10 +35,24 @@ public sealed class SyncEngine(
 {
     public string CurrentOperation { get; private set; } = "idle";
 
-    public async Task<SyncResult> RunCycleAsync(string mode, CancellationToken ct)
+    public Task<SyncResult> RunCycleAsync(string mode, CancellationToken ct) =>
+        RunCycleAsync(mode, null, ct);
+
+    /// <summary><paramref name="preflight"/>: a probe the caller just performed
+    /// (SyncWorker probes for AgentState/mode anyway) — passing it avoids the
+    /// historical double-probe of Tally at the start of every cycle.</summary>
+    public async Task<SyncResult> RunCycleAsync(string mode, TallyProbeResult? preflight,
+        CancellationToken ct)
     {
         var syncId = Guid.NewGuid().ToString("N")[..12];
         var started = DateTime.UtcNow;
+        // A crash mid-run leaves sync_runs.status='running' forever; mark such
+        // rows abandoned so the console never shows a phantom active run and
+        // nothing can key decisions off a stale 'running' row.
+        MarkAbandonedRuns();
+        // Arm the per-run Tally retry budget (Phase F8): timeouts/reconnects
+        // across ALL datasets and windows share one bounded pool this cycle.
+        tally.ResetRunBudget(config.Tally.MaxRetriesPerRun);
         RecordRunStart(syncId, mode);
         var errorList = new List<string>();
         var extractedCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -57,7 +71,7 @@ public sealed class SyncEngine(
             if (mode == "full-forced" && !string.IsNullOrWhiteSpace(config.Tally.Company))
                 ResetVoucherCheckpoint(config.Tally.Company);
 
-            var probe = await tally.ProbeAsync(ct);
+            var probe = preflight ?? await tally.ProbeAsync(ct);
             if (!probe.Ok)
             {
                 if (mode == "full-forced" && string.IsNullOrWhiteSpace(config.Tally.Company))
@@ -117,6 +131,23 @@ public sealed class SyncEngine(
                     var rows = await ExtractMasterOrSnapshot(ds.Name, ct);
                     extractedCounts[ds.Name] = rows.Count;
                     totalRows += rows.Count;
+
+                    // Dataset-aware empty-result handling (§G/§7): an empty
+                    // SNAPSHOT report (trial_balance, balance_sheet, …) is a
+                    // suspicious outcome, not a success — do NOT advance its
+                    // checkpoint (it retries next cycle) and surface a grouped
+                    // warning. Masters may legitimately be empty.
+                    if (ds.Kind == DatasetKind.Snapshot && rows.Count == 0)
+                    {
+                        log.LogWarning("Snapshot dataset {Dataset} returned 0 rows — " +
+                            "checkpoint NOT advanced; will retry next cycle", ds.Name);
+                        await reporter.ReportAsync(ErrorCategory.UnexpectedException,
+                            ErrorSeverity.Warning,
+                            $"Snapshot dataset '{ds.Name}' returned 0 rows (report and fallback both empty).",
+                            operation: CurrentOperation, dataset: ds.Name, ct: CancellationToken.None);
+                        continue;
+                    }
+
                     EnqueueAndCheckpoint(ds.Name, company, syncId, rows, null, null, fullDone: true);
                     ok++;
                 }
@@ -194,6 +225,9 @@ public sealed class SyncEngine(
                                     fullDone: false);
                             }
                             AdvanceVoucherWindowCheckpoint(company, from, to, plan.TargetStart);
+                            RecordWindowCoverage(syncId, "vouchers", from, to,
+                                result.VoucherHeaders.Count, result.MinVoucherDate,
+                                result.MaxVoucherDate, "completed");
                             ok++;
 
                             // Low-impact mode: give the Tally UI room to breathe
@@ -236,6 +270,7 @@ public sealed class SyncEngine(
                         catch (Exception ex) when (ex is not OperationCanceledException)
                         {
                             failed++;
+                            RecordWindowCoverage(syncId, "vouchers", from, to, 0, null, null, "failed");
                             await HandleDatasetErrorAsync($"vouchers[{from:yyyy-MM-dd}..{to:yyyy-MM-dd}]", ex, errorList);
                             break; // resume from the last successful checkpoint next cycle
                         }
@@ -455,6 +490,63 @@ public sealed class SyncEngine(
             operation: CurrentOperation, dataset: dataset, ct: CancellationToken.None);
         errorList.Add($"{dataset}: {ex.Message}");
         log.LogError(ex, "Dataset {Dataset} failed", dataset);
+    }
+
+    /// <summary>Durable per-window coverage evidence (§G12): requested window,
+    /// actual min/max voucher dates seen, record count, run id and status.
+    /// Historical completeness is judged from THIS table — never from
+    /// aggregate record counts (§G13).</summary>
+    private void RecordWindowCoverage(string syncId, string dataset, DateOnly from, DateOnly to,
+        int records, string? minDate, string? maxDate, string status)
+    {
+        try
+        {
+            using var conn = db.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO window_coverage
+                  (run_id, dataset, window_from, window_to, records, min_date, max_date,
+                   status, completed_utc)
+                VALUES ($r,$d,$wf,$wt,$n,$min,$max,$s,$ts)
+                """;
+            cmd.Parameters.AddWithValue("$r", syncId);
+            cmd.Parameters.AddWithValue("$d", dataset);
+            cmd.Parameters.AddWithValue("$wf", from.ToString("yyyy-MM-dd"));
+            cmd.Parameters.AddWithValue("$wt", to.ToString("yyyy-MM-dd"));
+            cmd.Parameters.AddWithValue("$n", records);
+            cmd.Parameters.AddWithValue("$min", (object?)minDate ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$max", (object?)maxDate ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$s", status);
+            cmd.Parameters.AddWithValue("$ts", DateTime.UtcNow.ToString("O"));
+            cmd.ExecuteNonQuery();
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning("Window coverage not recorded ({Msg})", ex.Message);
+        }
+    }
+
+    /// <summary>A crashed process leaves sync_runs.status='running' forever.
+    /// Called at cycle start (under the sync lease) so stale rows become
+    /// 'abandoned' — visible, but never mistaken for an active run.</summary>
+    private void MarkAbandonedRuns()
+    {
+        try
+        {
+            using var conn = db.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE sync_runs SET status='abandoned',
+                       error_message=COALESCE(error_message,'process terminated mid-run')
+                WHERE status='running'
+                """;
+            var n = cmd.ExecuteNonQuery();
+            if (n > 0) log.LogWarning("Marked {N} stale 'running' sync run(s) as abandoned", n);
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning("Stale-run cleanup failed ({Msg})", ex.Message);
+        }
     }
 
     private void RecordRunStart(string syncId, string mode)
