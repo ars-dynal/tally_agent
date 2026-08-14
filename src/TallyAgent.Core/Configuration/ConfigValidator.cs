@@ -31,6 +31,15 @@ public static partial class ConfigValidator
         if (cfg.Tally.RequestTimeoutSeconds is < 10 or > 900)
             errors.Add("Tally request timeout must be 10-900 seconds.");
 
+        if (cfg.Tally.MaxConcurrentTallyRequests is < 1 or > 2)
+            errors.Add("maxConcurrentTallyRequests must be 1 or 2 (Tally's XML server is single-threaded).");
+        if (cfg.Tally.GateWaitSeconds is < 5 or > 600)
+            errors.Add("gateWaitSeconds must be 5-600.");
+        if (cfg.Tally.MaxRetriesPerRun is < 0 or > 200)
+            errors.Add("maxRetriesPerRun must be 0-200.");
+        if (cfg.Tally.MaxResponseMb is < 16 or > 1024)
+            errors.Add("maxResponseMb must be 16-1024.");
+
         // Cloud
         if (string.IsNullOrWhiteSpace(cfg.Cloud.IngestionApiUrl))
             errors.Add("Cloud ingestion API URL is required.");

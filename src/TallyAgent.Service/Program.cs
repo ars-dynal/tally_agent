@@ -89,6 +89,7 @@ try
         builder.Services.AddSingleton<ReportExtractor>();
         builder.Services.AddSingleton<BatchBuilder>();
         builder.Services.AddSingleton<SyncEngine>();
+        builder.Services.AddSingleton<SyncCoordinator>();
         builder.Services.AddSingleton(sp => new IngestionApiClient(config,
             sp.GetRequiredService<ILogger<IngestionApiClient>>()));
         builder.Services.AddSingleton<WebhookNotifier>();
@@ -107,6 +108,21 @@ try
 
     if (config is not null)
     {
+        // Startup recovery shares the sync exclusion (Phase C2): if another
+        // process holds the lease (e.g. a second instance mid-sync), recovery
+        // is skipped this boot rather than racing it. Bounded 10s wait.
+        var startupCoordinator = host.Services.GetRequiredService<SyncCoordinator>();
+        var startupLease = await startupCoordinator.TryAcquireAsync(
+            "startup-recovery", Guid.NewGuid().ToString("N")[..12],
+            TimeSpan.FromSeconds(10), CancellationToken.None);
+        if (!startupLease.Acquired)
+        {
+            Log.Warning("{Status}: another agent process holds the sync lease — skipping startup recovery",
+                SyncAcquireResult.AlreadyRunning);
+        }
+        else
+        try
+        {
         var queue = host.Services.GetRequiredService<BatchQueueRepository>();
         var recovered = queue.RecoverStuckUploads();
         if (recovered > 0)
@@ -120,6 +136,11 @@ try
         var swept = BatchBuilder.SweepOrphans(queue);
         if (swept > 0)
             Log.Information("Startup sweep removed {N} orphaned temp/payload files", swept);
+        }
+        finally
+        {
+            startupCoordinator.Release();
+        }
     }
 
     await host.RunAsync();

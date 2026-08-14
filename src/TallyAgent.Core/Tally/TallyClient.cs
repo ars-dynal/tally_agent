@@ -11,19 +11,47 @@ public sealed record TallyProbeResult(bool Ok, IReadOnlyList<string> Companies, 
     ErrorCategory? Category = null);
 
 /// <summary>
-/// HTTP transport to the local TallyPrime XML server with categorized failures,
-/// bounded timeout retries and bounded auto-reconnect for temporary server drops.
+/// HTTP transport to the local TallyPrime XML server.
+///
+/// SERVER PROTECTION (fix/tally-agent-server-protection):
+/// Tally's XML server shares the application thread and must be treated as a
+/// constrained dependency. Every HTTP request from EVERY process (service,
+/// Manager test button, CLI test-tally / capture-xml) funnels through
+/// <see cref="PostOnceAsync"/>, which holds:
+///   1. an in-process gate (SemaphoreSlim, default concurrency 1, max 2), and
+///   2. a cross-process gate (exclusive lock file under ProgramData\locks —
+///      released by the OS if the holder crashes),
+/// for the FULL request/response lifecycle. Gate waits are bounded and
+/// cancellation-aware; a gate timeout surfaces as the transient
+/// <see cref="ErrorCategory.TallyBusy"/> — never a second concurrent request.
+///
+/// RUNAWAY-WORK PROTECTION:
+///  • timeout ladder (10/30/60s ± jitter) is bounded per request AND debits a
+///    per-run retry budget (<see cref="ResetRunBudget"/>) — a stalling Tally
+///    cannot be hammered indefinitely across datasets/windows;
+///  • a client-side timeout aborts only our socket while Tally keeps working,
+///    so auto-reconnect now TCP-probes first and only re-sends the full
+///    request once the port answers again — no full-payload polling;
+///  • cancellation is never retried; all waits honour the caller token.
 /// </summary>
-public sealed class TallyClient
+public sealed class TallyClient : IDisposable
 {
     private static readonly TimeSpan[] TimeoutRetryBackoff =
         [TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(60)];
+    private static readonly TimeSpan GatePollInterval = TimeSpan.FromMilliseconds(250);
 
     private readonly HttpClient _http;
     private readonly ILogger<TallyClient> _log;
     private readonly TallySettings _settings;
+    private readonly SemaphoreSlim _localGate;
+    private readonly string _gateLockPath;
+    private int _runRetryBudget = int.MaxValue;
 
-    public TallyClient(TallySettings settings, ILogger<TallyClient> log, HttpClient? http = null)
+    /// <summary>Injectable delay for deterministic offline tests (no real sleeps).</summary>
+    internal Func<TimeSpan, CancellationToken, Task> DelayAsync { get; set; } = Task.Delay;
+
+    public TallyClient(TallySettings settings, ILogger<TallyClient> log, HttpClient? http = null,
+        string? gateLockDirOverride = null)
     {
         _settings = settings;
         _log = log;
@@ -31,6 +59,11 @@ public sealed class TallyClient
         // Timeouts are enforced per request (PostOnceAsync) so heavy voucher
         // windows can use a longer budget than light master/report calls.
         _http.Timeout = Timeout.InfiniteTimeSpan;
+        _localGate = new SemaphoreSlim(settings.EffectiveMaxConcurrentTallyRequests,
+                                       settings.EffectiveMaxConcurrentTallyRequests);
+        var lockDir = gateLockDirOverride ?? Path.Combine(AgentInfo.DataDir, "locks");
+        Directory.CreateDirectory(lockDir);
+        _gateLockPath = Path.Combine(lockDir, "tally-gate.lock");
     }
 
     public string Company => _settings.Company;
@@ -41,36 +74,29 @@ public sealed class TallyClient
         TimeSpan.FromSeconds(Math.Max(_settings.RequestTimeoutSeconds,
             _settings.VoucherTimeoutSeconds));
 
+    /// <summary>Arm the per-run retry budget (call at the start of each sync
+    /// cycle). Every timeout-retry and reconnect-resend debits it; when it is
+    /// exhausted the current request fails with a NON-retryable TallyTimeout so
+    /// the run ends cleanly and resumes from its checkpoint next cycle.</summary>
+    public void ResetRunBudget(int totalRetries) =>
+        _runRetryBudget = Math.Max(0, totalRetries);
+
     /// <summary>Fast TCP probe + company list. Distinguishes "not running" from
-    /// "port blocked" from "company not open".</summary>
+    /// "port blocked" from "company not open" from "company mismatch".</summary>
     public async Task<TallyProbeResult> ProbeAsync(CancellationToken ct = default)
     {
-        // 1. raw TCP reachability
-        try
-        {
-            using var tcp = new TcpClient();
-            var connectTask = tcp.ConnectAsync(_settings.Host, _settings.Port, ct).AsTask();
-            var done = await Task.WhenAny(connectTask, Task.Delay(5000, ct));
-            if (done != connectTask || !tcp.Connected)
-                return new TallyProbeResult(false, [],
-                    $"Nothing is listening on {_settings.Host}:{_settings.Port}. " +
-                    "Ensure TallyPrime is running and 'TallyPrime acts as' is set to 'Both' or 'Server' " +
-                    "(F1 > Settings > Connectivity > Client/Server configuration).",
-                    ErrorCategory.TallyNotRunning);
-            await connectTask; // surface exceptions
-        }
-        catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
-        {
+        // 1. raw TCP reachability (cheap; does not consume the request gate)
+        if (!await TryTcpProbeAsync(ct))
             return new TallyProbeResult(false, [],
-                $"TCP connection to {_settings.Host}:{_settings.Port} failed: {ex.Message}",
-                ErrorCategory.TallyPortUnavailable);
-        }
+                $"Nothing is listening on {_settings.Host}:{_settings.Port}. " +
+                "Ensure TallyPrime is running and 'TallyPrime acts as' is set to 'Both' or 'Server' " +
+                "(F1 > Settings > Connectivity > Client/Server configuration).",
+                ErrorCategory.TallyNotRunning);
 
-        // 2. XML company list
+        // 2. XML company list (gated like every other request)
         try
         {
-            var doc = await PostOnceAsync(TallyEnvelopes.CompanyList(), ct);
+            var doc = await PostOnceAsync(TallyEnvelopes.CompanyList(), null, ct);
             var companies = doc.Descendants("NAME")
                 .Select(e => e.Value.Trim())
                 .Where(v => v.Length > 0)
@@ -79,10 +105,18 @@ public sealed class TallyClient
 
             if (!string.IsNullOrWhiteSpace(_settings.Company) &&
                 !companies.Contains(_settings.Company, StringComparer.OrdinalIgnoreCase))
-                return new TallyProbeResult(false, companies,
-                    $"Company '{_settings.Company}' is not open in Tally. Open companies: " +
-                    (companies.Count > 0 ? string.Join(", ", companies) : "(none)"),
-                    ErrorCategory.TallyCompanyNotOpen);
+            {
+                // Distinct operator-actionable conditions (§E4): no company open
+                // at all vs a DIFFERENT company open than the configured one.
+                return companies.Count == 0
+                    ? new TallyProbeResult(false, companies,
+                        $"No company is open in Tally (expected '{_settings.Company}').",
+                        ErrorCategory.TallyCompanyNotOpen)
+                    : new TallyProbeResult(false, companies,
+                        $"Configured company '{_settings.Company}' is not among the open companies. " +
+                        $"Open: {string.Join(", ", companies)}",
+                        ErrorCategory.TallyCompanyMismatch);
+            }
 
             return new TallyProbeResult(true, companies, null);
         }
@@ -98,7 +132,7 @@ public sealed class TallyClient
     public async Task<string> PostRawAsync(string envelope, CancellationToken ct = default)
     {
         var doc = await PostAsync(envelope, ct);
-        return doc.ToString(System.Xml.Linq.SaveOptions.None);
+        return doc.ToString(SaveOptions.None);
     }
 
     /// <summary>Company-wide AlterID watermarks for the configured company —
@@ -120,23 +154,13 @@ public sealed class TallyClient
         return null;
     }
 
-    /// <summary>
-    /// POST an envelope with two resilience modes:
-    ///  • slow/heavy request timeout: retry 10s/30s/60s, then return TallyTimeout
-    ///    so the SyncEngine can split the voucher window;
-    ///  • Tally temporarily unreachable: keep probing the same request at a
-    ///    bounded interval for up to reconnectMaxMinutes, then continue exactly
-    ///    where the sync stopped when Tally comes back.
-    /// </summary>
     public Task<XDocument> PostAsync(string envelope, CancellationToken ct = default) =>
         PostAsync(envelope, null, null, ct);
 
     /// <summary>
-    /// As <see cref="PostAsync(string, CancellationToken)"/> but with a caller-set
-    /// timeout budget and timeout-retry count. Voucher window extraction passes
+    /// POST with retry/reconnect resilience. Voucher window extraction passes
     /// maxTimeoutRetries: 0 for multi-day windows — retrying an identical heavy
-    /// request at the same size is deterministic waste (~10 min per ladder);
-    /// splitting the window immediately converges far faster.
+    /// request at the same size is deterministic waste; splitting converges faster.
     /// </summary>
     public async Task<XDocument> PostAsync(string envelope, TimeSpan? requestTimeout,
         int? maxTimeoutRetries, CancellationToken ct = default)
@@ -149,6 +173,7 @@ public sealed class TallyClient
 
         while (true)
         {
+            ct.ThrowIfCancellationRequested(); // cancellation is never retried (§F6)
             try
             {
                 return await PostOnceAsync(envelope, requestTimeout, ct);
@@ -157,11 +182,14 @@ public sealed class TallyClient
             {
                 if (timeoutAttempt >= timeoutRetries)
                     throw;
+                DebitRunBudget(tex);
 
-                var delay = TimeoutRetryBackoff[timeoutAttempt++];
-                _log.LogWarning("Tally request timed out (attempt {N}): {Msg} — retrying in {Delay}s",
+                // ±20% jitter prevents synchronized retry storms across datasets.
+                var baseDelay = TimeoutRetryBackoff[timeoutAttempt++];
+                var delay = baseDelay * (0.8 + Random.Shared.NextDouble() * 0.4);
+                _log.LogWarning("Tally request timed out (attempt {N}): {Msg} — retrying in {Delay:F0}s",
                     timeoutAttempt, tex.Message, delay.TotalSeconds);
-                await Task.Delay(delay, ct);
+                await DelayAsync(delay, ct);
             }
             catch (TallyException tex) when (tex.Category is ErrorCategory.TallyNotRunning
                 or ErrorCategory.TallyPortUnavailable)
@@ -172,62 +200,186 @@ public sealed class TallyClient
                         Math.Max(1, _settings.ReconnectMaxMinutes));
                     throw;
                 }
+                DebitRunBudget(tex);
 
                 timeoutAttempt = 0;
                 var remaining = Math.Max(0, (int)Math.Ceiling((reconnectDeadline - DateTime.UtcNow).TotalMinutes));
                 _log.LogWarning(
-                    "Tally connection dropped: {Msg} — auto-reconnect in {Delay}s (up to {Remaining} min remaining)",
+                    "Tally connection dropped: {Msg} — probing for recovery every {Delay}s (up to {Remaining} min remaining)",
                     tex.Message, reconnectDelay.TotalSeconds, remaining);
-                await Task.Delay(reconnectDelay, ct);
+
+                // Probe-first reconnect: wait, then check the TCP port cheaply and
+                // ONLY re-send the full request once Tally answers again. The old
+                // behaviour re-posted the entire payload every interval, piling
+                // work onto a Tally instance that was likely still busy.
+                do
+                {
+                    await DelayAsync(reconnectDelay, ct);
+                    if (await TryTcpProbeAsync(ct)) break;
+                } while (DateTime.UtcNow < reconnectDeadline);
             }
         }
     }
 
-    private Task<XDocument> PostOnceAsync(string envelope, CancellationToken ct) =>
-        PostOnceAsync(envelope, null, ct);
+    // ── single request: gate → send → bounded read → parse ──────────────
 
     private async Task<XDocument> PostOnceAsync(string envelope, TimeSpan? requestTimeout,
         CancellationToken ct)
     {
         var budget = requestTimeout
             ?? TimeSpan.FromSeconds(Math.Max(1, _settings.RequestTimeoutSeconds));
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(budget);
 
-        HttpResponseMessage resp;
-        byte[] body;
+        // In-process + cross-process gates held for the WHOLE request/response
+        // lifecycle (§D9). Bounded, cancellation-aware acquisition.
+        var gateWait = TimeSpan.FromSeconds(Math.Clamp(_settings.GateWaitSeconds, 5, 600));
+        if (!await _localGate.WaitAsync(gateWait, ct))
+            throw new TallyException(ErrorCategory.TallyBusy,
+                $"Another Tally request is still in flight after waiting {gateWait.TotalSeconds:F0}s " +
+                "(in-process gate). The request was NOT sent.");
+        FileStream? crossLock = null;
         try
         {
-            using var content = new ByteArrayContent(Encoding.UTF8.GetBytes(envelope));
-            content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("text/xml");
-            resp = await _http.PostAsync(_settings.BaseUri, content, timeoutCts.Token);
-            body = await resp.Content.ReadAsByteArrayAsync(timeoutCts.Token);
-        }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        {
-            throw new TallyException(ErrorCategory.TallyTimeout,
-                $"Tally request timed out after {(int)budget.TotalSeconds}s " +
-                $"({_settings.Host}:{_settings.Port}).");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new TallyException(ErrorCategory.TallyNotRunning,
-                $"Cannot reach Tally at {_settings.Host}:{_settings.Port}: {ex.Message}", ex);
-        }
+            crossLock = await AcquireCrossProcessGateAsync(gateWait, ct);
 
-        if (!resp.IsSuccessStatusCode)
-            throw new TallyException(ErrorCategory.TallyPortUnavailable,
-                $"Tally returned HTTP {(int)resp.StatusCode} on {_settings.Host}:{_settings.Port}.");
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(budget);
 
-        try
-        {
-            return TallyXml.Parse(body);
+            HttpResponseMessage? resp = null;
+            byte[] body;
+            try
+            {
+                using var content = new ByteArrayContent(Encoding.UTF8.GetBytes(envelope));
+                content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("text/xml");
+                using var request = new HttpRequestMessage(HttpMethod.Post, _settings.BaseUri) { Content = content };
+                resp = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token);
+                body = await ReadBoundedBodyAsync(resp, timeoutCts.Token);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                resp?.Dispose(); // connection not pinned while the retry loop runs
+                throw new TallyException(ErrorCategory.TallyTimeout,
+                    $"Tally request timed out after {(int)budget.TotalSeconds}s " +
+                    $"({_settings.Host}:{_settings.Port}).");
+            }
+            catch (TallyException)
+            {
+                resp?.Dispose(); // e.g. TallyResponseTooLarge from the bounded read
+                throw;
+            }
+            catch (HttpRequestException ex)
+            {
+                throw new TallyException(ErrorCategory.TallyNotRunning,
+                    $"Cannot reach Tally at {_settings.Host}:{_settings.Port}: {ex.Message}", ex);
+            }
+
+            using (resp)
+            {
+                if (!resp.IsSuccessStatusCode)
+                    throw new TallyException(ErrorCategory.TallyPortUnavailable,
+                        $"Tally returned HTTP {(int)resp.StatusCode} on {_settings.Host}:{_settings.Port}.");
+            }
+
+            try
+            {
+                return TallyXml.Parse(body);
+            }
+            catch (Exception ex)
+            {
+                var preview = Encoding.UTF8.GetString(body, 0, Math.Min(body.Length, 300));
+                throw new TallyException(ErrorCategory.TallyInvalidXml,
+                    $"Tally response is not valid XML: {ex.Message}. Response starts with: {preview}", ex);
+            }
         }
-        catch (Exception ex)
+        finally
         {
-            var preview = Encoding.UTF8.GetString(body, 0, Math.Min(body.Length, 300));
-            throw new TallyException(ErrorCategory.TallyInvalidXml,
-                $"Tally response is not valid XML: {ex.Message}. Response starts with: {preview}", ex);
+            crossLock?.Dispose();   // OS-backed: released even if this process dies
+            _localGate.Release();
         }
     }
+
+    /// <summary>Exclusive lock file shared by service, Manager and CLI so a
+    /// diagnostics probe can never hit Tally while an extraction is in flight.
+    /// Crash-safe: the OS releases the handle when the holder exits.</summary>
+    private async Task<FileStream> AcquireCrossProcessGateAsync(TimeSpan wait, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + wait;
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                return new FileStream(_gateLockPath, FileMode.OpenOrCreate,
+                    FileAccess.ReadWrite, FileShare.None, 1, FileOptions.DeleteOnClose);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // UnauthorizedAccessException covers the Windows delete-pending
+                // window while a DeleteOnClose holder is releasing the file.
+                if (DateTime.UtcNow >= deadline)
+                    throw new TallyException(ErrorCategory.TallyBusy,
+                        $"Another process is talking to Tally (gate busy for {wait.TotalSeconds:F0}s). " +
+                        "The request was NOT sent.");
+                await DelayAsync(GatePollInterval, ct);
+            }
+        }
+    }
+
+    /// <summary>Read the response body with a hard byte cap (§G10) so a runaway
+    /// export cannot exhaust agent memory. Oversized responses fail with a
+    /// NON-retryable error naming the offending size.</summary>
+    private async Task<byte[]> ReadBoundedBodyAsync(HttpResponseMessage resp, CancellationToken ct)
+    {
+        var capBytes = (long)Math.Clamp(_settings.MaxResponseMb, 16, 1024) * 1024 * 1024;
+        if (resp.Content.Headers.ContentLength is { } len && len > capBytes)
+            throw new TallyException(ErrorCategory.TallyResponseTooLarge,
+                $"Tally response ({len / (1024 * 1024)} MB) exceeds the {_settings.MaxResponseMb} MB limit. " +
+                "Reduce the extraction window or raise tally.maxResponseMb.");
+
+        await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+        using var buffer = new MemoryStream();
+        var chunk = new byte[81920];
+        int read;
+        while ((read = await stream.ReadAsync(chunk, ct)) > 0)
+        {
+            if (buffer.Length + read > capBytes)
+                throw new TallyException(ErrorCategory.TallyResponseTooLarge,
+                    $"Tally response exceeded the {_settings.MaxResponseMb} MB limit mid-stream. " +
+                    "Reduce the extraction window or raise tally.maxResponseMb.");
+            buffer.Write(chunk, 0, read);
+        }
+        return buffer.ToArray();
+    }
+
+    private async Task<bool> TryTcpProbeAsync(CancellationToken ct)
+    {
+        try
+        {
+            using var tcp = new TcpClient();
+            // Real 5s timeout via WaitAsync — deliberately NOT the injectable
+            // DelayAsync: an instant test delay must not zero the probe window.
+            await tcp.ConnectAsync(_settings.Host, _settings.Port, ct).AsTask()
+                .WaitAsync(TimeSpan.FromSeconds(5), ct);
+            return tcp.Connected;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch { return false; }
+    }
+
+    private void DebitRunBudget(TallyException cause)
+    {
+        if (_runRetryBudget == int.MaxValue) return; // budget not armed (CLI/Manager)
+        if (_runRetryBudget <= 0)
+            throw new TallyException(ErrorCategory.TallyTimeout,
+                "Per-run Tally retry budget exhausted — ending this sync cycle so Tally can " +
+                $"recover; the run resumes from its checkpoint next cycle. Last error: {cause.Message}");
+        _runRetryBudget--;
+    }
+
+    public void Dispose()
+    {
+        _localGate.Dispose();
+        _http.Dispose();
+    }
 }
+
+

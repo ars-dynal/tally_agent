@@ -15,6 +15,7 @@ namespace TallyAgent.Service.Workers;
 public sealed class SyncWorker(
     AgentConfig config,
     SyncEngine engine,
+    SyncCoordinator coordinator,
     TallyClient tally,
     ErrorReporter errors,
     CheckpointRepository checkpoints,
@@ -43,16 +44,41 @@ public sealed class SyncWorker(
                 try
                 {
                     var probe = await tally.ProbeAsync(ct);
-                    state.TallyConnected = probe.Ok || probe.Category == Core.Notifications.ErrorCategory.TallyCompanyNotOpen;
+                    state.TallyConnected = probe.Ok || probe.Category
+                        is Core.Notifications.ErrorCategory.TallyCompanyNotOpen
+                        or Core.Notifications.ErrorCategory.TallyCompanyMismatch;
                     state.TallyCompanyOpen = probe.Ok;
 
                     var mode = forceFull ? "full-forced"
                         : manual ? "manual"
                         : checkpoints.Get("_vouchers_window", ResolvedCompany(probe)) is { FullSyncDone: true }
                             ? "incremental" : "full";
-                    state.CurrentOperation = $"sync ({mode})";
 
-                    var result = await engine.RunCycleAsync(mode, ct);
+                    // Phase C: THE authoritative exclusion. Zero-wait — a second
+                    // request while a run is active never starts extraction; it
+                    // reports sync_already_running with the active run's id.
+                    var runId = Guid.NewGuid().ToString("N")[..12];
+                    var lease = await coordinator.TryAcquireAsync(mode, runId, TimeSpan.Zero, ct);
+                    if (!lease.Acquired)
+                    {
+                        var active = lease.ActiveRun;
+                        log.LogWarning("{Status}: run {ActiveId} ({Kind}) is active in process {Pid} — not starting another",
+                            SyncAcquireResult.AlreadyRunning,
+                            active?.RunId ?? "unknown", active?.Kind ?? "unknown", active?.ProcessId ?? 0);
+                        state.CurrentOperation = $"{SyncAcquireResult.AlreadyRunning} ({active?.RunId ?? "unknown"})";
+                        continue;
+                    }
+
+                    state.CurrentOperation = $"sync ({mode})";
+                    SyncResult result;
+                    try
+                    {
+                        result = await engine.RunCycleAsync(mode, probe, ct);
+                    }
+                    finally
+                    {
+                        coordinator.Release();
+                    }
 
                     if (result.Status == "failed" && result.Errors.Count > 0)
                         log.LogWarning("Sync cycle failed: {Errors}", string.Join("; ", result.Errors));

@@ -10,7 +10,7 @@ namespace TallyAgent.Core.Data;
 /// </summary>
 public sealed class AgentDatabase
 {
-    public const int CurrentSchemaVersion = 3;
+    public const int CurrentSchemaVersion = 4;
 
     private readonly string _connectionString;
     private readonly ILogger<AgentDatabase> _log;
@@ -57,6 +57,7 @@ public sealed class AgentDatabase
         if (version < 1) MigrateToV1(conn, tx);
         if (version < 2) MigrateToV2(conn, tx);
         if (version < 3) MigrateToV3(conn, tx);
+        if (version < 4) MigrateToV4(conn, tx);
         // future: if (version < 4) MigrateToV4(conn, tx); — additive only
 
         Exec(conn, tx, """
@@ -186,6 +187,27 @@ public sealed class AgentDatabase
     {
         Exec(conn, tx, """
             ALTER TABLE upload_batches ADD COLUMN content_checksum TEXT NOT NULL DEFAULT '';
+            """);
+    }
+
+    /// <summary>V4: window_coverage — durable per-window extraction evidence
+    /// (requested window, actual min/max dates, records, run id, status).</summary>
+    private static void MigrateToV4(SqliteConnection conn, SqliteTransaction tx)
+    {
+        Exec(conn, tx, """
+            CREATE TABLE IF NOT EXISTS window_coverage (
+              id            INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id        TEXT NOT NULL,
+              dataset       TEXT NOT NULL,
+              window_from   TEXT NOT NULL,
+              window_to     TEXT NOT NULL,
+              records       INTEGER NOT NULL,
+              min_date      TEXT,
+              max_date      TEXT,
+              status        TEXT NOT NULL,
+              completed_utc TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_coverage_ds ON window_coverage(dataset, window_from);
             """);
     }
 
