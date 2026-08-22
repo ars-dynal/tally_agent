@@ -39,6 +39,9 @@ public sealed class SyncWorker(
             var manual = ConsumeTrigger("sync-now") || forceFull;
             if (DateTime.UtcNow >= nextRun || manual)
             {
+                // Provisional (in case the cycle crashes before the finally
+                // below); the real next-run time is computed AFTER the cycle
+                // ends so Tally always gets a full idle interval between cycles.
                 nextRun = DateTime.UtcNow + interval;
                 state.LastAttemptedSyncUtc = DateTime.UtcNow.ToString("O");
                 try
@@ -94,6 +97,12 @@ public sealed class SyncWorker(
                 finally
                 {
                     state.CurrentOperation = "idle";
+                    // v2.0.5: schedule from the END of the cycle, not the start.
+                    // v2.0.4 computed nextRun before running, so any cycle longer
+                    // than the interval was followed by another one immediately —
+                    // Tally never got an idle gap during office hours.
+                    nextRun = DateTime.UtcNow + interval;
+                    log.LogInformation("Next scheduled sync at {Next:HH:mm:ss} UTC", nextRun);
                 }
             }
 

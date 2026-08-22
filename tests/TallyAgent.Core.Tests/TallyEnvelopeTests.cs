@@ -43,4 +43,24 @@ public sealed class TallyEnvelopeTests
 
         Assert.Contains("<SVCURRENTCOMPANY>A &amp; B &lt;India&gt;</SVCURRENTCOMPANY>", xml);
     }
+
+    [Fact]
+    public void VoucherCollection_RequestsOnlyTheAllEntriesShape_ByDefault()
+    {
+        // v2.0.3/4 fetched both ALLLEDGERENTRIES.* and LEDGERENTRIES.* (and both
+        // inventory shapes): Tally serialized every line twice and the
+        // extractor discarded one copy. Only the ALL* shape is requested now.
+        var xml = TallyEnvelopes.VoucherCollection(new DateOnly(2026, 8, 1), new DateOnly(2026, 8, 7), "Co");
+        Assert.Contains("ALLLEDGERENTRIES.LEDGERNAME", xml);
+        Assert.Contains("ALLINVENTORYENTRIES.STOCKITEMNAME", xml);
+        Assert.DoesNotContain(",LEDGERENTRIES.", xml);
+        Assert.DoesNotContain(">LEDGERENTRIES.", xml);
+        Assert.DoesNotContain(",INVENTORYENTRIES.", xml);
+        Assert.DoesNotContain(">INVENTORYENTRIES.", xml);
+
+        var legacy = TallyEnvelopes.VoucherCollection(new DateOnly(2026, 8, 1), new DateOnly(2026, 8, 7), "Co",
+            includeLegacyLists: true);
+        Assert.Contains(">LEDGERENTRIES.LEDGERNAME", legacy);
+        Assert.Contains(">INVENTORYENTRIES.STOCKITEMNAME", legacy);
+    }
 }

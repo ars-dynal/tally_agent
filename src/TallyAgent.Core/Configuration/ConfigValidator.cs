@@ -32,7 +32,17 @@ public static partial class ConfigValidator
             errors.Add("Tally request timeout must be 10-900 seconds.");
 
         if (cfg.Tally.MaxConcurrentTallyRequests is < 1 or > 2)
-            errors.Add("maxConcurrentTallyRequests must be 1 or 2 (Tally's XML server is single-threaded).");
+            errors.Add("maxConcurrentTallyRequests must be 1 or 2 (effective concurrency is always 1).");
+        if (cfg.Tally.VoucherTimeoutSeconds is < 10 or > 900)
+            errors.Add("voucherTimeoutSeconds must be 10-900 seconds.");
+        if (cfg.Tally.SnapshotTimeoutSeconds is < 10 or > 1800)
+            errors.Add("snapshotTimeoutSeconds must be 10-1800 seconds.");
+        if (cfg.Tally.SnapshotHourLocal is < 0 or > 23)
+            errors.Add("snapshotHourLocal must be 0-23.");
+        if (cfg.Tally.RequestPauseSeconds is < 0 or > 60)
+            errors.Add("requestPauseSeconds must be 0-60.");
+        if (cfg.Tally.WindowPauseSeconds is < 0 or > 300)
+            errors.Add("windowPauseSeconds must be 0-300.");
         if (cfg.Tally.GateWaitSeconds is < 5 or > 600)
             errors.Add("gateWaitSeconds must be 5-600.");
         if (cfg.Tally.MaxRetriesPerRun is < 0 or > 200)

@@ -1,5 +1,6 @@
 using System.Xml.Linq;
 using Microsoft.Extensions.Logging;
+using TallyAgent.Core.Data;
 using static TallyAgent.Core.Tally.TallyXml;
 
 namespace TallyAgent.Core.Tally.Extractors;
@@ -7,11 +8,160 @@ namespace TallyAgent.Core.Tally.Extractors;
 using Row = Dictionary<string, object?>;
 
 /// <summary>Extracts the 13 master/inventory-master collections via TDL FETCH lists.
-/// Field lists and fallback chains ported from the proven Python connector.</summary>
-public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor> log)
+/// Field lists and fallback chains ported from the proven Python connector.
+///
+/// ONE FETCH PER COLLECTION PER CYCLE (v2.0.5): v2.0.4 asked Tally for the
+/// Ledger collection five times and the StockItem collection four times every
+/// cycle (ledgers, opening_bills, outstanding ×2, bank names; stock_items,
+/// gst_rates, standard costs, standard prices). Each was a full serialization
+/// inside Tally's UI thread. The Ledger and StockItem documents are now
+/// fetched once with the union of fields and cached for the cycle
+/// (<see cref="BeginCycle"/> / <see cref="EndCycle"/>); the dependent
+/// datasets are derived in memory.
+///
+/// COMPUTED BALANCES ONCE A DAY: OPENING/CLOSINGBALANCE on ledgers and
+/// CLOSINGBALANCE/VALUE/RATE on stock items force Tally to walk every voucher
+/// for every master (a full valuation) on each master export. They are
+/// therefore requested from Tally only when the engine says so (the daily
+/// snapshot slot, first run, Force Full Sync, or every cycle when
+/// tally.includeMasterBalances=true) and persisted per GUID in SQLite; every
+/// other master export fills the balance columns from that store, so the
+/// ledgers / stock_items datasets ALWAYS carry balances (as of the last daily
+/// capture) without re-valuing the company each cycle.</summary>
+public sealed class MasterExtractor(TallyClient client, MasterBalanceRepository balanceStore,
+    ILogger<MasterExtractor> log)
 {
+    private readonly SemaphoreSlim _cacheLock = new(1, 1);
+    private XDocument? _ledgerDoc;
+    private XDocument? _stockItemDoc;
+    private bool _fetchBalances;
+    private string _company = "";
+
+    /// <summary>Start a cycle. <paramref name="fetchBalances"/>: ask Tally for
+    /// computed balances this cycle (and persist them); otherwise balances are
+    /// filled from the last capture.</summary>
+    public void BeginCycle(string company, bool fetchBalances)
+    {
+        EndCycle();
+        _company = company;
+        _fetchBalances = fetchBalances || client.IncludeMasterBalances;
+    }
+    public void EndCycle() { _ledgerDoc = null; _stockItemDoc = null; }
+
+    /// <summary>True when this cycle captured fresh balances from Tally.</summary>
+    public bool FetchedBalancesThisCycle => _fetchBalances;
+
     private async Task<XDocument> FetchCollection(string type, string[] fields, CancellationToken ct) =>
         await client.PostAsync(TallyEnvelopes.Collection(type, fields, client.Company), ct);
+
+    private static readonly string[] LedgerBaseFields =
+    [
+        "GUID","MASTERID","ALTERID",
+        "NAME","PARENT","PARTYGSTIN","GSTIN",
+        "GSTREGISTRATIONNUMBER","INCOMETAXNUMBER","LEDSTATENAME","COUNTRYNAME","ADDRESS",
+        "PINCODE","LEDGERMOBILE","LEDGERPHONE","EMAIL","LEDGERCONTACT","BANKACCOUNTNUMBER",
+        "IFSCODE","BANKNAME","BRANCHNAME","ISBILLWISEON","ISCOSTCENTRESON",
+        "BILLALLOCATIONS.LIST",   // opening bills
+    ];
+    private static readonly string[] LedgerBalanceFields = ["OPENINGBALANCE","CLOSINGBALANCE"];
+
+    private static readonly string[] StockItemBaseFields =
+    [
+        "GUID","MASTERID","ALTERID",
+        "NAME","PARENT","CATEGORY","BASEUNITS","OPENINGBALANCE","OPENINGVALUE","OPENINGRATE",
+        "GSTRATE","HSNCODE","DESCRIPTION","ADDITIONALNAME",
+        "GSTAPPLICABLE","GSTTYPEOFSUPPLY","TAXCLASSIFICATIONNAME","GSTDETAILS.LIST",
+        "STANDARDCOSTLIST.LIST","STANDARDPRICELIST.LIST",
+    ];
+    private static readonly string[] StockItemBalanceFields = ["CLOSINGBALANCE","CLOSINGVALUE","CLOSINGRATE"];
+
+    /// <summary>The Ledger collection for this cycle (fetched once).</summary>
+    public async Task<XDocument> LedgerDocument(CancellationToken ct)
+    {
+        if (_ledgerDoc is { } cached) return cached;
+        await _cacheLock.WaitAsync(ct);
+        try
+        {
+            if (_ledgerDoc is { } c2) return c2;
+            var fields = _fetchBalances
+                ? LedgerBaseFields.Concat(LedgerBalanceFields).ToArray()
+                : LedgerBaseFields;
+            _ledgerDoc = await FetchCollection("Ledger", fields, ct);
+            return _ledgerDoc;
+        }
+        finally { _cacheLock.Release(); }
+    }
+
+    /// <summary>The StockItem collection for this cycle (fetched once).</summary>
+    public async Task<XDocument> StockItemDocument(CancellationToken ct)
+    {
+        if (_stockItemDoc is { } cached) return cached;
+        await _cacheLock.WaitAsync(ct);
+        try
+        {
+            if (_stockItemDoc is { } c2) return c2;
+            var fields = _fetchBalances
+                ? StockItemBaseFields.Concat(StockItemBalanceFields).ToArray()
+                : StockItemBaseFields;
+            _stockItemDoc = await FetchCollection("StockItem", fields, ct);
+            return _stockItemDoc;
+        }
+        finally { _cacheLock.Release(); }
+    }
+
+    /// <summary>Balance columns: fresh from Tally when fetching this cycle
+    /// (recorded for persistence), otherwise from the last capture by GUID.</summary>
+    private sealed class BalanceSource
+    {
+        private readonly bool _fresh;
+        private readonly Dictionary<string, Dictionary<string, double>> _cached;
+        public readonly Dictionary<string, Dictionary<string, double>> Captured = new(StringComparer.Ordinal);
+        /// <summary>UTC instant the balance columns are "as of" — now when fresh
+        /// from Tally, the last capture time when served from the store, null
+        /// when no capture exists yet. Emitted on every record as
+        /// <c>balance_as_of</c> so the warehouse never mistakes a cached balance
+        /// for one computed at extraction time.</summary>
+        public readonly string? AsOf;
+        public BalanceSource(bool fresh, Dictionary<string, Dictionary<string, double>> cached, string? asOf)
+        { _fresh = fresh; _cached = cached; AsOf = asOf; }
+        public object? Get(XElement el, string guid, string tag)
+        {
+            if (_fresh)
+            {
+                var v = Num(el, tag);
+                if (guid.Length > 0)
+                {
+                    if (!Captured.TryGetValue(guid, out var d)) Captured[guid] = d = new();
+                    d[tag] = v;
+                }
+                return v;
+            }
+            return _cached.TryGetValue(guid, out var c) && c.TryGetValue(tag, out var cv) ? cv : null;
+        }
+    }
+
+    private BalanceSource NewBalanceSource(string dataset)
+    {
+        if (_fetchBalances)
+            return new BalanceSource(true, new(), DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"));
+        try
+        {
+            return new BalanceSource(false, balanceStore.Load(dataset, _company),
+                balanceStore.LastCapturedUtc(dataset, _company));
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning("Master balance cache unavailable for {Dataset} ({Msg}) — balances null this cycle", dataset, ex.Message);
+            return new BalanceSource(false, new(), null);
+        }
+    }
+
+    private void PersistBalances(string dataset, BalanceSource src)
+    {
+        if (!_fetchBalances || src.Captured.Count == 0) return;
+        try { balanceStore.Save(dataset, _company, src.Captured); }
+        catch (Exception ex) { log.LogWarning("Could not persist {Dataset} balances ({Msg})", dataset, ex.Message); }
+    }
 
     public async Task<List<Row>> Companies(CancellationToken ct)
     {
@@ -59,15 +209,12 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
 
     public async Task<List<Row>> Ledgers(CancellationToken ct)
     {
-        var doc = await FetchCollection("Ledger", [
-            "GUID","MASTERID","ALTERID",
-            "NAME","PARENT","OPENINGBALANCE","CLOSINGBALANCE","PARTYGSTIN","GSTIN",
-            "GSTREGISTRATIONNUMBER","INCOMETAXNUMBER","LEDSTATENAME","COUNTRYNAME","ADDRESS",
-            "PINCODE","LEDGERMOBILE","LEDGERPHONE","EMAIL","LEDGERCONTACT","BANKACCOUNTNUMBER",
-            "IFSCODE","BANKNAME","BRANCHNAME","ISBILLWISEON","ISCOSTCENTRESON"], ct);
+        var doc = await LedgerDocument(ct);
         var rows = new List<Row>();
+        var bal = NewBalanceSource("ledgers");
         foreach (var el in doc.Descendants("LEDGER"))
         {
+            var guid = Text(el, "GUID");
             var gstin = Text(el, "PARTYGSTIN");
             if (gstin.Length == 0) gstin = Text(el, "GSTIN");
             if (gstin.Length == 0) gstin = Text(el, "GSTREGISTRATIONNUMBER");
@@ -78,8 +225,9 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
             ["alter_id"] = Int(el, "ALTERID"),
             ["ledger_name"] = Text(el, "NAME"),
                 ["parent_group"] = Text(el, "PARENT"),
-                ["opening_balance"] = Num(el, "OPENINGBALANCE"),
-                ["closing_balance"] = Num(el, "CLOSINGBALANCE"),
+                ["opening_balance"] = bal.Get(el, guid, "OPENINGBALANCE"),
+                ["closing_balance"] = bal.Get(el, guid, "CLOSINGBALANCE"),
+                ["balance_as_of"] = bal.AsOf,
                 ["gstin"] = gstin,
                 ["pan"] = Text(el, "INCOMETAXNUMBER"),
                 ["state"] = Text(el, "LEDSTATENAME"),
@@ -98,7 +246,9 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
                 ["is_costcentre"] = Bool(el, "ISCOSTCENTRESON"),
             });
         }
-        log.LogInformation("Fetched {N} ledgers", rows.Count);
+        PersistBalances("ledgers", bal);
+        log.LogInformation("Fetched {N} ledgers (balances: {Mode})", rows.Count,
+            _fetchBalances ? "fresh from Tally" : "from last daily capture");
         return rows;
     }
 
@@ -200,16 +350,14 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
 
     public async Task<List<Row>> StockItems(CancellationToken ct)
     {
-        var doc = await FetchCollection("StockItem", [
-            "GUID","MASTERID","ALTERID",
-            "NAME","PARENT","CATEGORY","BASEUNITS","OPENINGBALANCE","OPENINGVALUE",
-            "OPENINGRATE","CLOSINGBALANCE","CLOSINGVALUE","CLOSINGRATE","GSTRATE",
-            "HSNCODE","DESCRIPTION","ADDITIONALNAME"], ct);
+        var doc = await StockItemDocument(ct);
         var rows = new List<Row>();
+        var bal = NewBalanceSource("stock_items");
         foreach (var el in doc.Descendants("STOCKITEM"))
         {
             var name = Text(el, "NAME");
             if (name.Length == 0) continue;
+            var guid = Text(el, "GUID");
             rows.Add(new Row
             {
                 ["master_guid"] = Text(el, "GUID"),
@@ -222,16 +370,19 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
                 ["opening_qty"] = Num(el, "OPENINGBALANCE"),
                 ["opening_value"] = Num(el, "OPENINGVALUE"),
                 ["opening_rate"] = Num(el, "OPENINGRATE"),
-                ["closing_qty"] = Num(el, "CLOSINGBALANCE"),
-                ["closing_value"] = Num(el, "CLOSINGVALUE"),
-                ["closing_rate"] = Num(el, "CLOSINGRATE"),
+                ["closing_qty"] = bal.Get(el, guid, "CLOSINGBALANCE"),
+                ["closing_value"] = bal.Get(el, guid, "CLOSINGVALUE"),
+                ["closing_rate"] = bal.Get(el, guid, "CLOSINGRATE"),
+                ["balance_as_of"] = bal.AsOf,
                 ["gst_rate"] = Num(el, "GSTRATE"),
                 ["hsn_code"] = Text(el, "HSNCODE"),
                 ["description"] = Text(el, "DESCRIPTION"),
                 ["alias"] = Text(el, "ADDITIONALNAME"),
             });
         }
-        log.LogInformation("Fetched {N} stock items", rows.Count);
+        PersistBalances("stock_items", bal);
+        log.LogInformation("Fetched {N} stock items (balances: {Mode})", rows.Count,
+            _fetchBalances ? "fresh from Tally" : "from last daily capture");
         return rows;
     }
 
@@ -257,10 +408,7 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
     /// → RATEDETAILS.LIST; older Tally exposes flat GSTRATE/HSNCODE. Both handled.</summary>
     public async Task<List<Row>> GstRates(CancellationToken ct)
     {
-        var doc = await FetchCollection("StockItem", [
-            "GUID","MASTERID","ALTERID",
-            "NAME","GSTRATE","HSNCODE","GSTAPPLICABLE","GSTTYPEOFSUPPLY",
-            "TAXCLASSIFICATIONNAME","GSTDETAILS.LIST"], ct);
+        var doc = await StockItemDocument(ct);
         var rows = new List<Row>();
         foreach (var el in doc.Descendants("STOCKITEM"))
         {
@@ -310,9 +458,7 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
     /// <summary>Opening bill-wise balances from ledger BILLALLOCATIONS.</summary>
     public async Task<List<Row>> OpeningBills(CancellationToken ct)
     {
-        var doc = await FetchCollection("Ledger",
-            [
-            "GUID","MASTERID","ALTERID","NAME","BILLALLOCATIONS.LIST"], ct);
+        var doc = await LedgerDocument(ct);
         var rows = new List<Row>();
         foreach (var el in doc.Descendants("LEDGER"))
         {
@@ -345,8 +491,7 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
 
     private async Task<List<Row>> StandardRates(string listTag, CancellationToken ct)
     {
-        var doc = await FetchCollection("StockItem", [
-            "GUID","MASTERID","ALTERID","NAME", listTag], ct);
+        var doc = await StockItemDocument(ct);
         var rows = new List<Row>();
         foreach (var el in doc.Descendants("STOCKITEM"))
         {
@@ -365,5 +510,21 @@ public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor>
             }
         }
         return rows;
+    }
+
+    /// <summary>Bank ledger names (parent group containing "Bank") for the
+    /// bank-book fan-out — derived from the cycle's cached Ledger document,
+    /// no extra Tally request.</summary>
+    public async Task<HashSet<string>> BankLedgerNames(CancellationToken ct)
+    {
+        var doc = await LedgerDocument(ct);
+        var set = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var el in doc.Descendants("LEDGER"))
+        {
+            var parent = Text(el, "PARENT");
+            if (parent.Contains("Bank", StringComparison.OrdinalIgnoreCase))
+                set.Add(Text(el, "NAME"));
+        }
+        return set;
     }
 }

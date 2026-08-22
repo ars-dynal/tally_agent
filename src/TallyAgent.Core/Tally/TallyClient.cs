@@ -33,6 +33,19 @@ public sealed record TallyProbeResult(bool Ok, IReadOnlyList<string> Companies, 
 ///    so auto-reconnect now TCP-probes first and only re-sends the full
 ///    request once the port answers again — no full-payload polling;
 ///  • cancellation is never retried; all waits honour the caller token.
+///
+/// DRAIN-AFTER-TIMEOUT (v2.0.5):
+///  A client-side timeout only closes OUR socket — Tally keeps computing the
+///  abandoned export on its single XML thread. Sending the next request
+///  straight away (a retry, a split window, the next dataset) just queues it
+///  behind that work, times out again, and piles more abandoned work onto
+///  Tally: that cascade is what operators experienced as "Tally stuck". A TCP
+///  probe cannot detect it because the listener accepts connections while
+///  busy. So after ANY timeout the client sends a tiny CompanyList request
+///  with a long budget and waits for it to answer before anything else is
+///  sent: because Tally serves requests serially, that answer arrives only
+///  once the abandoned work has drained. If even the drain times out, the
+///  request fails NON-retryably and the cycle ends — Tally gets to recover.
 /// </summary>
 public sealed class TallyClient : IDisposable
 {
@@ -46,6 +59,10 @@ public sealed class TallyClient : IDisposable
     private readonly SemaphoreSlim _localGate;
     private readonly string _gateLockPath;
     private int _runRetryBudget = int.MaxValue;
+    /// <summary>Set when a request timed out; the next request must first
+    /// wait for Tally to finish the abandoned work.</summary>
+    private volatile bool _needsDrain;
+    private TimeSpan _lastTimedOutBudget = TimeSpan.Zero;
 
     /// <summary>Injectable delay for deterministic offline tests (no real sleeps).</summary>
     internal Func<TimeSpan, CancellationToken, Task> DelayAsync { get; set; } = Task.Delay;
@@ -67,12 +84,26 @@ public sealed class TallyClient : IDisposable
     }
 
     public string Company => _settings.Company;
+    public bool FetchLegacyVoucherLists => _settings.VoucherFetchLegacyLists;
+    public bool IncludeMasterBalances => _settings.IncludeMasterBalances;
 
     /// <summary>Request budget for windowed voucher extraction — the heaviest
     /// Tally call. Never below the general request timeout.</summary>
     public TimeSpan VoucherRequestTimeout =>
         TimeSpan.FromSeconds(Math.Max(_settings.RequestTimeoutSeconds,
             _settings.VoucherTimeoutSeconds));
+
+    /// <summary>Request budget for full-financial-year snapshot reports.</summary>
+    public TimeSpan SnapshotRequestTimeout =>
+        TimeSpan.FromSeconds(Math.Max(_settings.RequestTimeoutSeconds,
+            _settings.SnapshotTimeoutSeconds));
+
+    /// <summary>True while Tally is believed to still be working on a request
+    /// the agent abandoned (timed out). Cleared by a successful drain.</summary>
+    public bool NeedsDrain => _needsDrain;
+
+    /// <summary>Injectable "is this the drain probe" marker for tests.</summary>
+    internal const string DrainEnvelopeId = "<ID>CompanyList</ID>";
 
     /// <summary>Arm the per-run retry budget (call at the start of each sync
     /// cycle). Every timeout-retry and reconnect-resend debits it; when it is
@@ -174,11 +205,13 @@ public sealed class TallyClient : IDisposable
         while (true)
         {
             ct.ThrowIfCancellationRequested(); // cancellation is never retried (§F6)
+            if (_needsDrain)
+                await DrainAsync(ct); // throws non-retryable TallyTimeout if Tally is still busy
             try
             {
                 return await PostOnceAsync(envelope, requestTimeout, ct);
             }
-            catch (TallyException tex) when (tex.Category == ErrorCategory.TallyTimeout)
+            catch (TallyException tex) when (tex.Category == ErrorCategory.TallyTimeout && !tex.IsRunEnding)
             {
                 if (timeoutAttempt >= timeoutRetries)
                     throw;
@@ -217,6 +250,9 @@ public sealed class TallyClient : IDisposable
                     await DelayAsync(reconnectDelay, ct);
                     if (await TryTcpProbeAsync(ct)) break;
                 } while (DateTime.UtcNow < reconnectDeadline);
+                // The listener being up does not mean Tally is idle — make the
+                // next send wait for a real (cheap) answer first.
+                _needsDrain = true;
             }
         }
     }
@@ -224,6 +260,21 @@ public sealed class TallyClient : IDisposable
     // ── single request: gate → send → bounded read → parse ──────────────
 
     private async Task<XDocument> PostOnceAsync(string envelope, TimeSpan? requestTimeout,
+        CancellationToken ct)
+    {
+        try
+        {
+            return await PostOnceCoreAsync(envelope, requestTimeout, ct);
+        }
+        finally
+        {
+            // Pause after success AND failure (a timed-out Tally needs the gap most).
+            if (!ct.IsCancellationRequested)
+                await PauseAfterRequestAsync(ct);
+        }
+    }
+
+    private async Task<XDocument> PostOnceCoreAsync(string envelope, TimeSpan? requestTimeout,
         CancellationToken ct)
     {
         var budget = requestTimeout
@@ -251,12 +302,18 @@ public sealed class TallyClient : IDisposable
                 using var content = new ByteArrayContent(Encoding.UTF8.GetBytes(envelope));
                 content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("text/xml");
                 using var request = new HttpRequestMessage(HttpMethod.Post, _settings.BaseUri) { Content = content };
+                // Tally's HTTP server is happiest with one connection per request;
+                // a lingering keep-alive socket can hold its request slot.
+                request.Headers.ConnectionClose = true;
                 resp = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token);
                 body = await ReadBoundedBodyAsync(resp, timeoutCts.Token);
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
                 resp?.Dispose(); // connection not pinned while the retry loop runs
+                // Tally is still working on what we just abandoned.
+                _needsDrain = true;
+                _lastTimedOutBudget = budget;
                 throw new TallyException(ErrorCategory.TallyTimeout,
                     $"Tally request timed out after {(int)budget.TotalSeconds}s " +
                     $"({_settings.Host}:{_settings.Port}).");
@@ -275,8 +332,18 @@ public sealed class TallyClient : IDisposable
             using (resp)
             {
                 if (!resp.IsSuccessStatusCode)
-                    throw new TallyException(ErrorCategory.TallyPortUnavailable,
-                        $"Tally returned HTTP {(int)resp.StatusCode} on {_settings.Host}:{_settings.Port}.");
+                {
+                    var code = (int)resp.StatusCode;
+                    // 5xx / 503 = Tally busy or restarting → transient (reconnect path).
+                    // 4xx = the request itself was rejected → permanent; retrying or
+                    // "reconnecting" for 30 minutes would only hammer Tally.
+                    if (code >= 500)
+                        throw new TallyException(ErrorCategory.TallyPortUnavailable,
+                            $"Tally returned HTTP {code} on {_settings.Host}:{_settings.Port}.");
+                    throw new TallyException(ErrorCategory.TallyInvalidXml,
+                        $"Tally rejected the request with HTTP {code} on {_settings.Host}:{_settings.Port} " +
+                        "(not retried — check the TDL/collection or Tally build).");
+                }
             }
 
             try
@@ -296,6 +363,40 @@ public sealed class TallyClient : IDisposable
             _localGate.Release();
         }
     }
+
+    /// <summary>Wait for Tally to finish work abandoned by a timed-out request
+    /// (see class summary). Budget: twice the budget that expired, at least
+    /// 60 s, at most 10 min. Does not debit the retry budget — it sends no
+    /// real work. A drain that itself times out fails NON-retryably so the
+    /// current run ends and Tally is left alone until the next cycle.</summary>
+    private async Task DrainAsync(CancellationToken ct)
+    {
+        var budget = TimeSpan.FromSeconds(Math.Clamp(_lastTimedOutBudget.TotalSeconds * 2, 60, 600));
+        _log.LogWarning("Waiting up to {Budget:F0}s for Tally to finish the request the agent abandoned before sending more work",
+            budget.TotalSeconds);
+        try
+        {
+            await PostOnceAsync(TallyEnvelopes.CompanyList(), budget, ct);
+            _needsDrain = false;
+            _log.LogInformation("Tally is responsive again — resuming");
+        }
+        catch (TallyException tex) when (tex.Category == ErrorCategory.TallyTimeout)
+        {
+            // Still busy after a generous wait: end this run cleanly. The flag
+            // stays set so the NEXT cycle also drains before doing anything.
+            throw new TallyException(ErrorCategory.TallyTimeout,
+                $"Tally is still busy {budget.TotalSeconds:F0}s after a timed-out request — ending this " +
+                "sync cycle so Tally can recover; the run resumes from its checkpoint next cycle.", tex)
+            { IsRunEnding = true };
+        }
+    }
+
+    /// <summary>Give the Tally UI thread a slice after every request. Applied
+    /// OUTSIDE the gates so other processes are not blocked by our pause.</summary>
+    private Task PauseAfterRequestAsync(CancellationToken ct) =>
+        _settings.RequestPauseSeconds > 0
+            ? DelayAsync(TimeSpan.FromSeconds(_settings.RequestPauseSeconds), ct)
+            : Task.CompletedTask;
 
     /// <summary>Exclusive lock file shared by service, Manager and CLI so a
     /// diagnostics probe can never hit Tally while an extraction is in flight.
@@ -371,7 +472,8 @@ public sealed class TallyClient : IDisposable
         if (_runRetryBudget <= 0)
             throw new TallyException(ErrorCategory.TallyTimeout,
                 "Per-run Tally retry budget exhausted — ending this sync cycle so Tally can " +
-                $"recover; the run resumes from its checkpoint next cycle. Last error: {cause.Message}");
+                $"recover; the run resumes from its checkpoint next cycle. Last error: {cause.Message}")
+            { IsRunEnding = true };
         _runRetryBudget--;
     }
 

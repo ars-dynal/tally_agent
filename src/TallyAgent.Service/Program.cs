@@ -82,6 +82,7 @@ try
         builder.Services.AddSingleton<CheckpointRepository>();
         builder.Services.AddSingleton<ErrorLogRepository>();
         builder.Services.AddSingleton<HeartbeatRepository>();
+        builder.Services.AddSingleton<MasterBalanceRepository>();
         builder.Services.AddSingleton(sp => new TallyClient(config.Tally,
             sp.GetRequiredService<ILogger<TallyClient>>()));
         builder.Services.AddSingleton<MasterExtractor>();

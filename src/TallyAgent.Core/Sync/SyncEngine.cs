@@ -35,6 +35,13 @@ public sealed class SyncEngine(
 {
     public string CurrentOperation { get; private set; } = "idle";
 
+    /// <summary>Bank ledger names reused across cycles while masters are
+    /// unchanged (saves a Ledger fetch on every incremental cycle).</summary>
+    private HashSet<string>? _bankLedgerCache;
+
+    /// <summary>Checkpoint row that records the last daily master-balance capture.</summary>
+    private const string MasterBalancesCheckpoint = "_master_balances";
+
     public Task<SyncResult> RunCycleAsync(string mode, CancellationToken ct) =>
         RunCycleAsync(mode, null, ct);
 
@@ -53,6 +60,7 @@ public sealed class SyncEngine(
         // Arm the per-run Tally retry budget (Phase F8): timeouts/reconnects
         // across ALL datasets and windows share one bounded pool this cycle.
         tally.ResetRunBudget(config.Tally.MaxRetriesPerRun);
+        reports.BeginCycle();
         RecordRunStart(syncId, mode);
         var errorList = new List<string>();
         var extractedCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -119,12 +127,34 @@ public sealed class SyncEngine(
                 checkpoints.Get("_alter_gate_vouchers", company)?.LastAlterId == a2.Vouchers;
 
             // ── Masters & snapshots ────────────────────────────────
-            if (mastersUnchanged && vouchersUnchanged)
-                log.LogInformation("AlterID gate: no master or voucher changes — skipping masters/snapshots");
+            // v2.0.5: the two gates are INDEPENDENT. v2.0.4 skipped masters only
+            // when masters AND vouchers were both unchanged — so one voucher
+            // entry during the day re-exported all 15 master tables plus the
+            // full-FY snapshot reports every cycle. Masters now run only when a
+            // master changed; snapshots run on their own daily slot.
+            // Computed balances (ledger opening/closing, stock closing qty/value/
+            // rate) are asked from Tally on the same daily slot as the snapshots
+            // and cached per GUID; other cycles fill them from the cache.
+            var balancesDue = ShouldRunSnapshot(MasterBalancesCheckpoint, company, mode, out var balWhy);
+            masters.BeginCycle(company, fetchBalances: balancesDue);
+            var runMasters = !mastersUnchanged;
+            if (!runMasters)
+                log.LogInformation("AlterID gate: no master changes — skipping master collections" +
+                    (balancesDue ? " (ledgers/stock_items still run for the daily balance capture)" : ""));
             else
+                log.LogDebug("Master balances this cycle: {Mode} ({Why})", balancesDue ? "fetch" : "cache", balWhy);
+            var balanceDatasetsOk = 0;
+            var runEnded = false;
             foreach (var ds in enabled.Where(d => d.Kind is DatasetKind.Master or DatasetKind.Snapshot))
             {
                 ct.ThrowIfCancellationRequested();
+                var isBalanceDataset = ds.Name is "ledgers" or "stock_items";
+                if (ds.Kind == DatasetKind.Master && !runMasters && !(balancesDue && isBalanceDataset)) continue;
+                if (ds.Kind == DatasetKind.Snapshot && !ShouldRunSnapshot(ds.Name, company, mode, out var why))
+                {
+                    log.LogDebug("Snapshot {Dataset} skipped: {Why}", ds.Name, why);
+                    continue;
+                }
                 CurrentOperation = $"extract:{ds.Name}";
                 try
                 {
@@ -150,6 +180,15 @@ public sealed class SyncEngine(
 
                     EnqueueAndCheckpoint(ds.Name, company, syncId, rows, null, null, fullDone: true);
                     ok++;
+                    if (balancesDue && isBalanceDataset) balanceDatasetsOk++;
+                }
+                catch (TallyException tex) when (tex.IsRunEnding)
+                {
+                    // Tally is busy/exhausted: stop asking it for anything this cycle.
+                    failed++;
+                    await HandleDatasetErrorAsync(ds.Name, tex, errorList);
+                    runEnded = true;
+                    break;
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
@@ -157,6 +196,12 @@ public sealed class SyncEngine(
                     await HandleDatasetErrorAsync(ds.Name, ex, errorList);
                 }
             }
+
+            // Mark the daily balance capture done only when both balance-bearing
+            // datasets succeeded (or are disabled) so a failed one is retried.
+            if (balancesDue && balanceDatasetsOk >= enabled.Count(d => d.Name is "ledgers" or "stock_items"))
+                checkpoints.Upsert(new SyncCheckpoint(MasterBalancesCheckpoint, company,
+                    null, null, null, DateTime.UtcNow.ToString("O"), true));
 
             // Do not silently certify a full baseline when strongly related
             // datasets contradict each other. These checks are deliberately
@@ -175,7 +220,7 @@ public sealed class SyncEngine(
             }
 
             // ── Vouchers (windowed Day Book fan-out) ───────────────
-            if (enabled.Any(d => d.Kind == DatasetKind.Voucher))
+            if (!runEnded && enabled.Any(d => d.Kind == DatasetKind.Voucher))
             {
                 var plan = PlanVouchers(company);
                 var skipVouchers = vouchersUnchanged && !plan.IsFullSync;
@@ -200,8 +245,15 @@ public sealed class SyncEngine(
                 if (!skipVouchers && plan.Windows.Count > 0)
                 {
                     HashSet<string> bankLedgers;
-                    try { bankLedgers = await reports.BankLedgerNames(ct); }
-                    catch { bankLedgers = []; }
+                    if (_bankLedgerCache is { } cachedBanks && !runMasters)
+                        bankLedgers = cachedBanks;
+                    else
+                    {
+                        try { bankLedgers = await masters.BankLedgerNames(ct); _bankLedgerCache = bankLedgers; }
+                        catch (TallyException tex) when (tex.IsRunEnding) { throw; }
+                        catch { bankLedgers = _bankLedgerCache ?? []; }
+                    }
+                    var voucherBudget = tally.VoucherRequestTimeout;
 
                     // Adaptive windowing: a window that times out is split in half
                     // and retried down to single-day windows.
@@ -213,7 +265,9 @@ public sealed class SyncEngine(
                         CurrentOperation = $"extract:vouchers {from:yyyy-MM-dd}..{to:yyyy-MM-dd}";
                         try
                         {
+                            var sw = System.Diagnostics.Stopwatch.StartNew();
                             var result = await vouchers.ExtractWindow(from, to, bankLedgers, ct);
+                            sw.Stop();
                             var wf = from.ToString("yyyy-MM-dd");
                             var wt = to.ToString("yyyy-MM-dd");
 
@@ -230,6 +284,23 @@ public sealed class SyncEngine(
                                 result.MaxVoucherDate, "completed");
                             ok++;
 
+                            // Adaptive-down windowing: a window that succeeded but
+                            // used more than 60% of its budget is a timeout waiting
+                            // to happen on the next (often busier) month. Halve the
+                            // remaining windows now instead of discovering it the
+                            // expensive way. Windows never grow within a run.
+                            var days = to.DayNumber - from.DayNumber + 1;
+                            if (days > 1 && pending.Count > 0 &&
+                                sw.Elapsed > voucherBudget * 0.6)
+                            {
+                                var newChunk = Math.Max(1, days / 2);
+                                log.LogWarning(
+                                    "Window {From}..{To} took {Secs:F0}s (>60% of the {Budget:F0}s budget) — " +
+                                    "shrinking remaining windows to {Chunk} day(s)",
+                                    from, to, sw.Elapsed.TotalSeconds, voucherBudget.TotalSeconds, newChunk);
+                                ReChunk(pending, newChunk, newestFirst: plan.TargetStart is not null);
+                            }
+
                             // Low-impact mode: give the Tally UI room to breathe
                             // between windows (its XML server shares the app
                             // thread — the gap is when operators' screens catch up).
@@ -238,7 +309,7 @@ public sealed class SyncEngine(
                                     TimeSpan.FromSeconds(config.Tally.WindowPauseSeconds), ct);
                         }
                         catch (TallyException tex) when (
-                            tex.Category == ErrorCategory.TallyTimeout && to > from)
+                            tex.Category == ErrorCategory.TallyTimeout && !tex.IsRunEnding && to > from)
                         {
                             var mid = from.AddDays((to.DayNumber - from.DayNumber) / 2);
                             var secondFrom = mid.AddDays(1);
@@ -266,6 +337,10 @@ public sealed class SyncEngine(
                                 pending.Enqueue((secondFrom, to));
                             }
                             foreach (var w in rest) pending.Enqueue(w);
+                            // Every later window of the old size would time out the
+                            // same way — shrink them all to the new half size now.
+                            ReChunk(pending, Math.Max(1, (mid.DayNumber - from.DayNumber + 1)),
+                                newestFirst: plan.TargetStart is not null);
                         }
                         catch (Exception ex) when (ex is not OperationCanceledException)
                         {
@@ -308,11 +383,60 @@ public sealed class SyncEngine(
         }
         finally
         {
+            masters.EndCycle();   // release cached Ledger/StockItem documents
+            reports.EndCycle();
             CurrentOperation = "idle";
         }
     }
 
     // ── planning ──────────────────────────────────────────────────
+
+    /// <summary>Snapshot reports (full-FY TB/BS/P&amp;L/Stock Summary and the
+    /// outstanding balances) are the heaviest requests the agent makes. They
+    /// run: every cycle only if tally.snapshotEveryCycle; otherwise on Force
+    /// Full Sync, when the dataset has never been extracted, or once per
+    /// server-local day at/after tally.snapshotHourLocal. Per-dataset, so a
+    /// snapshot that timed out is retried next cycle without re-running the
+    /// ones that already succeeded today.</summary>
+    private bool ShouldRunSnapshot(string dataset, string company, string mode, out string reason)
+    {
+        if (config.Tally.SnapshotEveryCycle) { reason = "snapshotEveryCycle"; return true; }
+        if (mode == "full-forced") { reason = "force full sync"; return true; }
+        var cp = checkpoints.Get(dataset, company);
+        if (cp?.LastSuccessUtc is null) { reason = "never extracted"; return true; }
+
+        var now = DateTime.Now;
+        var lastLocal = DateTime.TryParse(cp.LastSuccessUtc, null,
+            System.Globalization.DateTimeStyles.RoundtripKind, out var lastUtc)
+            ? lastUtc.ToLocalTime() : DateTime.MinValue;
+        if (lastLocal.Date == now.Date) { reason = "already extracted today"; return false; }
+        if (now.Hour < Math.Clamp(config.Tally.SnapshotHourLocal, 0, 23))
+        { reason = $"daily slot starts at {config.Tally.SnapshotHourLocal:00}:00"; return false; }
+        reason = "daily slot";
+        return true;
+    }
+
+    /// <summary>Re-split every pending window wider than <paramref name="chunkDays"/>
+    /// into chunks of that size, preserving walk direction and order.</summary>
+    internal static void ReChunk(Queue<(DateOnly From, DateOnly To)> pending, int chunkDays, bool newestFirst)
+    {
+        chunkDays = Math.Max(1, chunkDays);
+        var rest = pending.ToList();
+        pending.Clear();
+        foreach (var (from, to) in rest)
+        {
+            if (to.DayNumber - from.DayNumber + 1 <= chunkDays) { pending.Enqueue((from, to)); continue; }
+            var pieces = new List<(DateOnly, DateOnly)>();
+            for (var f = from; f <= to; f = f.AddDays(chunkDays))
+            {
+                var t = f.AddDays(chunkDays - 1);
+                if (t > to) t = to;
+                pieces.Add((f, t));
+            }
+            if (newestFirst) pieces.Reverse();
+            foreach (var pc in pieces) pending.Enqueue(pc);
+        }
+    }
 
     public List<(DateOnly From, DateOnly To)> PlanVoucherWindows(string company)
     {
@@ -394,8 +518,8 @@ public sealed class SyncEngine(
             "balance_sheet" => await reports.BalanceSheet(fyStart, today, ct),
             "profit_loss" => await reports.ProfitLoss(fyStart, today, ct),
             "stock_summary" => await reports.StockSummary(fyStart, today, ct),
-            "outstanding_payables" => await reports.Outstanding("Sundry Creditors", ct),
-            "outstanding_receivables" => await reports.Outstanding("Sundry Debtors", ct),
+            "outstanding_payables" => await reports.Outstanding("Sundry Creditors", today, ct),
+            "outstanding_receivables" => await reports.Outstanding("Sundry Debtors", today, ct),
             _ => throw new InvalidOperationException($"Unknown dataset '{dataset}'"),
         };
     }
