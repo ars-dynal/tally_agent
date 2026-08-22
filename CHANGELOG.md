@@ -1,5 +1,96 @@
 # Changelog
 
+## 2.0.5 — Tally load reduction (Tally no longer slows down / gets stuck while the agent runs)
+
+Root cause of the v2.0.4 field reports: 2.0.4 fixed *concurrency* (one request
+at a time) but not *load*. Every 15-minute cycle still fired ~25–30 heavy
+requests back-to-back, several of them full-financial-year computations, and a
+client-side timeout left Tally computing the abandoned request while the agent
+immediately sent the next one — the requests piled up on Tally's single XML
+thread, which operators saw as "Tally stuck". Full analysis in
+`docs/REVIEW_v2.0.4_tally_slowness.md`.
+
+### Stuck-Tally fixes
+* **Drain after timeout** (`TallyClient`): after ANY timed-out request the
+  client sends one tiny CompanyList probe with a long budget and waits for it
+  to answer before sending anything else. Because Tally serves requests
+  serially, the answer arrives only once the abandoned work has drained. If
+  even the drain times out the request fails NON-retryably (`IsRunEnding`),
+  the cycle ends, and the next cycle drains first too. The old 10/30/60 s
+  same-request retry ladder — which queued up to 4 copies of a heavy report
+  inside Tally — is effectively gone for a busy Tally.
+* **Run-ending errors stop the whole cycle** (`SyncEngine`): retry budget
+  exhausted or Tally-still-busy no longer moves on to the next dataset or
+  splits the voucher window; extraction stops and resumes from checkpoints.
+* **Next run is scheduled from the END of a cycle** (`SyncWorker`): a cycle
+  longer than `syncFrequencyMinutes` was previously followed by another one
+  immediately, so Tally never got an idle gap during office hours.
+* **Idle gap after every request** (`tally.requestPauseSeconds`, default 2):
+  the breathing pause now follows masters, reports and probes — not only
+  voucher windows (`windowPauseSeconds` default raised 3 → 5).
+* `Connection: close` on every Tally request; HTTP 4xx is now a permanent
+  error (no 30-minute "reconnect" loop on a rejected TDL).
+* `maxConcurrentTallyRequests` is accepted for compatibility but the effective
+  in-flight concurrency is always 1 (2 is known to stall TallyPrime).
+* `maxRetriesPerRun` default 20 → 5.
+
+### Load reduction per cycle
+* **Independent AlterID gates**: masters are skipped when no *master*
+  changed (previously one voucher entry re-exported all 15 master tables).
+* **Snapshot reports once a day**: Trial Balance, Balance Sheet, P&L, Stock
+  Summary and outstanding payables/receivables (full-FY computations) now run
+  on a daily slot after `tally.snapshotHourLocal` (default 20:00), on the
+  first ever run, and on Force Full Sync — per dataset, so a report that timed
+  out is retried next cycle without re-running the others. They use their own
+  `snapshotTimeoutSeconds` (default 300) and are never retried at the same
+  size within a cycle. `snapshotEveryCycle: true` restores the old behaviour.
+* **One Ledger fetch and one StockItem fetch per cycle** (`MasterExtractor`):
+  previously Ledger ×5 and StockItem ×4 per cycle. `ledgers`, `opening_bills`,
+  bank-ledger names, `stock_items`, `gst_rates`, `stock_standard_costs` and
+  `stock_standard_prices` are derived from the cached documents; the two
+  outstanding datasets and the trial-balance fallback share one dated Ledger
+  balance fetch (`ReportExtractor`).
+* **Computed master balances once a day, never missing**: ledger
+  OPENING/CLOSINGBALANCE and stock item closing qty/value/rate forced Tally to
+  re-value every ledger/item on every master export. They are now requested
+  from Tally only on the daily snapshot slot (and first run / Force Full Sync),
+  persisted per GUID in SQLite (`master_balances`, schema v5), and every other
+  `ledgers` / `stock_items` export fills the balance columns from that store —
+  so the columns always carry values (as of the last daily capture). Every
+  `ledgers` / `stock_items` record carries a new `balance_as_of` (UTC) field
+  — the capture time, NOT the extraction time — so balance age is explicit
+  in the warehouse (null until the first capture).
+  `tally.includeMasterBalances: true` asks Tally for fresh balances every
+  cycle (v2.0.4 behaviour, heavy).
+* **Voucher export asks for each line once**: the envelope requested every
+  dotted field under both `ALLLEDGERENTRIES` and `LEDGERENTRIES` (and both
+  inventory shapes), so Tally serialized every line twice and the extractor
+  discarded one copy. Only the `ALL*` shape is requested now;
+  `tally.voucherFetchLegacyLists: true` re-enables the legacy lists for old
+  builds.
+* **Adaptive-down voucher windows**: `fullSyncChunkDays` default 31 → 7,
+  `voucherTimeoutSeconds` default 300 → 180. A window that times out OR takes
+  more than 60% of its budget shrinks *all* remaining windows (not just the one
+  that failed); windows never grow within a run.
+
+### Tests
+* +12 offline tests: drain-before-retry, busy-Tally ends run after one drain,
+  budget-0 ends run, 4xx not retried, per-request pause, concurrency always 1,
+  envelope requests ALL* shape only, ReChunk ordering/coverage, daily balance
+  capture + cache, one Ledger fetch per cycle. Two v2.0.4 tests updated for
+  the drain call. 68/68 pass. Service and CLI projects compile-checked
+  against the published assemblies (Manager unchanged).
+
+### Upgrade notes
+* Existing `config.json` files keep working; new keys take their defaults.
+  Recommended: leave defaults, and run Force Full Sync after office hours.
+* Warehouse: `ledgers` / `stock_items` balance columns are refreshed once a
+  day (snapshot slot) rather than every cycle; intraday they repeat the last
+  daily capture. Use `trial_balance` / `stock_summary` for intraday figures.
+* SQLite schema migrates v4 → v5 automatically (new `master_balances` table).
+* Known limitation: offline source-code phase; not yet validated against a
+  live Windows/Tally installation.
+
 ## 2.0.4 — Server protection & synchronization stability (fix/tally-agent-server-protection)
 
 Offline source-code phase; NOT yet validated against live Windows/Tally.

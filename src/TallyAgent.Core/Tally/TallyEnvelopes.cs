@@ -61,7 +61,8 @@ public static class TallyEnvelopes
     /// extractor still validates each voucher's DATE client-side, so any
     /// out-of-window voucher a Tally build might leak is skipped and logged.
     /// </summary>
-    public static string VoucherCollection(DateOnly from, DateOnly to, string? company)
+    public static string VoucherCollection(DateOnly from, DateOnly to, string? company,
+        bool includeLegacyLists = false)
     {
         var sb = new StringBuilder(4096);
         sb.Append("<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>")
@@ -76,18 +77,50 @@ public static class TallyEnvelopes
 
         sb.Append("</STATICVARIABLES><TDL><TDLMESSAGE>")
           .Append("<COLLECTION NAME=\"AgentVoucherCollection\"><TYPE>Voucher</TYPE>")
-          .Append("<FETCH>DATE,VOUCHERTYPENAME,VOUCHERNUMBER,REFERENCE,NARRATION,PARTYLEDGERNAME,GUID,MASTERID,ALTERID,ISCANCELLED,ISOPTIONAL,AMOUNT</FETCH>")
-          // Explicit dotted sub-object fields ONLY (the exact set the extractor
-          // reads). Wildcard fetches (ALLLEDGERENTRIES.* etc.) made Tally
-          // serialize EVERY field of EVERY nested object — including deep GST/
-          // tax structures nobody consumed — which is what froze the Tally UI
-          // during extraction. Same technique as tally-database-loader.
-          .Append("<FETCH>ALLLEDGERENTRIES.LEDGERNAME,ALLLEDGERENTRIES.AMOUNT,ALLLEDGERENTRIES.ISDEEMEDPOSITIVE,LEDGERENTRIES.LEDGERNAME,LEDGERENTRIES.AMOUNT,LEDGERENTRIES.ISDEEMEDPOSITIVE</FETCH>")
-          .Append("<FETCH>ALLLEDGERENTRIES.BILLALLOCATIONS.NAME,ALLLEDGERENTRIES.BILLALLOCATIONS.AMOUNT,ALLLEDGERENTRIES.BILLALLOCATIONS.BILLTYPE,LEDGERENTRIES.BILLALLOCATIONS.NAME,LEDGERENTRIES.BILLALLOCATIONS.AMOUNT,LEDGERENTRIES.BILLALLOCATIONS.BILLTYPE</FETCH>")
-          .Append("<FETCH>ALLLEDGERENTRIES.BANKALLOCATIONS.TRANSACTIONTYPE,ALLLEDGERENTRIES.BANKALLOCATIONS.INSTRUMENTDATE,ALLLEDGERENTRIES.BANKALLOCATIONS.INSTRUMENTNUMBER,ALLLEDGERENTRIES.BANKALLOCATIONS.BANKNAME,ALLLEDGERENTRIES.BANKALLOCATIONS.AMOUNT,ALLLEDGERENTRIES.BANKALLOCATIONS.BANKERSDATE,LEDGERENTRIES.BANKALLOCATIONS.TRANSACTIONTYPE,LEDGERENTRIES.BANKALLOCATIONS.INSTRUMENTDATE,LEDGERENTRIES.BANKALLOCATIONS.INSTRUMENTNUMBER,LEDGERENTRIES.BANKALLOCATIONS.BANKNAME,LEDGERENTRIES.BANKALLOCATIONS.AMOUNT,LEDGERENTRIES.BANKALLOCATIONS.BANKERSDATE</FETCH>")
-          .Append("<FETCH>ALLLEDGERENTRIES.COSTCENTREALLOCATIONS.NAME,ALLLEDGERENTRIES.COSTCENTREALLOCATIONS.AMOUNT,ALLLEDGERENTRIES.CATEGORYALLOCATIONS.CATEGORY,ALLLEDGERENTRIES.CATEGORYALLOCATIONS.COSTCENTREALLOCATIONS.NAME,ALLLEDGERENTRIES.CATEGORYALLOCATIONS.COSTCENTREALLOCATIONS.AMOUNT,LEDGERENTRIES.COSTCENTREALLOCATIONS.NAME,LEDGERENTRIES.COSTCENTREALLOCATIONS.AMOUNT,LEDGERENTRIES.CATEGORYALLOCATIONS.CATEGORY,LEDGERENTRIES.CATEGORYALLOCATIONS.COSTCENTREALLOCATIONS.NAME,LEDGERENTRIES.CATEGORYALLOCATIONS.COSTCENTREALLOCATIONS.AMOUNT</FETCH>")
-          .Append("<FETCH>ALLINVENTORYENTRIES.STOCKITEMNAME,ALLINVENTORYENTRIES.ACTUALQTY,ALLINVENTORYENTRIES.RATE,ALLINVENTORYENTRIES.AMOUNT,ALLINVENTORYENTRIES.GODOWNNAME,ALLINVENTORYENTRIES.BATCHALLOCATIONS.GODOWNNAME,INVENTORYENTRIES.STOCKITEMNAME,INVENTORYENTRIES.ACTUALQTY,INVENTORYENTRIES.RATE,INVENTORYENTRIES.AMOUNT,INVENTORYENTRIES.GODOWNNAME,INVENTORYENTRIES.BATCHALLOCATIONS.GODOWNNAME</FETCH>")
-          .Append("</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>");
+          .Append("<FETCH>DATE,VOUCHERTYPENAME,VOUCHERNUMBER,REFERENCE,NARRATION,PARTYLEDGERNAME,GUID,MASTERID,ALTERID,ISCANCELLED,ISOPTIONAL,AMOUNT</FETCH>");
+
+        // Explicit dotted sub-object fields ONLY (the exact set the extractor
+        // reads). Wildcard fetches (ALLLEDGERENTRIES.* etc.) made Tally
+        // serialize EVERY field of EVERY nested object — including deep GST/
+        // tax structures nobody consumed — which is what froze the Tally UI
+        // during extraction. Same technique as tally-database-loader.
+        //
+        // v2.0.5: ONLY the ALL*ENTRIES shape is requested by default. v2.0.3/4
+        // also fetched the legacy LEDGERENTRIES/INVENTORYENTRIES lists, which
+        // made Tally serialize every line TWICE (the extractor then threw one
+        // copy away). Old builds that lack ALL*ENTRIES can opt in via
+        // tally.voucherFetchLegacyLists.
+        var prefixes = includeLegacyLists
+            ? new[] { ("ALLLEDGERENTRIES", "ALLINVENTORYENTRIES"), ("LEDGERENTRIES", "INVENTORYENTRIES") }
+            : new[] { ("ALLLEDGERENTRIES", "ALLINVENTORYENTRIES") };
+
+        foreach (var (led, inv) in prefixes)
+        {
+            sb.Append("<FETCH>")
+              .Append(led).Append(".LEDGERNAME,").Append(led).Append(".AMOUNT,").Append(led).Append(".ISDEEMEDPOSITIVE")
+              .Append("</FETCH>");
+            sb.Append("<FETCH>")
+              .Append(led).Append(".BILLALLOCATIONS.NAME,").Append(led).Append(".BILLALLOCATIONS.AMOUNT,")
+              .Append(led).Append(".BILLALLOCATIONS.BILLTYPE")
+              .Append("</FETCH>");
+            sb.Append("<FETCH>")
+              .Append(led).Append(".BANKALLOCATIONS.TRANSACTIONTYPE,").Append(led).Append(".BANKALLOCATIONS.INSTRUMENTDATE,")
+              .Append(led).Append(".BANKALLOCATIONS.INSTRUMENTNUMBER,").Append(led).Append(".BANKALLOCATIONS.BANKNAME,")
+              .Append(led).Append(".BANKALLOCATIONS.AMOUNT,").Append(led).Append(".BANKALLOCATIONS.BANKERSDATE")
+              .Append("</FETCH>");
+            sb.Append("<FETCH>")
+              .Append(led).Append(".COSTCENTREALLOCATIONS.NAME,").Append(led).Append(".COSTCENTREALLOCATIONS.AMOUNT,")
+              .Append(led).Append(".CATEGORYALLOCATIONS.CATEGORY,")
+              .Append(led).Append(".CATEGORYALLOCATIONS.COSTCENTREALLOCATIONS.NAME,")
+              .Append(led).Append(".CATEGORYALLOCATIONS.COSTCENTREALLOCATIONS.AMOUNT")
+              .Append("</FETCH>");
+            sb.Append("<FETCH>")
+              .Append(inv).Append(".STOCKITEMNAME,").Append(inv).Append(".ACTUALQTY,").Append(inv).Append(".RATE,")
+              .Append(inv).Append(".AMOUNT,").Append(inv).Append(".GODOWNNAME,").Append(inv).Append(".BATCHALLOCATIONS.GODOWNNAME")
+              .Append("</FETCH>");
+        }
+
+        sb.Append("</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>");
         return sb.ToString();
     }
 

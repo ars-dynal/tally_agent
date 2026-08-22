@@ -10,7 +10,7 @@ namespace TallyAgent.Core.Data;
 /// </summary>
 public sealed class AgentDatabase
 {
-    public const int CurrentSchemaVersion = 4;
+    public const int CurrentSchemaVersion = 5;
 
     private readonly string _connectionString;
     private readonly ILogger<AgentDatabase> _log;
@@ -58,7 +58,8 @@ public sealed class AgentDatabase
         if (version < 2) MigrateToV2(conn, tx);
         if (version < 3) MigrateToV3(conn, tx);
         if (version < 4) MigrateToV4(conn, tx);
-        // future: if (version < 4) MigrateToV4(conn, tx); — additive only
+        if (version < 5) MigrateToV5(conn, tx);
+        // future: additive only
 
         Exec(conn, tx, """
             INSERT INTO schema_meta(key, value) VALUES('schema_version', $v)
@@ -208,6 +209,24 @@ public sealed class AgentDatabase
               completed_utc TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS ix_coverage_ds ON window_coverage(dataset, window_from);
+            """);
+    }
+
+    /// <summary>V5: master_balances — last known computed balances per master
+    /// (ledger opening/closing, stock item closing qty/value/rate), captured on
+    /// the daily snapshot slot so every-cycle master exports never ask Tally to
+    /// re-value the whole company yet still carry balance columns.</summary>
+    private static void MigrateToV5(SqliteConnection conn, SqliteTransaction tx)
+    {
+        Exec(conn, tx, """
+            CREATE TABLE IF NOT EXISTS master_balances (
+              dataset      TEXT NOT NULL,
+              company      TEXT NOT NULL,
+              guid         TEXT NOT NULL,
+              values_json  TEXT NOT NULL,
+              captured_utc TEXT NOT NULL,
+              PRIMARY KEY (dataset, company, guid)
+            );
             """);
     }
 

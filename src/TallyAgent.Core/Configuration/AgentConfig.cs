@@ -26,7 +26,34 @@ public sealed class TallySettings
     /// <summary>Timeout for windowed voucher extraction requests, which are the
     /// heaviest calls the agent makes. Defaults higher than requestTimeoutSeconds
     /// so a large month gets a fair chance before the window is split.</summary>
-    [JsonPropertyName("voucherTimeoutSeconds")] public int VoucherTimeoutSeconds { get; set; } = 300;
+    [JsonPropertyName("voucherTimeoutSeconds")] public int VoucherTimeoutSeconds { get; set; } = 180;
+    /// <summary>Timeout for full-financial-year snapshot reports (Trial Balance,
+    /// Balance Sheet, P&amp;L, Stock Summary). These are never retried at the
+    /// same size inside a cycle — a timeout simply defers the snapshot to the
+    /// next snapshot slot.</summary>
+    [JsonPropertyName("snapshotTimeoutSeconds")] public int SnapshotTimeoutSeconds { get; set; } = 300;
+    /// <summary>Server-local hour (0-23) after which the once-daily snapshot
+    /// reports (TB/BS/P&amp;L/Stock Summary/outstanding) are extracted. They are
+    /// the heaviest thing the agent asks Tally for, so they run once per day
+    /// (default 20:00 — after office hours), on the first ever run, and on a
+    /// Force Full Sync. Set snapshotEveryCycle=true to restore v2.0.4 behaviour.</summary>
+    [JsonPropertyName("snapshotHourLocal")] public int SnapshotHourLocal { get; set; } = 20;
+    [JsonPropertyName("snapshotEveryCycle")] public bool SnapshotEveryCycle { get; set; } = false;
+    /// <summary>Computed balances (ledger OPENING/CLOSINGBALANCE, stock item
+    /// closing qty/value/rate) force Tally to walk every voucher for every
+    /// ledger/item. By default (false) they are requested from Tally once a day
+    /// on the snapshot slot and cached per GUID; every other master export
+    /// fills the balance columns from that cache. Set true to ask Tally for
+    /// fresh balances on EVERY cycle (v2.0.4 behaviour, heavy).</summary>
+    [JsonPropertyName("includeMasterBalances")] public bool IncludeMasterBalances { get; set; } = false;
+    /// <summary>Also request the legacy LEDGERENTRIES/INVENTORYENTRIES lists in
+    /// the voucher export (older Tally builds that do not emit ALL*ENTRIES).
+    /// Off by default: requesting both makes Tally serialize every line twice.</summary>
+    [JsonPropertyName("voucherFetchLegacyLists")] public bool VoucherFetchLegacyLists { get; set; } = false;
+    /// <summary>Idle gap after EVERY Tally request (masters, reports, probes and
+    /// voucher windows alike) so the Tally UI thread gets a slice between
+    /// requests. 0 disables.</summary>
+    [JsonPropertyName("requestPauseSeconds")] public int RequestPauseSeconds { get; set; } = 2;
     /// <summary>How long an active sync waits for a temporarily unavailable Tally server before giving up.</summary>
     [JsonPropertyName("reconnectMaxMinutes")] public int ReconnectMaxMinutes { get; set; } = 30;
     /// <summary>Delay between Tally reachability probes while auto-reconnecting.</summary>
@@ -35,20 +62,20 @@ public sealed class TallySettings
     /// breathing room during a long history walk. Tally's XML server shares the
     /// application thread — while a request runs, operators feel it; the gap
     /// between requests is when the UI catches up. 0 disables the pause.</summary>
-    [JsonPropertyName("windowPauseSeconds")] public int WindowPauseSeconds { get; set; } = 3;
-    /// <summary>In-flight Tally request concurrency. Tally's XML server shares the
-    /// application thread — default 1; hard-bounded to 2 because anything higher is
-    /// known to stall TallyPrime. Raise to 2 only with observed evidence.</summary>
+    [JsonPropertyName("windowPauseSeconds")] public int WindowPauseSeconds { get; set; } = 5;
+    /// <summary>Kept for config compatibility. Tally's XML server is single-
+    /// threaded and 2 in-flight requests are known to stall TallyPrime, so the
+    /// effective concurrency is ALWAYS 1 (see EffectiveMaxConcurrentTallyRequests).</summary>
     [JsonPropertyName("maxConcurrentTallyRequests")] public int MaxConcurrentTallyRequests { get; set; } = 1;
     [JsonPropertyName("gateWaitSeconds")] public int GateWaitSeconds { get; set; } = 120;
     /// <summary>Total timeout/reconnect retries permitted per sync run across ALL
     /// datasets and windows — a stalling Tally ends the cycle instead of being
     /// hammered; the run resumes from checkpoints next cycle.</summary>
-    [JsonPropertyName("maxRetriesPerRun")] public int MaxRetriesPerRun { get; set; } = 20;
+    [JsonPropertyName("maxRetriesPerRun")] public int MaxRetriesPerRun { get; set; } = 5;
     [JsonPropertyName("maxResponseMb")] public int MaxResponseMb { get; set; } = 256;
 
     [System.Text.Json.Serialization.JsonIgnore]
-    public int EffectiveMaxConcurrentTallyRequests => Math.Clamp(MaxConcurrentTallyRequests, 1, 2);
+    public int EffectiveMaxConcurrentTallyRequests => 1;
     [JsonPropertyName("autoDiscoverCompanies")] public bool AutoDiscoverCompanies { get; set; } = true;
     [JsonPropertyName("enableMasters")] public bool EnableMasters { get; set; } = true;
     [JsonPropertyName("enableVouchers")] public bool EnableVouchers { get; set; } = true;
@@ -56,7 +83,10 @@ public sealed class TallySettings
     [JsonPropertyName("enableGst")] public bool EnableGst { get; set; } = true;
     [JsonPropertyName("enableCostCentres")] public bool EnableCostCentres { get; set; } = true;
     [JsonPropertyName("incrementalLookbackDays")] public int IncrementalLookbackDays { get; set; } = 7;
-    [JsonPropertyName("fullSyncChunkDays")] public int FullSyncChunkDays { get; set; } = 31;
+    /// <summary>Initial voucher window size for a history walk. The engine
+    /// shrinks windows adaptively (never grows them within a run) when a window
+    /// times out or takes more than 60% of voucherTimeoutSeconds.</summary>
+    [JsonPropertyName("fullSyncChunkDays")] public int FullSyncChunkDays { get; set; } = 7;
 
     public Uri BaseUri => new($"http://{Host}:{Port}/");
 }

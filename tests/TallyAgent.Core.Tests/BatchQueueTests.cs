@@ -252,7 +252,7 @@ public class BatchQueueTests : IDisposable
         using var cmd2 = conn.CreateCommand();
         cmd2.CommandText = "SELECT content_checksum FROM upload_batches LIMIT 0";
         cmd2.ExecuteReader();                                                // v3 column present
-        Assert.Equal(4, AgentDatabase.CurrentSchemaVersion);
+        Assert.Equal(5, AgentDatabase.CurrentSchemaVersion);
     }
 }
 

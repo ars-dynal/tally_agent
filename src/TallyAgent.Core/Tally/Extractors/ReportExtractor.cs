@@ -11,6 +11,37 @@ using Row = Dictionary<string, object?>;
 /// and does not assume report rows are direct children of the XML root.</summary>
 public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor> log)
 {
+    // Snapshot reports are full-financial-year computations — the heaviest
+    // requests the agent makes. They get their own (longer) budget and are
+    // NEVER retried at the same size within a cycle: a timeout defers the
+    // snapshot to the next snapshot slot instead of queuing more work on Tally.
+    private Task<XDocument> PostReport(string envelope, CancellationToken ct) =>
+        client.PostAsync(envelope, client.SnapshotRequestTimeout, maxTimeoutRetries: 0, ct);
+
+    // Ledger closing balances as-of a date: shared by the two outstanding
+    // datasets and the trial-balance fallback (one Tally request per cycle
+    // instead of three).
+    private readonly SemaphoreSlim _cacheLock = new(1, 1);
+    private (DateOnly To, XDocument Doc)? _ledgerBalances;
+
+    public void BeginCycle() => EndCycle();
+    public void EndCycle() => _ledgerBalances = null;
+
+    private async Task<XDocument> LedgerBalancesDocument(DateOnly to, CancellationToken ct)
+    {
+        if (_ledgerBalances is { } c && c.To == to) return c.Doc;
+        await _cacheLock.WaitAsync(ct);
+        try
+        {
+            if (_ledgerBalances is { } c2 && c2.To == to) return c2.Doc;
+            var doc = await PostReport(TallyEnvelopes.Collection(
+                "Ledger", ["NAME", "PARENT", "CLOSINGBALANCE"], client.Company, null, to), ct);
+            _ledgerBalances = (to, doc);
+            return doc;
+        }
+        finally { _cacheLock.Release(); }
+    }
+
     private static bool Is(XElement el, string localName) =>
         el.Name.LocalName.Equals(localName, StringComparison.OrdinalIgnoreCase);
 
@@ -26,7 +57,7 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
 
     public async Task<List<Row>> TrialBalance(DateOnly from, DateOnly to, CancellationToken ct)
     {
-        var doc = await client.PostAsync(
+        var doc = await PostReport(
             TallyEnvelopes.Report("Trial Balance", from, to, client.Company), ct);
         var rows = WalkNameAmountPairs(doc, (name, amtEl) =>
         {
@@ -55,8 +86,7 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
     private async Task<List<Row>> TrialBalanceFromLedgers(DateOnly from, DateOnly to, CancellationToken ct)
     {
         log.LogInformation("Trial balance report export was empty — falling back to dated Ledger collection");
-        var doc = await client.PostAsync(TallyEnvelopes.Collection(
-            "Ledger", ["NAME", "PARENT", "CLOSINGBALANCE"], client.Company, from, to), ct);
+        var doc = await LedgerBalancesDocument(to, ct);
         var rows = new List<Row>();
         foreach (var el in doc.Descendants().Where(e => Is(e, "LEDGER")))
         {
@@ -79,7 +109,7 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
 
     public async Task<List<Row>> BalanceSheet(DateOnly from, DateOnly to, CancellationToken ct)
     {
-        var doc = await client.PostAsync(
+        var doc = await PostReport(
             TallyEnvelopes.Report("Balance Sheet", from, to, client.Company), ct);
         var rows = WalkNameAmountPairs(doc, (name, amtEl) =>
         {
@@ -101,7 +131,7 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
 
     public async Task<List<Row>> ProfitLoss(DateOnly from, DateOnly to, CancellationToken ct)
     {
-        var doc = await client.PostAsync(
+        var doc = await PostReport(
             TallyEnvelopes.Report("Profit and Loss A/c", from, to, client.Company), ct);
         var rows = WalkNameAmountPairs(doc, (name, amtEl) =>
         {
@@ -128,7 +158,7 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
     {
         log.LogInformation("{Report} report export was empty — falling back to dated Group collection",
             revenueGroups ? "P&L" : "Balance sheet");
-        var doc = await client.PostAsync(TallyEnvelopes.Collection(
+        var doc = await PostReport(TallyEnvelopes.Collection(
             "Group", ["NAME", "PARENT", "ISREVENUE", "CLOSINGBALANCE"], client.Company, from, to), ct);
         var rows = new List<Row>();
         foreach (var el in doc.Descendants().Where(e => Is(e, "GROUP")))
@@ -153,7 +183,7 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
 
     public async Task<List<Row>> StockSummary(DateOnly from, DateOnly to, CancellationToken ct)
     {
-        var doc = await client.PostAsync(
+        var doc = await PostReport(
             TallyEnvelopes.Report("Stock Summary", from, to, client.Company), ct);
         var rows = new List<Row>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -193,7 +223,7 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
     private async Task<List<Row>> StockSummaryFromItems(DateOnly from, DateOnly to, CancellationToken ct)
     {
         log.LogInformation("Stock summary report export was empty — falling back to dated StockItem collection");
-        var doc = await client.PostAsync(TallyEnvelopes.Collection(
+        var doc = await PostReport(TallyEnvelopes.Collection(
             "StockItem",
             ["NAME", "PARENT", "OPENINGBALANCE", "OPENINGVALUE", "CLOSINGBALANCE", "CLOSINGVALUE"],
             client.Company, from, to), ct);
@@ -222,11 +252,11 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
         return rows;
     }
 
-    /// <summary>Outstanding = closing balances of ledgers under the given parent groups.</summary>
-    public async Task<List<Row>> Outstanding(string parentGroupContains, CancellationToken ct)
+    /// <summary>Outstanding = closing balances (as of <paramref name="asOf"/>)
+    /// of ledgers under the given parent groups.</summary>
+    public async Task<List<Row>> Outstanding(string parentGroupContains, DateOnly asOf, CancellationToken ct)
     {
-        var doc = await client.PostAsync(
-            TallyEnvelopes.Collection("Ledger", ["NAME", "PARENT", "CLOSINGBALANCE"], client.Company), ct);
+        var doc = await LedgerBalancesDocument(asOf, ct);
         var rows = new List<Row>();
         foreach (var el in doc.Descendants().Where(e => Is(e, "LEDGER")))
         {
@@ -242,21 +272,6 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
             });
         }
         return rows;
-    }
-
-    /// <summary>Bank ledger names (parents containing "Bank") for bank-book fan-out.</summary>
-    public async Task<HashSet<string>> BankLedgerNames(CancellationToken ct)
-    {
-        var doc = await client.PostAsync(
-            TallyEnvelopes.Collection("Ledger", ["NAME", "PARENT"], client.Company), ct);
-        var set = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var el in doc.Descendants().Where(e => Is(e, "LEDGER")))
-        {
-            var parent = Text(el, "PARENT");
-            if (parent.Contains("Bank", StringComparison.OrdinalIgnoreCase))
-                set.Add(Text(el, "NAME"));
-        }
-        return set;
     }
 
     private static XElement? FollowingSibling(XElement el)

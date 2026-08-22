@@ -47,7 +47,7 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
         // so they keep the full retry ladder.
         var days = to.DayNumber - from.DayNumber + 1;
         var doc = await client.PostAsync(
-            TallyEnvelopes.VoucherCollection(from, to, client.Company),
+            TallyEnvelopes.VoucherCollection(from, to, client.Company, client.FetchLegacyVoucherLists),
             requestTimeout: client.VoucherRequestTimeout,
             maxTimeoutRetries: days > 1 ? 0 : null, ct);
         var result = new DayBookResult();

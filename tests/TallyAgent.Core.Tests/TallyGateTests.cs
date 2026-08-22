@@ -72,29 +72,118 @@ public class TallyGateTests : IDisposable
         Assert.Equal(1, handler.MaxConcurrent);              // §D: single-flight
     }
 
+    private static bool IsDrain(HttpRequestMessage req) =>
+        req.Content!.ReadAsStringAsync().Result.Contains(TallyClient.DrainEnvelopeId);
+
     [Fact]
-    public async Task Timeout_ReleasesGate_AndBudgetBoundsRetries()
+    public async Task Timeout_WhenTallyStaysBusy_EndsRunAfterOneDrainWait_WithoutHammering()
     {
+        // v2.0.5: a never-responding Tally is NOT retried 10/30/60s — that only
+        // queued more abandoned work on Tally's single thread. One timed-out
+        // request + one drain probe, then the run ends (non-retryable).
         var handler = new FakeHandler(async (_, ct) =>
         {
             await Task.Delay(Timeout.InfiniteTimeSpan, ct);  // never responds
             throw new UnreachableException();
         });
         using var client = NewClient(handler, s => s.RequestTimeoutSeconds = 10);
-        client.ResetRunBudget(2);                            // per-run budget: 2 retries
+        client.ResetRunBudget(2);
 
-        // Ladder allows up to 3 retries, but the run budget stops it at 2:
-        // attempts = 1 initial + 2 budgeted retries = 3 calls, then exhaustion.
         var ex = await Assert.ThrowsAsync<TallyException>(() =>
             client.PostAsync("<ENVELOPE/>", TimeSpan.FromMilliseconds(50), 3, CancellationToken.None));
         Assert.Equal(ErrorCategory.TallyTimeout, ex.Category);
-        Assert.Contains("budget exhausted", ex.Message);
-        Assert.Equal(3, handler.Calls);
+        Assert.True(ex.IsRunEnding);
+        Assert.Contains("still busy", ex.Message);
+        Assert.Equal(2, handler.Calls);                      // request + drain, nothing more
+        Assert.True(client.NeedsDrain);                      // next cycle drains first too
 
         // Gate released: a healthy follow-up request succeeds immediately.
         var healthy = new FakeHandler((_, _) => Task.FromResult(Xml("<ENVELOPE><OK/></ENVELOPE>")));
         using var client2 = NewClient(healthy);
         Assert.NotNull(await client2.PostAsync("<ENVELOPE/>", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Timeout_ThenTallyRecovers_DrainsBeforeRetry_AndSucceeds()
+    {
+        // 1st call: hangs (times out). Drain probe: answers (Tally finished the
+        // abandoned work). Retry: answers. Exactly one drain between them.
+        var seq = 0;
+        var handler = new FakeHandler(async (req, ct) =>
+        {
+            var n = Interlocked.Increment(ref seq);
+            if (n == 1) { await Task.Delay(Timeout.InfiniteTimeSpan, ct); throw new UnreachableException(); }
+            if (n == 2) { Assert.True(IsDrain(req)); return Xml("<ENVELOPE><NAME>Co</NAME></ENVELOPE>"); }
+            Assert.False(IsDrain(req));
+            return Xml("<ENVELOPE><OK/></ENVELOPE>");
+        });
+        using var client = NewClient(handler, s => s.RequestTimeoutSeconds = 10);
+        client.ResetRunBudget(5);
+
+        var doc = await client.PostAsync("<ENVELOPE/>", TimeSpan.FromMilliseconds(50), 3, CancellationToken.None);
+        Assert.NotNull(doc);
+        Assert.Equal(3, handler.Calls);
+        Assert.False(client.NeedsDrain);
+    }
+
+    [Fact]
+    public async Task Timeout_RunBudgetExhausted_EndsRun()
+    {
+        // Budget 0: the first timeout may not be retried even though Tally
+        // would answer the drain — the run ends and resumes next cycle.
+        var seq = 0;
+        var handler = new FakeHandler(async (req, ct) =>
+        {
+            if (Interlocked.Increment(ref seq) == 1) { await Task.Delay(Timeout.InfiniteTimeSpan, ct); }
+            return Xml("<ENVELOPE><OK/></ENVELOPE>");
+        });
+        using var client = NewClient(handler, s => s.RequestTimeoutSeconds = 10);
+        client.ResetRunBudget(0);
+        var ex = await Assert.ThrowsAsync<TallyException>(() =>
+            client.PostAsync("<ENVELOPE/>", TimeSpan.FromMilliseconds(50), 3, CancellationToken.None));
+        Assert.True(ex.IsRunEnding);
+        Assert.Contains("budget exhausted", ex.Message);
+    }
+
+    [Fact]
+    public async Task ClientError4xx_IsNotRetried()
+    {
+        var handler = new FakeHandler((_, _) => Task.FromResult(
+            new HttpResponseMessage(HttpStatusCode.BadRequest) { Content = new StringContent("bad TDL") }));
+        using var client = NewClient(handler);
+        var ex = await Assert.ThrowsAsync<TallyException>(() =>
+            client.PostAsync("<ENVELOPE/>", CancellationToken.None));
+        Assert.Equal(ErrorCategory.TallyInvalidXml, ex.Category);
+        Assert.Equal(1, handler.Calls);                      // no 30-minute "reconnect" loop
+    }
+
+    [Fact]
+    public async Task EveryRequest_IsFollowedByTheConfiguredPause()
+    {
+        var pauses = new List<TimeSpan>();
+        var handler = new FakeHandler((_, _) => Task.FromResult(Xml("<ENVELOPE><OK/></ENVELOPE>")));
+        var settings = new TallySettings { RequestTimeoutSeconds = 10, GateWaitSeconds = 5, RequestPauseSeconds = 7 };
+        using var client = new TallyClient(settings, NullLogger<TallyClient>.Instance,
+            new HttpClient(handler), _lockDir)
+        { DelayAsync = (d, _) => { pauses.Add(d); return Task.CompletedTask; } };
+        await client.PostAsync("<ENVELOPE/>", CancellationToken.None);
+        await client.PostAsync("<ENVELOPE/>", CancellationToken.None);
+        Assert.Equal(2, pauses.Count(p => p == TimeSpan.FromSeconds(7)));
+    }
+
+    [Fact]
+    public async Task ConcurrencySetting_IsAlwaysEffectivelyOne()
+    {
+        Assert.Equal(1, new TallySettings { MaxConcurrentTallyRequests = 2 }.EffectiveMaxConcurrentTallyRequests);
+        var handler = new FakeHandler(async (_, ct) =>
+        {
+            await Task.Delay(30, ct);
+            return Xml("<ENVELOPE><OK/></ENVELOPE>");
+        });
+        using var client = NewClient(handler, s => s.MaxConcurrentTallyRequests = 2);
+        await Task.WhenAll(Enumerable.Range(0, 6)
+            .Select(_ => client.PostAsync("<ENVELOPE/>", CancellationToken.None)));
+        Assert.Equal(1, handler.MaxConcurrent);
     }
 
     [Fact]
@@ -116,10 +205,11 @@ public class TallyGateTests : IDisposable
                     : Task.FromResult(Xml("<ENVELOPE><OK/></ENVELOPE>")));
             using var client = NewClient(handler, s => { s.Host = "127.0.0.1"; s.Port = port; });
 
-            // HTTP 500 → transient path → probe (listener answers) → single re-send → OK.
+            // HTTP 500 → transient path → TCP probe (listener answers) → drain
+            // probe (Tally may be busy even though the port is up) → re-send → OK.
             var doc = await client.PostAsync("<ENVELOPE/>", CancellationToken.None);
             Assert.NotNull(doc);
-            Assert.Equal(2, handler.Calls);
+            Assert.Equal(3, handler.Calls);
 
             // Gate is free afterwards: an immediate follow-up succeeds.
             Assert.NotNull(await client.PostAsync("<ENVELOPE/>", CancellationToken.None));
