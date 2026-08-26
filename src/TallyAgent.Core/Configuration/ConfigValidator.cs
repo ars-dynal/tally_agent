@@ -28,6 +28,13 @@ public static partial class ConfigValidator
         if (!string.IsNullOrWhiteSpace(cfg.Tally.ExtractionStartDate) &&
             !DateOnly.TryParse(cfg.Tally.ExtractionStartDate, out _))
             errors.Add($"Extraction start date '{cfg.Tally.ExtractionStartDate}' is not a valid yyyy-MM-dd date.");
+        if (!string.IsNullOrWhiteSpace(cfg.Tally.ExtractionEndDate) &&
+            !DateOnly.TryParse(cfg.Tally.ExtractionEndDate, out _))
+            errors.Add($"Extraction end date '{cfg.Tally.ExtractionEndDate}' is not a valid yyyy-MM-dd date.");
+        if (DateOnly.TryParse(cfg.Tally.ExtractionStartDate, out var exStart) &&
+            DateOnly.TryParse(cfg.Tally.ExtractionEndDate, out var exEnd) &&
+            exEnd < exStart)
+            errors.Add("Extraction end date must not be earlier than the extraction start date.");
         if (cfg.Tally.RequestTimeoutSeconds is < 10 or > 900)
             errors.Add("Tally request timeout must be 10-900 seconds.");
 

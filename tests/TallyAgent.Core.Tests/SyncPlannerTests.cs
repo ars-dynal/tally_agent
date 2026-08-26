@@ -138,4 +138,71 @@ public class SyncPlannerTests
         Assert.Null(SyncPlanner.TryParseIsoDate(null));
         Assert.Null(SyncPlanner.TryParseIsoDate(""));
     }
+
+    // -- bounded backfill: extractionEndDate confines the walk ------
+
+    [Fact]
+    public void ExtractionEndDate_BoundsFullSyncToThatFinancialYear()
+    {
+        var settings = new TallySettings
+        {
+            FullSyncChunkDays = 31,
+            ExtractionStartDate = "2019-04-01",
+            ExtractionEndDate = "2020-03-31",
+        };
+
+        var plan = SyncPlanner.PlanVoucherWindows(settings, null, Today);
+
+        Assert.True(plan.IsFullSync);
+        Assert.Equal(new DateOnly(2019, 4, 1), plan.TargetStart);
+
+        // Newest window ends at the configured end date, not at today.
+        Assert.Equal(new DateOnly(2020, 3, 31), plan.Windows[0].To);
+        Assert.Equal(new DateOnly(2019, 4, 1), plan.Windows[^1].From);
+
+        // Nothing outside the financial year is ever requested.
+        Assert.All(plan.Windows, w => Assert.True(w.From >= new DateOnly(2019, 4, 1)));
+        Assert.All(plan.Windows, w => Assert.True(w.To <= new DateOnly(2020, 3, 31)));
+    }
+
+    [Fact]
+    public void ExtractionEndDate_Blank_StillWalksToToday()
+    {
+        var settings = Settings();
+        settings.ExtractionEndDate = "";
+
+        var plan = SyncPlanner.PlanVoucherWindows(settings, null, Today);
+
+        Assert.Equal(Today, plan.Windows[0].To);
+    }
+
+    [Fact]
+    public void ExtractionEndDate_InTheFuture_IsIgnored()
+    {
+        var settings = Settings();
+        settings.ExtractionEndDate = "2099-01-01";
+
+        var plan = SyncPlanner.PlanVoucherWindows(settings, null, Today);
+
+        Assert.Equal(Today, plan.Windows[0].To);
+    }
+
+    [Fact]
+    public void ExtractionEndDate_ResumedWalk_NeverExceedsTheCeiling()
+    {
+        var settings = new TallySettings
+        {
+            FullSyncChunkDays = 31,
+            ExtractionStartDate = "2019-04-01",
+            ExtractionEndDate = "2020-03-31",
+        };
+
+        // Frontier sits above the ceiling (left over from an unbounded run).
+        var plan = SyncPlanner.PlanVoucherWindows(
+            settings, NewestFirstCp("2025-01-01", "2026-07-30"), Today);
+
+        Assert.NotEmpty(plan.Windows);
+        Assert.All(plan.Windows, w => Assert.True(w.To <= new DateOnly(2020, 3, 31)));
+    }
+
 }

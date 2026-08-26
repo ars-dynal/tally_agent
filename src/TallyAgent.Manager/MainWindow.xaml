@@ -9,6 +9,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
@@ -62,15 +63,34 @@
             </Grid>
         </Border>
 
+        <!-- Current run -->
+        <Border Grid.Row="2" BorderBrush="#BFD9F7" BorderThickness="1" CornerRadius="6" Padding="12"
+                Background="#F4F9FF" Margin="0,0,0,12">
+            <StackPanel>
+                <DockPanel>
+                    <TextBlock Text="Current run" FontWeight="Bold"/>
+                    <TextBlock x:Name="RunStatusText" DockPanel.Dock="Right" HorizontalAlignment="Right"
+                               FontWeight="Bold" Foreground="Gray" Text="idle"/>
+                </DockPanel>
+                <TextBlock x:Name="RunOperationText" Margin="0,6,0,0" FontSize="14"
+                           TextTrimming="CharacterEllipsis" Text="Nothing running"/>
+                <ProgressBar x:Name="RunProgressBar" Height="14" Margin="0,8,0,0"
+                             Minimum="0" Maximum="100" Value="0"/>
+                <TextBlock x:Name="RunCountsText" Margin="0,6,0,0" Foreground="#333" Text=""/>
+                <TextBlock x:Name="RunRangeText" Margin="0,2,0,0" Foreground="Gray"
+                           TextTrimming="CharacterEllipsis" Text=""/>
+            </StackPanel>
+        </Border>
+
         <!-- Action buttons -->
-        <WrapPanel Grid.Row="2" Margin="0,0,0,4">
+        <WrapPanel Grid.Row="3" Margin="0,0,0,4">
             <Button x:Name="TestTallyBtn" Content="Test Tally Connection" Click="TestTally_Click"/>
             <Button x:Name="TestCloudBtn" Content="Test Cloud Connection" Click="TestCloud_Click"/>
             <Button x:Name="StartBtn" Content="Start Service" Click="StartService_Click"/>
             <Button x:Name="StopBtn" Content="Stop Service" Click="StopService_Click"/>
             <Button x:Name="RestartBtn" Content="Restart Service" Click="RestartService_Click"/>
-            <Button x:Name="SyncNowBtn" Content="Sync Now" Click="SyncNow_Click"/>
-            <Button x:Name="ForceFullBtn" Content="Force Full Sync" Click="ForceFull_Click"/>
+            <Button x:Name="SyncNowBtn" Content="Sync Now (catch up)" Click="SyncNow_Click"/>
+            <Button x:Name="ForceFullBtn" Content="Re-extract Whole Range" Click="ForceFull_Click"/>
             <Button x:Name="RetryBtn" Content="Retry Failed Batches" Click="RetryFailed_Click"/>
             <Button Content="Open Log Folder" Click="OpenLogs_Click"/>
             <Button Content="Export Diagnostics" Click="ExportDiag_Click"/>
@@ -78,7 +98,7 @@
         </WrapPanel>
 
         <!-- Recent errors -->
-        <GroupBox Grid.Row="3" Header="Recent errors" Margin="0,4,0,8">
+        <GroupBox Grid.Row="4" Header="Recent errors" Margin="0,4,0,8">
             <DataGrid x:Name="ErrorsGrid" AutoGenerateColumns="False" IsReadOnly="True"
                       HeadersVisibility="Column" GridLinesVisibility="Horizontal"
                       CanUserAddRows="False">
@@ -93,7 +113,7 @@
         </GroupBox>
 
         <!-- Footer -->
-        <DockPanel Grid.Row="4">
+        <DockPanel Grid.Row="5">
             <TextBlock x:Name="FooterText" Foreground="Gray"
                        Text="Closing this window does not stop the sync service."/>
             <TextBlock DockPanel.Dock="Right" HorizontalAlignment="Right">
