@@ -21,6 +21,13 @@ public sealed class TallySettings
     [JsonPropertyName("company")] public string Company { get; set; } = "";
     /// <summary>ISO date (yyyy-MM-dd) from which historical vouchers are extracted.</summary>
     [JsonPropertyName("extractionStartDate")] public string ExtractionStartDate { get; set; } = "";
+    /// <summary>Optional ISO date (yyyy-MM-dd) at which the historical backfill
+    /// STOPS. Set it together with extractionStartDate to walk exactly one
+    /// financial year at a time (e.g. 2019-04-01 to 2020-03-31), so the range
+    /// Tally is asked for is bounded by that year instead of the whole history.
+    /// Blank (the default) means walk to today, which is what the machine
+    /// tracking live data should use.</summary>
+    [JsonPropertyName("extractionEndDate")] public string ExtractionEndDate { get; set; } = "";
     [JsonPropertyName("syncFrequencyMinutes")] public int SyncFrequencyMinutes { get; set; } = 15;
     [JsonPropertyName("requestTimeoutSeconds")] public int RequestTimeoutSeconds { get; set; } = 120;
     /// <summary>Timeout for windowed voucher extraction requests, which are the

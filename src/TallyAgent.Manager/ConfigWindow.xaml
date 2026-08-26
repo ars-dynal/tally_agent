@@ -12,6 +12,7 @@
                 <Grid.RowDefinitions>
                     <RowDefinition/><RowDefinition/><RowDefinition/>
                     <RowDefinition/><RowDefinition/><RowDefinition/>
+                    <RowDefinition/>
                 </Grid.RowDefinitions>
                 <TextBlock Grid.Row="0" Text="Host" VerticalAlignment="Center"/>
                 <TextBox Grid.Row="0" Grid.Column="1" x:Name="HostBox" Margin="0,2"/>
@@ -22,10 +23,13 @@
                 <TextBlock Grid.Row="3" Text="Extraction start date" VerticalAlignment="Center"/>
                 <TextBox Grid.Row="3" Grid.Column="1" x:Name="StartDateBox" Margin="0,2"
                          ToolTip="yyyy-MM-dd"/>
-                <TextBlock Grid.Row="4" Text="Sync frequency (min)" VerticalAlignment="Center"/>
-                <TextBox Grid.Row="4" Grid.Column="1" x:Name="FrequencyBox" Margin="0,2"/>
-                <TextBlock Grid.Row="5" Text="Lookback days" VerticalAlignment="Center"/>
-                <TextBox Grid.Row="5" Grid.Column="1" x:Name="LookbackBox" Margin="0,2"/>
+                <TextBlock Grid.Row="4" Text="Extraction end date" VerticalAlignment="Center"/>
+                <TextBox Grid.Row="4" Grid.Column="1" x:Name="EndDateBox" Margin="0,2"
+                         ToolTip="yyyy-MM-dd. Leave BLANK on the machine that tracks live data.&#x0a;Set it with the start date to back-fill one financial year at a time,&#x0a;e.g. start 2019-04-01 and end 2020-03-31."/>
+                <TextBlock Grid.Row="5" Text="Sync frequency (min)" VerticalAlignment="Center"/>
+                <TextBox Grid.Row="5" Grid.Column="1" x:Name="FrequencyBox" Margin="0,2"/>
+                <TextBlock Grid.Row="6" Text="Lookback days" VerticalAlignment="Center"/>
+                <TextBox Grid.Row="6" Grid.Column="1" x:Name="LookbackBox" Margin="0,2"/>
             </Grid>
         </GroupBox>
 

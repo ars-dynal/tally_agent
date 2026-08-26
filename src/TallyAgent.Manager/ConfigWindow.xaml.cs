@@ -22,6 +22,7 @@ public partial class ConfigWindow : Window
         PortBox.Text = _config.Tally.Port.ToString();
         CompanyBox.Text = _config.Tally.Company;
         StartDateBox.Text = _config.Tally.ExtractionStartDate;
+        EndDateBox.Text = _config.Tally.ExtractionEndDate;
         FrequencyBox.Text = _config.Tally.SyncFrequencyMinutes.ToString();
         LookbackBox.Text = _config.Tally.IncrementalLookbackDays.ToString();
         MastersCheck.IsChecked = _config.Tally.EnableMasters;
@@ -47,6 +48,7 @@ public partial class ConfigWindow : Window
             _config.Tally.Port = int.Parse(PortBox.Text.Trim());
             _config.Tally.Company = CompanyBox.Text.Trim();
             _config.Tally.ExtractionStartDate = StartDateBox.Text.Trim();
+            _config.Tally.ExtractionEndDate = EndDateBox.Text.Trim();
             _config.Tally.SyncFrequencyMinutes = int.Parse(FrequencyBox.Text.Trim());
             _config.Tally.IncrementalLookbackDays = int.Parse(LookbackBox.Text.Trim());
             _config.Tally.EnableMasters = MastersCheck.IsChecked == true;

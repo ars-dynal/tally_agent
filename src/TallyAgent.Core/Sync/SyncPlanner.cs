@@ -48,16 +48,22 @@ public static class SyncPlanner
         if (checkpoint is not { FullSyncDone: true })
         {
             var target = ResolveExtractionStart(settings, today);
+            // Upper bound of the walk. extractionEndDate confines a backfill run
+            // to a single financial year, so no window is ever asked to cover
+            // more than that year.
+            var ceiling = ResolveExtractionEnd(settings, today);
+            if (ceiling < target) ceiling = target;
 
             // Resume a newest-first walk: continue backwards from the day
             // before the oldest window already completed.
-            var top = today;
+            var top = ceiling;
             if (checkpoint?.LastAlterId == NewestFirstCheckpointMarker &&
                 TryParseIsoDate(checkpoint.LastFromDate) is { } frontier)
             {
                 if (frontier <= target) // walk already reached the start
                     return new VoucherPlan(windows, IsFullSync: true, 0, target);
                 top = frontier.AddDays(-1);
+                if (top > ceiling) top = ceiling;
             }
 
             AddChunkedNewestFirst(windows, target, top, chunk);
@@ -106,6 +112,17 @@ public static class SyncPlanner
             if (from < start) from = start;
             windows.Add((from, to));
         }
+    }
+
+    /// <summary>Upper bound of the historical walk. When extractionEndDate is
+    /// set the backfill stops there instead of at today, so one run can be
+    /// confined to a single financial year. Blank, unparseable, or a date at or
+    /// after today all mean "walk to today".</summary>
+    private static DateOnly ResolveExtractionEnd(TallySettings settings, DateOnly today)
+    {
+        if (TryParseIsoDate(settings.ExtractionEndDate) is { } configured && configured < today)
+            return configured;
+        return today;
     }
 
     private static DateOnly ResolveExtractionStart(TallySettings settings, DateOnly today)

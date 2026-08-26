@@ -9,6 +9,7 @@ using TallyAgent.Core.Cloud;
 using TallyAgent.Core.Configuration;
 using TallyAgent.Core.Data;
 using TallyAgent.Core.Diagnostics;
+using TallyAgent.Core.Sync;
 using TallyAgent.Core.Tally;
 
 namespace TallyAgent.Manager;
@@ -23,7 +24,7 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         VersionText.Text = $"v{AgentInfo.Version}";
-        _refreshTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(10) };
+        _refreshTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
         _refreshTimer.Tick += (_, _) => RefreshStatus();
         Loaded += (_, _) => { LoadBackend(); RefreshStatus(); _refreshTimer.Start(); };
         Closed += (_, _) => _refreshTimer.Stop();
@@ -45,8 +46,98 @@ public partial class MainWindow : Window
 
     // ── status refresh ────────────────────────────────────────────
 
+    /// <summary>Renders progress.json, written by the service as it works, so
+    /// this window can show what is happening right now instead of only a list
+    /// of past errors. A snapshot that still says "running" but has not been
+    /// touched for five minutes is shown as stalled, not as healthy progress.</summary>
+    private void RefreshProgress()
+    {
+        var p = SyncProgressStore.Read();
+        if (p is null)
+        {
+            RunStatusText.Text = "idle";
+            RunStatusText.Foreground = System.Windows.Media.Brushes.Gray;
+            RunOperationText.Text = "Nothing running";
+            RunProgressBar.IsIndeterminate = false;
+            RunProgressBar.Value = 0;
+            RunCountsText.Text = "";
+            RunRangeText.Text = "";
+            return;
+        }
+
+        var fresh = DateTime.TryParse(p.UpdatedUtc, null,
+            System.Globalization.DateTimeStyles.RoundtripKind, out var updated)
+            && (DateTime.UtcNow - updated.ToUniversalTime()) < TimeSpan.FromMinutes(5);
+        var isRunning = p.Status == "running" && fresh;
+        var stalled = p.Status == "running" && !fresh;
+
+        RunStatusText.Text = stalled ? "stalled (no update for 5 min)" : p.Status;
+        RunStatusText.Foreground = stalled
+            ? System.Windows.Media.Brushes.OrangeRed
+            : p.Status switch
+            {
+                "running" => System.Windows.Media.Brushes.DodgerBlue,
+                "success" => System.Windows.Media.Brushes.Green,
+                "partial" => System.Windows.Media.Brushes.DarkOrange,
+                "failed" or "cancelled" => System.Windows.Media.Brushes.Red,
+                _ => System.Windows.Media.Brushes.Gray,
+            };
+
+        RunOperationText.Text = isRunning || stalled
+            ? DescribeOperation(p.Operation)
+            : "Nothing running";
+
+        var pct = p.WindowsTotal > 0
+            ? 100.0 * p.WindowsDone / p.WindowsTotal
+            : p.DatasetsTotal > 0 ? 100.0 * p.DatasetsDone / p.DatasetsTotal
+            : 0.0;
+        RunProgressBar.IsIndeterminate =
+            isRunning && p.WindowsTotal == 0 && p.DatasetsTotal == 0;
+        RunProgressBar.Value = Math.Clamp(pct, 0, 100);
+
+        var parts = new List<string>();
+        if (p.DatasetsTotal > 0) parts.Add($"datasets {p.DatasetsDone}/{p.DatasetsTotal}");
+        if (p.WindowsTotal > 0) parts.Add($"date windows {p.WindowsDone}/{p.WindowsTotal}");
+        parts.Add($"{p.Rows:N0} records this run");
+        if (DateTime.TryParse(p.StartedUtc, null,
+                System.Globalization.DateTimeStyles.RoundtripKind, out var startedAt))
+        {
+            var elapsed = DateTime.UtcNow - startedAt.ToUniversalTime();
+            if (elapsed > TimeSpan.Zero)
+                parts.Add($"{elapsed:hh\\:mm\\:ss} elapsed");
+        }
+        RunCountsText.Text = string.Join("   \u00b7   ", parts);
+
+        var rangeFrom = string.IsNullOrWhiteSpace(p.RangeFrom)
+            ? "start of this financial year" : p.RangeFrom;
+        var range = $"Mode: {p.Mode}   \u00b7   Extracting {rangeFrom} to {p.RangeTo}";
+        if (!string.IsNullOrWhiteSpace(p.Message)) range += $"   \u00b7   {p.Message}";
+        RunRangeText.Text = range;
+    }
+
+    /// <summary>Turns an internal operation string into something readable.</summary>
+    private static string DescribeOperation(string op)
+    {
+        if (op.StartsWith("extract:vouchers", StringComparison.Ordinal))
+        {
+            var w = op["extract:vouchers".Length..].Trim();
+            return w.Length == 0
+                ? "Reading vouchers from Tally"
+                : $"Reading vouchers from Tally for {w.Replace("..", " to ")}";
+        }
+        if (op.StartsWith("extract:", StringComparison.Ordinal))
+            return $"Reading {op["extract:".Length..].Replace('_', ' ')} from Tally";
+        return op switch
+        {
+            "preflight" => "Checking that Tally is reachable",
+            "idle" or "" => "Nothing running",
+            _ => op,
+        };
+    }
+
     private void RefreshStatus()
     {
+        RefreshProgress();
         ServiceStatusText.Text = GetServiceStatus(out var running);
         ServiceStatusText.Foreground = running
             ? System.Windows.Media.Brushes.Green : System.Windows.Media.Brushes.Red;

@@ -33,7 +33,20 @@ public sealed class SyncEngine(
     AgentDatabase db,
     ILogger<SyncEngine> log)
 {
-    public string CurrentOperation { get; private set; } = "idle";
+    private readonly SyncProgressSnapshot _progress = new();
+
+    /// <summary>What the engine is doing right now. Assigning also publishes the
+    /// progress snapshot to disk, so the Management Console can display live
+    /// progress without reaching into this process.</summary>
+    public string CurrentOperation
+    {
+        get => _progress.Operation;
+        private set
+        {
+            _progress.Operation = value;
+            SyncProgressStore.Write(_progress);
+        }
+    }
 
     /// <summary>Bank ledger names reused across cycles while masters are
     /// unchanged (saves a Ledger fetch on every incremental cycle).</summary>
@@ -62,6 +75,19 @@ public sealed class SyncEngine(
         tally.ResetRunBudget(config.Tally.MaxRetriesPerRun);
         reports.BeginCycle();
         RecordRunStart(syncId, mode);
+        _progress.SyncId = syncId;
+        _progress.Mode = mode;
+        _progress.Status = "running";
+        _progress.Message = "";
+        _progress.StartedUtc = DateTime.UtcNow.ToString("O");
+        _progress.DatasetsDone = 0;
+        _progress.DatasetsTotal = 0;
+        _progress.WindowsDone = 0;
+        _progress.WindowsTotal = 0;
+        _progress.Rows = 0;
+        _progress.RangeFrom = config.Tally.ExtractionStartDate;
+        _progress.RangeTo = string.IsNullOrWhiteSpace(config.Tally.ExtractionEndDate)
+            ? "today" : config.Tally.ExtractionEndDate;
         var errorList = new List<string>();
         var extractedCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         int ok = 0, failed = 0;
@@ -97,6 +123,8 @@ public sealed class SyncEngine(
                 await reporter.ReportAsync(category, ErrorSeverity.Error,
                     probe.Error ?? "Tally probe failed",
                     operation: "preflight", ct: CancellationToken.None);
+                _progress.Status = "failed";
+                _progress.Message = probe.Error ?? "Tally unavailable";
                 RecordRunFinish(syncId, "failed", 0, probe.Error);
                 return new SyncResult(syncId, "failed", 0, 0, 0, [probe.Error ?? "Tally unavailable"]);
             }
@@ -105,6 +133,8 @@ public sealed class SyncEngine(
             var enabled = DatasetRegistry.Enabled(config.Tally);
             log.LogInformation("Sync {SyncId} ({Mode}) starting: company='{Company}', {N} datasets",
                 syncId, mode, company, enabled.Count);
+            _progress.Company = company;
+            _progress.DatasetsTotal = enabled.Count;
 
             // Configured-company force-full already reset above. Only the
             // auto-discovery path still needs a reset here.
@@ -155,6 +185,8 @@ public sealed class SyncEngine(
                     log.LogDebug("Snapshot {Dataset} skipped: {Why}", ds.Name, why);
                     continue;
                 }
+                _progress.DatasetsDone++;
+                _progress.Rows = totalRows;
                 CurrentOperation = $"extract:{ds.Name}";
                 try
                 {
@@ -257,11 +289,18 @@ public sealed class SyncEngine(
 
                     // Adaptive windowing: a window that times out is split in half
                     // and retried down to single-day windows.
+                    _progress.WindowsDone = 0;
+                    _progress.WindowsTotal = plan.Windows.Count;
                     var pending = new Queue<(DateOnly From, DateOnly To)>(plan.Windows);
                     while (pending.Count > 0)
                     {
                         var (from, to) = pending.Dequeue();
                         ct.ThrowIfCancellationRequested();
+                        _progress.WindowsDone++;
+                        // Adaptive splitting can add windows mid-run, so the
+                        // total is recomputed rather than fixed up front.
+                        _progress.WindowsTotal = _progress.WindowsDone + pending.Count;
+                        _progress.Rows = totalRows;
                         CurrentOperation = $"extract:vouchers {from:yyyy-MM-dd}..{to:yyyy-MM-dd}";
                         try
                         {
@@ -363,6 +402,9 @@ public sealed class SyncEngine(
             }
 
             var status = failed == 0 ? "success" : ok > 0 ? "partial" : "failed";
+            _progress.Status = status;
+            _progress.Rows = totalRows;
+            _progress.Message = errorList.Count > 0 ? string.Join("; ", errorList) : "";
             RecordRunFinish(syncId, status, totalRows,
                 errorList.Count > 0 ? string.Join("; ", errorList) : null);
             log.LogInformation("Sync {SyncId} {Status}: {Rows} rows, {Ok} ok, {Failed} failed ({Elapsed:F0}s)",
@@ -371,6 +413,9 @@ public sealed class SyncEngine(
         }
         catch (OperationCanceledException)
         {
+            _progress.Status = "cancelled";
+            _progress.Rows = totalRows;
+            _progress.Message = "service stopping";
             RecordRunFinish(syncId, "cancelled", totalRows, "service stopping");
             throw;
         }
@@ -378,6 +423,9 @@ public sealed class SyncEngine(
         {
             await reporter.ReportAsync(ErrorCategory.UnexpectedException, ErrorSeverity.Critical,
                 ex.Message, ex.StackTrace, operation: CurrentOperation, ct: CancellationToken.None);
+            _progress.Status = "failed";
+            _progress.Rows = totalRows;
+            _progress.Message = ex.Message;
             RecordRunFinish(syncId, "failed", totalRows, ex.Message);
             return new SyncResult(syncId, "failed", ok, failed + 1, totalRows, [ex.Message]);
         }

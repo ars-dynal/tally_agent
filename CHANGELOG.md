@@ -1,5 +1,51 @@
 # Changelog
 
+## 2.0.6 - Year-by-year backfill, and a console that shows what is happening
+
+Two problems this release fixes, both reported from the field: there was no way
+to confine a historical backfill to one financial year, and the Management
+Console showed only a list of past errors - never what the service was doing
+right now, or whether a run had finished.
+
+### Year-by-year backfill
+* **New setting `extractionEndDate`** (`TallySettings`): the upper bound of the
+  historical walk. Set with `extractionStartDate` to extract exactly one
+  financial year - e.g. `2019-04-01` to `2020-03-31` - so no request Tally
+  serves spans more than that year. Blank (the default) means walk to today,
+  which is what the machine tracking live data should use.
+* `SyncPlanner` clamps the newest-first walk to that ceiling, and a checkpoint
+  left over from an earlier unbounded run can never push a window past it.
+* `ConfigValidator` rejects an unparseable end date, and an end date earlier
+  than the start date.
+* The Manager's configuration window has an **Extraction end date** field.
+* To walk 2019 to today: set each year's dates, Save, Restart Service, then
+  "Re-extract Whole Range" (which resets the voucher checkpoint). Repeat.
+
+### Live progress in the Management Console
+* **New `SyncProgress.cs`**: the service publishes a snapshot to
+  `%ProgramData%\TallyBigQueryAgent\progress.json` - current operation, mode,
+  datasets done/total, date windows done/total, rows this run, status. The
+  Console and the service are separate processes, so this file is how the
+  Console can see anything at all. Every write is best effort and can never
+  fail a sync cycle.
+* `SyncEngine.CurrentOperation` publishes on assignment, so every existing
+  call site reports without new plumbing. Status is recorded on all exit
+  paths, including cancellation and crash.
+* **New "Current run" panel** with a progress bar, plain-English operation text
+  ("Reading vouchers from Tally for 2019-04-01 to 2019-04-07"), counters and
+  elapsed time. Refresh is 3s, was 10s.
+* **Stalled detection**: a snapshot still marked running but untouched for five
+  minutes shows as "stalled (no update for 5 min)" instead of looking healthy -
+  the exact state that was previously invisible when Tally hung.
+* Window totals are recomputed as adaptive splitting adds windows, so the
+  denominator rising is visible rather than hidden.
+* Clearer buttons: "Sync Now" is now "Sync Now (catch up)"; "Force Full Sync"
+  is now "Re-extract Whole Range".
+
+### Tests
+72 passing (was 68). Four new planner tests cover the bounded year, a blank
+end date, a future end date, and a stale checkpoint above the ceiling.
+
 ## 2.0.5 — Tally load reduction (Tally no longer slows down / gets stuck while the agent runs)
 
 Root cause of the v2.0.4 field reports: 2.0.4 fixed *concurrency* (one request
