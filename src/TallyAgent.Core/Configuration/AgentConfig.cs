@@ -84,6 +84,14 @@ public sealed class TallySettings
     [System.Text.Json.Serialization.JsonIgnore]
     public int EffectiveMaxConcurrentTallyRequests => 1;
     [JsonPropertyName("autoDiscoverCompanies")] public bool AutoDiscoverCompanies { get; set; } = true;
+    /// <summary>Snapshot reports (Trial Balance, Balance Sheet, P&amp;L, Stock
+    /// Summary, outstanding payables/receivables). These are the heaviest
+    /// requests the agent makes - each one asks Tally to compute a whole
+    /// financial year - and a Force Full Sync runs all six. Turn them OFF on a
+    /// machine doing a historical back-fill: the underlying vouchers and
+    /// ledgers are extracted anyway, so the reports can be derived downstream,
+    /// and skipping them removes the longest stalls from the walk.</summary>
+    [JsonPropertyName("enableSnapshots")] public bool EnableSnapshots { get; set; } = true;
     [JsonPropertyName("enableMasters")] public bool EnableMasters { get; set; } = true;
     [JsonPropertyName("enableVouchers")] public bool EnableVouchers { get; set; } = true;
     [JsonPropertyName("enableInventory")] public bool EnableInventory { get; set; } = true;

@@ -25,6 +25,7 @@ public partial class ConfigWindow : Window
         EndDateBox.Text = _config.Tally.ExtractionEndDate;
         FrequencyBox.Text = _config.Tally.SyncFrequencyMinutes.ToString();
         LookbackBox.Text = _config.Tally.IncrementalLookbackDays.ToString();
+        SnapshotsCheck.IsChecked = _config.Tally.EnableSnapshots;
         MastersCheck.IsChecked = _config.Tally.EnableMasters;
         VouchersCheck.IsChecked = _config.Tally.EnableVouchers;
         InventoryCheck.IsChecked = _config.Tally.EnableInventory;
@@ -51,6 +52,7 @@ public partial class ConfigWindow : Window
             _config.Tally.ExtractionEndDate = EndDateBox.Text.Trim();
             _config.Tally.SyncFrequencyMinutes = int.Parse(FrequencyBox.Text.Trim());
             _config.Tally.IncrementalLookbackDays = int.Parse(LookbackBox.Text.Trim());
+            _config.Tally.EnableSnapshots = SnapshotsCheck.IsChecked == true;
             _config.Tally.EnableMasters = MastersCheck.IsChecked == true;
             _config.Tally.EnableVouchers = VouchersCheck.IsChecked == true;
             _config.Tally.EnableInventory = InventoryCheck.IsChecked == true;

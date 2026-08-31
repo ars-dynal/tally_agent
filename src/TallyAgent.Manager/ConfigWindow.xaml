@@ -40,6 +40,8 @@
                 <CheckBox x:Name="InventoryCheck" Content="Inventory" Margin="0,0,14,0"/>
                 <CheckBox x:Name="GstCheck" Content="GST" Margin="0,0,14,0"/>
                 <CheckBox x:Name="CostCentresCheck" Content="Cost centres" Margin="0,0,14,0"/>
+                <CheckBox x:Name="SnapshotsCheck" Content="Snapshot reports" Margin="0,0,14,0"
+                          ToolTip="Trial Balance, Balance Sheet, P&amp;L, Stock Summary, outstandings.&#x0a;The heaviest requests the agent makes. Turn OFF on a back-fill machine."/>
                 <CheckBox x:Name="AutoDiscoverCheck" Content="Auto-discover company"/>
             </WrapPanel>
         </GroupBox>

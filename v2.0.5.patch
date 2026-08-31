@@ -1,0 +1,1505 @@
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/CHANGELOG.md agent/CHANGELOG.md
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/CHANGELOG.md	2026-08-22 06:43:20.111028461 +0000
++++ agent/CHANGELOG.md	2026-08-22 08:03:42.738717584 +0000
+@@ -1,5 +1,96 @@
+ # Changelog
+ 
++## 2.0.5 — Tally load reduction (Tally no longer slows down / gets stuck while the agent runs)
++
++Root cause of the v2.0.4 field reports: 2.0.4 fixed *concurrency* (one request
++at a time) but not *load*. Every 15-minute cycle still fired ~25–30 heavy
++requests back-to-back, several of them full-financial-year computations, and a
++client-side timeout left Tally computing the abandoned request while the agent
++immediately sent the next one — the requests piled up on Tally's single XML
++thread, which operators saw as "Tally stuck". Full analysis in
++`docs/REVIEW_v2.0.4_tally_slowness.md`.
++
++### Stuck-Tally fixes
++* **Drain after timeout** (`TallyClient`): after ANY timed-out request the
++  client sends one tiny CompanyList probe with a long budget and waits for it
++  to answer before sending anything else. Because Tally serves requests
++  serially, the answer arrives only once the abandoned work has drained. If
++  even the drain times out the request fails NON-retryably (`IsRunEnding`),
++  the cycle ends, and the next cycle drains first too. The old 10/30/60 s
++  same-request retry ladder — which queued up to 4 copies of a heavy report
++  inside Tally — is effectively gone for a busy Tally.
++* **Run-ending errors stop the whole cycle** (`SyncEngine`): retry budget
++  exhausted or Tally-still-busy no longer moves on to the next dataset or
++  splits the voucher window; extraction stops and resumes from checkpoints.
++* **Next run is scheduled from the END of a cycle** (`SyncWorker`): a cycle
++  longer than `syncFrequencyMinutes` was previously followed by another one
++  immediately, so Tally never got an idle gap during office hours.
++* **Idle gap after every request** (`tally.requestPauseSeconds`, default 2):
++  the breathing pause now follows masters, reports and probes — not only
++  voucher windows (`windowPauseSeconds` default raised 3 → 5).
++* `Connection: close` on every Tally request; HTTP 4xx is now a permanent
++  error (no 30-minute "reconnect" loop on a rejected TDL).
++* `maxConcurrentTallyRequests` is accepted for compatibility but the effective
++  in-flight concurrency is always 1 (2 is known to stall TallyPrime).
++* `maxRetriesPerRun` default 20 → 5.
++
++### Load reduction per cycle
++* **Independent AlterID gates**: masters are skipped when no *master*
++  changed (previously one voucher entry re-exported all 15 master tables).
++* **Snapshot reports once a day**: Trial Balance, Balance Sheet, P&L, Stock
++  Summary and outstanding payables/receivables (full-FY computations) now run
++  on a daily slot after `tally.snapshotHourLocal` (default 20:00), on the
++  first ever run, and on Force Full Sync — per dataset, so a report that timed
++  out is retried next cycle without re-running the others. They use their own
++  `snapshotTimeoutSeconds` (default 300) and are never retried at the same
++  size within a cycle. `snapshotEveryCycle: true` restores the old behaviour.
++* **One Ledger fetch and one StockItem fetch per cycle** (`MasterExtractor`):
++  previously Ledger ×5 and StockItem ×4 per cycle. `ledgers`, `opening_bills`,
++  bank-ledger names, `stock_items`, `gst_rates`, `stock_standard_costs` and
++  `stock_standard_prices` are derived from the cached documents; the two
++  outstanding datasets and the trial-balance fallback share one dated Ledger
++  balance fetch (`ReportExtractor`).
++* **Computed master balances once a day, never missing**: ledger
++  OPENING/CLOSINGBALANCE and stock item closing qty/value/rate forced Tally to
++  re-value every ledger/item on every master export. They are now requested
++  from Tally only on the daily snapshot slot (and first run / Force Full Sync),
++  persisted per GUID in SQLite (`master_balances`, schema v5), and every other
++  `ledgers` / `stock_items` export fills the balance columns from that store —
++  so the columns always carry values (as of the last daily capture). Every
++  `ledgers` / `stock_items` record carries a new `balance_as_of` (UTC) field
++  — the capture time, NOT the extraction time — so balance age is explicit
++  in the warehouse (null until the first capture).
++  `tally.includeMasterBalances: true` asks Tally for fresh balances every
++  cycle (v2.0.4 behaviour, heavy).
++* **Voucher export asks for each line once**: the envelope requested every
++  dotted field under both `ALLLEDGERENTRIES` and `LEDGERENTRIES` (and both
++  inventory shapes), so Tally serialized every line twice and the extractor
++  discarded one copy. Only the `ALL*` shape is requested now;
++  `tally.voucherFetchLegacyLists: true` re-enables the legacy lists for old
++  builds.
++* **Adaptive-down voucher windows**: `fullSyncChunkDays` default 31 → 7,
++  `voucherTimeoutSeconds` default 300 → 180. A window that times out OR takes
++  more than 60% of its budget shrinks *all* remaining windows (not just the one
++  that failed); windows never grow within a run.
++
++### Tests
++* +12 offline tests: drain-before-retry, busy-Tally ends run after one drain,
++  budget-0 ends run, 4xx not retried, per-request pause, concurrency always 1,
++  envelope requests ALL* shape only, ReChunk ordering/coverage, daily balance
++  capture + cache, one Ledger fetch per cycle. Two v2.0.4 tests updated for
++  the drain call. 68/68 pass. Service and CLI projects compile-checked
++  against the published assemblies (Manager unchanged).
++
++### Upgrade notes
++* Existing `config.json` files keep working; new keys take their defaults.
++  Recommended: leave defaults, and run Force Full Sync after office hours.
++* Warehouse: `ledgers` / `stock_items` balance columns are refreshed once a
++  day (snapshot slot) rather than every cycle; intraday they repeat the last
++  daily capture. Use `trial_balance` / `stock_summary` for intraday figures.
++* SQLite schema migrates v4 → v5 automatically (new `master_balances` table).
++* Known limitation: offline source-code phase; not yet validated against a
++  live Windows/Tally installation.
++
+ ## 2.0.4 — Server protection & synchronization stability (fix/tally-agent-server-protection)
+ 
+ Offline source-code phase; NOT yet validated against live Windows/Tally.
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/Directory.Build.props agent/Directory.Build.props
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/Directory.Build.props	2026-08-22 06:54:50.025240545 +0000
++++ agent/Directory.Build.props	2026-08-22 07:08:42.504888842 +0000
+@@ -1,6 +1,6 @@
+ <Project>
+   <PropertyGroup>
+-    <Version>2.0.4</Version>
++    <Version>2.0.5</Version>
+     <Company>Dynalektric</Company>
+     <Product>Tally BigQuery Agent</Product>
+     <Copyright>Copyright © 2026</Copyright>
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/AgentVersion.cs agent/src/TallyAgent.Core/AgentVersion.cs
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/AgentVersion.cs	2026-08-22 06:54:52.981240720 +0000
++++ agent/src/TallyAgent.Core/AgentVersion.cs	2026-08-22 07:08:42.514683058 +0000
+@@ -3,7 +3,7 @@
+ /// <summary>Central version + well-known path constants for the agent.</summary>
+ public static class AgentInfo
+ {
+-    public const string Version = "2.0.4";
++    public const string Version = "2.0.5";
+     public const string SchemaVersion = "1.0";
+     public const string ServiceName = "TallyBigQueryAgent";
+     public const string ServiceDisplayName = "Tally BigQuery Data Sync Agent";
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Configuration/AgentConfig.cs agent/src/TallyAgent.Core/Configuration/AgentConfig.cs
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Configuration/AgentConfig.cs	2026-08-22 06:43:17.455028303 +0000
++++ agent/src/TallyAgent.Core/Configuration/AgentConfig.cs	2026-08-22 07:53:47.730093204 +0000
+@@ -26,7 +26,34 @@
+     /// <summary>Timeout for windowed voucher extraction requests, which are the
+     /// heaviest calls the agent makes. Defaults higher than requestTimeoutSeconds
+     /// so a large month gets a fair chance before the window is split.</summary>
+-    [JsonPropertyName("voucherTimeoutSeconds")] public int VoucherTimeoutSeconds { get; set; } = 300;
++    [JsonPropertyName("voucherTimeoutSeconds")] public int VoucherTimeoutSeconds { get; set; } = 180;
++    /// <summary>Timeout for full-financial-year snapshot reports (Trial Balance,
++    /// Balance Sheet, P&amp;L, Stock Summary). These are never retried at the
++    /// same size inside a cycle — a timeout simply defers the snapshot to the
++    /// next snapshot slot.</summary>
++    [JsonPropertyName("snapshotTimeoutSeconds")] public int SnapshotTimeoutSeconds { get; set; } = 300;
++    /// <summary>Server-local hour (0-23) after which the once-daily snapshot
++    /// reports (TB/BS/P&amp;L/Stock Summary/outstanding) are extracted. They are
++    /// the heaviest thing the agent asks Tally for, so they run once per day
++    /// (default 20:00 — after office hours), on the first ever run, and on a
++    /// Force Full Sync. Set snapshotEveryCycle=true to restore v2.0.4 behaviour.</summary>
++    [JsonPropertyName("snapshotHourLocal")] public int SnapshotHourLocal { get; set; } = 20;
++    [JsonPropertyName("snapshotEveryCycle")] public bool SnapshotEveryCycle { get; set; } = false;
++    /// <summary>Computed balances (ledger OPENING/CLOSINGBALANCE, stock item
++    /// closing qty/value/rate) force Tally to walk every voucher for every
++    /// ledger/item. By default (false) they are requested from Tally once a day
++    /// on the snapshot slot and cached per GUID; every other master export
++    /// fills the balance columns from that cache. Set true to ask Tally for
++    /// fresh balances on EVERY cycle (v2.0.4 behaviour, heavy).</summary>
++    [JsonPropertyName("includeMasterBalances")] public bool IncludeMasterBalances { get; set; } = false;
++    /// <summary>Also request the legacy LEDGERENTRIES/INVENTORYENTRIES lists in
++    /// the voucher export (older Tally builds that do not emit ALL*ENTRIES).
++    /// Off by default: requesting both makes Tally serialize every line twice.</summary>
++    [JsonPropertyName("voucherFetchLegacyLists")] public bool VoucherFetchLegacyLists { get; set; } = false;
++    /// <summary>Idle gap after EVERY Tally request (masters, reports, probes and
++    /// voucher windows alike) so the Tally UI thread gets a slice between
++    /// requests. 0 disables.</summary>
++    [JsonPropertyName("requestPauseSeconds")] public int RequestPauseSeconds { get; set; } = 2;
+     /// <summary>How long an active sync waits for a temporarily unavailable Tally server before giving up.</summary>
+     [JsonPropertyName("reconnectMaxMinutes")] public int ReconnectMaxMinutes { get; set; } = 30;
+     /// <summary>Delay between Tally reachability probes while auto-reconnecting.</summary>
+@@ -35,20 +62,20 @@
+     /// breathing room during a long history walk. Tally's XML server shares the
+     /// application thread — while a request runs, operators feel it; the gap
+     /// between requests is when the UI catches up. 0 disables the pause.</summary>
+-    [JsonPropertyName("windowPauseSeconds")] public int WindowPauseSeconds { get; set; } = 3;
+-    /// <summary>In-flight Tally request concurrency. Tally's XML server shares the
+-    /// application thread — default 1; hard-bounded to 2 because anything higher is
+-    /// known to stall TallyPrime. Raise to 2 only with observed evidence.</summary>
++    [JsonPropertyName("windowPauseSeconds")] public int WindowPauseSeconds { get; set; } = 5;
++    /// <summary>Kept for config compatibility. Tally's XML server is single-
++    /// threaded and 2 in-flight requests are known to stall TallyPrime, so the
++    /// effective concurrency is ALWAYS 1 (see EffectiveMaxConcurrentTallyRequests).</summary>
+     [JsonPropertyName("maxConcurrentTallyRequests")] public int MaxConcurrentTallyRequests { get; set; } = 1;
+     [JsonPropertyName("gateWaitSeconds")] public int GateWaitSeconds { get; set; } = 120;
+     /// <summary>Total timeout/reconnect retries permitted per sync run across ALL
+     /// datasets and windows — a stalling Tally ends the cycle instead of being
+     /// hammered; the run resumes from checkpoints next cycle.</summary>
+-    [JsonPropertyName("maxRetriesPerRun")] public int MaxRetriesPerRun { get; set; } = 20;
++    [JsonPropertyName("maxRetriesPerRun")] public int MaxRetriesPerRun { get; set; } = 5;
+     [JsonPropertyName("maxResponseMb")] public int MaxResponseMb { get; set; } = 256;
+ 
+     [System.Text.Json.Serialization.JsonIgnore]
+-    public int EffectiveMaxConcurrentTallyRequests => Math.Clamp(MaxConcurrentTallyRequests, 1, 2);
++    public int EffectiveMaxConcurrentTallyRequests => 1;
+     [JsonPropertyName("autoDiscoverCompanies")] public bool AutoDiscoverCompanies { get; set; } = true;
+     [JsonPropertyName("enableMasters")] public bool EnableMasters { get; set; } = true;
+     [JsonPropertyName("enableVouchers")] public bool EnableVouchers { get; set; } = true;
+@@ -56,7 +83,10 @@
+     [JsonPropertyName("enableGst")] public bool EnableGst { get; set; } = true;
+     [JsonPropertyName("enableCostCentres")] public bool EnableCostCentres { get; set; } = true;
+     [JsonPropertyName("incrementalLookbackDays")] public int IncrementalLookbackDays { get; set; } = 7;
+-    [JsonPropertyName("fullSyncChunkDays")] public int FullSyncChunkDays { get; set; } = 31;
++    /// <summary>Initial voucher window size for a history walk. The engine
++    /// shrinks windows adaptively (never grows them within a run) when a window
++    /// times out or takes more than 60% of voucherTimeoutSeconds.</summary>
++    [JsonPropertyName("fullSyncChunkDays")] public int FullSyncChunkDays { get; set; } = 7;
+ 
+     public Uri BaseUri => new($"http://{Host}:{Port}/");
+ }
+@@ -94,4 +124,4 @@
+     [JsonPropertyName("queueDiskLimitMb")] public int QueueDiskLimitMb { get; set; } = 2048;
+     [JsonPropertyName("minFreeDiskMb")] public int MinFreeDiskMb { get; set; } = 500;
+     [JsonPropertyName("maxUploadRetryMinutes")] public int MaxUploadRetryMinutes { get; set; } = 30;
+-}
+\ No newline at end of file
++}
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Configuration/ConfigValidator.cs agent/src/TallyAgent.Core/Configuration/ConfigValidator.cs
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Configuration/ConfigValidator.cs	2026-08-22 06:54:55.745240885 +0000
++++ agent/src/TallyAgent.Core/Configuration/ConfigValidator.cs	2026-08-22 07:08:42.535099238 +0000
+@@ -32,7 +32,17 @@
+             errors.Add("Tally request timeout must be 10-900 seconds.");
+ 
+         if (cfg.Tally.MaxConcurrentTallyRequests is < 1 or > 2)
+-            errors.Add("maxConcurrentTallyRequests must be 1 or 2 (Tally's XML server is single-threaded).");
++            errors.Add("maxConcurrentTallyRequests must be 1 or 2 (effective concurrency is always 1).");
++        if (cfg.Tally.VoucherTimeoutSeconds is < 10 or > 900)
++            errors.Add("voucherTimeoutSeconds must be 10-900 seconds.");
++        if (cfg.Tally.SnapshotTimeoutSeconds is < 10 or > 1800)
++            errors.Add("snapshotTimeoutSeconds must be 10-1800 seconds.");
++        if (cfg.Tally.SnapshotHourLocal is < 0 or > 23)
++            errors.Add("snapshotHourLocal must be 0-23.");
++        if (cfg.Tally.RequestPauseSeconds is < 0 or > 60)
++            errors.Add("requestPauseSeconds must be 0-60.");
++        if (cfg.Tally.WindowPauseSeconds is < 0 or > 300)
++            errors.Add("windowPauseSeconds must be 0-300.");
+         if (cfg.Tally.GateWaitSeconds is < 5 or > 600)
+             errors.Add("gateWaitSeconds must be 5-600.");
+         if (cfg.Tally.MaxRetriesPerRun is < 0 or > 200)
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Data/AgentDatabase.cs agent/src/TallyAgent.Core/Data/AgentDatabase.cs
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Data/AgentDatabase.cs	2026-08-22 06:43:21.507028544 +0000
++++ agent/src/TallyAgent.Core/Data/AgentDatabase.cs	2026-08-22 07:53:47.775585535 +0000
+@@ -10,7 +10,7 @@
+ /// </summary>
+ public sealed class AgentDatabase
+ {
+-    public const int CurrentSchemaVersion = 4;
++    public const int CurrentSchemaVersion = 5;
+ 
+     private readonly string _connectionString;
+     private readonly ILogger<AgentDatabase> _log;
+@@ -58,7 +58,8 @@
+         if (version < 2) MigrateToV2(conn, tx);
+         if (version < 3) MigrateToV3(conn, tx);
+         if (version < 4) MigrateToV4(conn, tx);
+-        // future: if (version < 4) MigrateToV4(conn, tx); — additive only
++        if (version < 5) MigrateToV5(conn, tx);
++        // future: additive only
+ 
+         Exec(conn, tx, """
+             INSERT INTO schema_meta(key, value) VALUES('schema_version', $v)
+@@ -211,6 +212,24 @@
+             """);
+     }
+ 
++    /// <summary>V5: master_balances — last known computed balances per master
++    /// (ledger opening/closing, stock item closing qty/value/rate), captured on
++    /// the daily snapshot slot so every-cycle master exports never ask Tally to
++    /// re-value the whole company yet still carry balance columns.</summary>
++    private static void MigrateToV5(SqliteConnection conn, SqliteTransaction tx)
++    {
++        Exec(conn, tx, """
++            CREATE TABLE IF NOT EXISTS master_balances (
++              dataset      TEXT NOT NULL,
++              company      TEXT NOT NULL,
++              guid         TEXT NOT NULL,
++              values_json  TEXT NOT NULL,
++              captured_utc TEXT NOT NULL,
++              PRIMARY KEY (dataset, company, guid)
++            );
++            """);
++    }
++
+     private static void Exec(SqliteConnection conn, SqliteTransaction tx, string sql,
+         params (string name, object value)[] args)
+     {
+Only in agent/src/TallyAgent.Core/Data: MasterBalanceRepository.cs
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Sync/SyncEngine.cs agent/src/TallyAgent.Core/Sync/SyncEngine.cs
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Sync/SyncEngine.cs	2026-08-22 06:43:15.719028200 +0000
++++ agent/src/TallyAgent.Core/Sync/SyncEngine.cs	2026-08-22 07:53:47.754233941 +0000
+@@ -35,6 +35,13 @@
+ {
+     public string CurrentOperation { get; private set; } = "idle";
+ 
++    /// <summary>Bank ledger names reused across cycles while masters are
++    /// unchanged (saves a Ledger fetch on every incremental cycle).</summary>
++    private HashSet<string>? _bankLedgerCache;
++
++    /// <summary>Checkpoint row that records the last daily master-balance capture.</summary>
++    private const string MasterBalancesCheckpoint = "_master_balances";
++
+     public Task<SyncResult> RunCycleAsync(string mode, CancellationToken ct) =>
+         RunCycleAsync(mode, null, ct);
+ 
+@@ -53,6 +60,7 @@
+         // Arm the per-run Tally retry budget (Phase F8): timeouts/reconnects
+         // across ALL datasets and windows share one bounded pool this cycle.
+         tally.ResetRunBudget(config.Tally.MaxRetriesPerRun);
++        reports.BeginCycle();
+         RecordRunStart(syncId, mode);
+         var errorList = new List<string>();
+         var extractedCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+@@ -119,12 +127,34 @@
+                 checkpoints.Get("_alter_gate_vouchers", company)?.LastAlterId == a2.Vouchers;
+ 
+             // ── Masters & snapshots ────────────────────────────────
+-            if (mastersUnchanged && vouchersUnchanged)
+-                log.LogInformation("AlterID gate: no master or voucher changes — skipping masters/snapshots");
++            // v2.0.5: the two gates are INDEPENDENT. v2.0.4 skipped masters only
++            // when masters AND vouchers were both unchanged — so one voucher
++            // entry during the day re-exported all 15 master tables plus the
++            // full-FY snapshot reports every cycle. Masters now run only when a
++            // master changed; snapshots run on their own daily slot.
++            // Computed balances (ledger opening/closing, stock closing qty/value/
++            // rate) are asked from Tally on the same daily slot as the snapshots
++            // and cached per GUID; other cycles fill them from the cache.
++            var balancesDue = ShouldRunSnapshot(MasterBalancesCheckpoint, company, mode, out var balWhy);
++            masters.BeginCycle(company, fetchBalances: balancesDue);
++            var runMasters = !mastersUnchanged;
++            if (!runMasters)
++                log.LogInformation("AlterID gate: no master changes — skipping master collections" +
++                    (balancesDue ? " (ledgers/stock_items still run for the daily balance capture)" : ""));
+             else
++                log.LogDebug("Master balances this cycle: {Mode} ({Why})", balancesDue ? "fetch" : "cache", balWhy);
++            var balanceDatasetsOk = 0;
++            var runEnded = false;
+             foreach (var ds in enabled.Where(d => d.Kind is DatasetKind.Master or DatasetKind.Snapshot))
+             {
+                 ct.ThrowIfCancellationRequested();
++                var isBalanceDataset = ds.Name is "ledgers" or "stock_items";
++                if (ds.Kind == DatasetKind.Master && !runMasters && !(balancesDue && isBalanceDataset)) continue;
++                if (ds.Kind == DatasetKind.Snapshot && !ShouldRunSnapshot(ds.Name, company, mode, out var why))
++                {
++                    log.LogDebug("Snapshot {Dataset} skipped: {Why}", ds.Name, why);
++                    continue;
++                }
+                 CurrentOperation = $"extract:{ds.Name}";
+                 try
+                 {
+@@ -150,6 +180,15 @@
+ 
+                     EnqueueAndCheckpoint(ds.Name, company, syncId, rows, null, null, fullDone: true);
+                     ok++;
++                    if (balancesDue && isBalanceDataset) balanceDatasetsOk++;
++                }
++                catch (TallyException tex) when (tex.IsRunEnding)
++                {
++                    // Tally is busy/exhausted: stop asking it for anything this cycle.
++                    failed++;
++                    await HandleDatasetErrorAsync(ds.Name, tex, errorList);
++                    runEnded = true;
++                    break;
+                 }
+                 catch (Exception ex) when (ex is not OperationCanceledException)
+                 {
+@@ -158,6 +197,12 @@
+                 }
+             }
+ 
++            // Mark the daily balance capture done only when both balance-bearing
++            // datasets succeeded (or are disabled) so a failed one is retried.
++            if (balancesDue && balanceDatasetsOk >= enabled.Count(d => d.Name is "ledgers" or "stock_items"))
++                checkpoints.Upsert(new SyncCheckpoint(MasterBalancesCheckpoint, company,
++                    null, null, null, DateTime.UtcNow.ToString("O"), true));
++
+             // Do not silently certify a full baseline when strongly related
+             // datasets contradict each other. These checks are deliberately
+             // conservative and only flag impossible/suspicious combinations.
+@@ -175,7 +220,7 @@
+             }
+ 
+             // ── Vouchers (windowed Day Book fan-out) ───────────────
+-            if (enabled.Any(d => d.Kind == DatasetKind.Voucher))
++            if (!runEnded && enabled.Any(d => d.Kind == DatasetKind.Voucher))
+             {
+                 var plan = PlanVouchers(company);
+                 var skipVouchers = vouchersUnchanged && !plan.IsFullSync;
+@@ -200,8 +245,15 @@
+                 if (!skipVouchers && plan.Windows.Count > 0)
+                 {
+                     HashSet<string> bankLedgers;
+-                    try { bankLedgers = await reports.BankLedgerNames(ct); }
+-                    catch { bankLedgers = []; }
++                    if (_bankLedgerCache is { } cachedBanks && !runMasters)
++                        bankLedgers = cachedBanks;
++                    else
++                    {
++                        try { bankLedgers = await masters.BankLedgerNames(ct); _bankLedgerCache = bankLedgers; }
++                        catch (TallyException tex) when (tex.IsRunEnding) { throw; }
++                        catch { bankLedgers = _bankLedgerCache ?? []; }
++                    }
++                    var voucherBudget = tally.VoucherRequestTimeout;
+ 
+                     // Adaptive windowing: a window that times out is split in half
+                     // and retried down to single-day windows.
+@@ -213,7 +265,9 @@
+                         CurrentOperation = $"extract:vouchers {from:yyyy-MM-dd}..{to:yyyy-MM-dd}";
+                         try
+                         {
++                            var sw = System.Diagnostics.Stopwatch.StartNew();
+                             var result = await vouchers.ExtractWindow(from, to, bankLedgers, ct);
++                            sw.Stop();
+                             var wf = from.ToString("yyyy-MM-dd");
+                             var wt = to.ToString("yyyy-MM-dd");
+ 
+@@ -230,6 +284,23 @@
+                                 result.MaxVoucherDate, "completed");
+                             ok++;
+ 
++                            // Adaptive-down windowing: a window that succeeded but
++                            // used more than 60% of its budget is a timeout waiting
++                            // to happen on the next (often busier) month. Halve the
++                            // remaining windows now instead of discovering it the
++                            // expensive way. Windows never grow within a run.
++                            var days = to.DayNumber - from.DayNumber + 1;
++                            if (days > 1 && pending.Count > 0 &&
++                                sw.Elapsed > voucherBudget * 0.6)
++                            {
++                                var newChunk = Math.Max(1, days / 2);
++                                log.LogWarning(
++                                    "Window {From}..{To} took {Secs:F0}s (>60% of the {Budget:F0}s budget) — " +
++                                    "shrinking remaining windows to {Chunk} day(s)",
++                                    from, to, sw.Elapsed.TotalSeconds, voucherBudget.TotalSeconds, newChunk);
++                                ReChunk(pending, newChunk, newestFirst: plan.TargetStart is not null);
++                            }
++
+                             // Low-impact mode: give the Tally UI room to breathe
+                             // between windows (its XML server shares the app
+                             // thread — the gap is when operators' screens catch up).
+@@ -238,7 +309,7 @@
+                                     TimeSpan.FromSeconds(config.Tally.WindowPauseSeconds), ct);
+                         }
+                         catch (TallyException tex) when (
+-                            tex.Category == ErrorCategory.TallyTimeout && to > from)
++                            tex.Category == ErrorCategory.TallyTimeout && !tex.IsRunEnding && to > from)
+                         {
+                             var mid = from.AddDays((to.DayNumber - from.DayNumber) / 2);
+                             var secondFrom = mid.AddDays(1);
+@@ -266,6 +337,10 @@
+                                 pending.Enqueue((secondFrom, to));
+                             }
+                             foreach (var w in rest) pending.Enqueue(w);
++                            // Every later window of the old size would time out the
++                            // same way — shrink them all to the new half size now.
++                            ReChunk(pending, Math.Max(1, (mid.DayNumber - from.DayNumber + 1)),
++                                newestFirst: plan.TargetStart is not null);
+                         }
+                         catch (Exception ex) when (ex is not OperationCanceledException)
+                         {
+@@ -308,12 +383,61 @@
+         }
+         finally
+         {
++            masters.EndCycle();   // release cached Ledger/StockItem documents
++            reports.EndCycle();
+             CurrentOperation = "idle";
+         }
+     }
+ 
+     // ── planning ──────────────────────────────────────────────────
+ 
++    /// <summary>Snapshot reports (full-FY TB/BS/P&amp;L/Stock Summary and the
++    /// outstanding balances) are the heaviest requests the agent makes. They
++    /// run: every cycle only if tally.snapshotEveryCycle; otherwise on Force
++    /// Full Sync, when the dataset has never been extracted, or once per
++    /// server-local day at/after tally.snapshotHourLocal. Per-dataset, so a
++    /// snapshot that timed out is retried next cycle without re-running the
++    /// ones that already succeeded today.</summary>
++    private bool ShouldRunSnapshot(string dataset, string company, string mode, out string reason)
++    {
++        if (config.Tally.SnapshotEveryCycle) { reason = "snapshotEveryCycle"; return true; }
++        if (mode == "full-forced") { reason = "force full sync"; return true; }
++        var cp = checkpoints.Get(dataset, company);
++        if (cp?.LastSuccessUtc is null) { reason = "never extracted"; return true; }
++
++        var now = DateTime.Now;
++        var lastLocal = DateTime.TryParse(cp.LastSuccessUtc, null,
++            System.Globalization.DateTimeStyles.RoundtripKind, out var lastUtc)
++            ? lastUtc.ToLocalTime() : DateTime.MinValue;
++        if (lastLocal.Date == now.Date) { reason = "already extracted today"; return false; }
++        if (now.Hour < Math.Clamp(config.Tally.SnapshotHourLocal, 0, 23))
++        { reason = $"daily slot starts at {config.Tally.SnapshotHourLocal:00}:00"; return false; }
++        reason = "daily slot";
++        return true;
++    }
++
++    /// <summary>Re-split every pending window wider than <paramref name="chunkDays"/>
++    /// into chunks of that size, preserving walk direction and order.</summary>
++    internal static void ReChunk(Queue<(DateOnly From, DateOnly To)> pending, int chunkDays, bool newestFirst)
++    {
++        chunkDays = Math.Max(1, chunkDays);
++        var rest = pending.ToList();
++        pending.Clear();
++        foreach (var (from, to) in rest)
++        {
++            if (to.DayNumber - from.DayNumber + 1 <= chunkDays) { pending.Enqueue((from, to)); continue; }
++            var pieces = new List<(DateOnly, DateOnly)>();
++            for (var f = from; f <= to; f = f.AddDays(chunkDays))
++            {
++                var t = f.AddDays(chunkDays - 1);
++                if (t > to) t = to;
++                pieces.Add((f, t));
++            }
++            if (newestFirst) pieces.Reverse();
++            foreach (var pc in pieces) pending.Enqueue(pc);
++        }
++    }
++
+     public List<(DateOnly From, DateOnly To)> PlanVoucherWindows(string company)
+     {
+         var today = DateOnly.FromDateTime(DateTime.Today);
+@@ -394,8 +518,8 @@
+             "balance_sheet" => await reports.BalanceSheet(fyStart, today, ct),
+             "profit_loss" => await reports.ProfitLoss(fyStart, today, ct),
+             "stock_summary" => await reports.StockSummary(fyStart, today, ct),
+-            "outstanding_payables" => await reports.Outstanding("Sundry Creditors", ct),
+-            "outstanding_receivables" => await reports.Outstanding("Sundry Debtors", ct),
++            "outstanding_payables" => await reports.Outstanding("Sundry Creditors", today, ct),
++            "outstanding_receivables" => await reports.Outstanding("Sundry Debtors", today, ct),
+             _ => throw new InvalidOperationException($"Unknown dataset '{dataset}'"),
+         };
+     }
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Tally/Extractors/MasterExtractor.cs agent/src/TallyAgent.Core/Tally/Extractors/MasterExtractor.cs
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Tally/Extractors/MasterExtractor.cs	2026-08-22 06:43:14.215028111 +0000
++++ agent/src/TallyAgent.Core/Tally/Extractors/MasterExtractor.cs	2026-08-22 08:03:42.740580825 +0000
+@@ -1,5 +1,6 @@
+ using System.Xml.Linq;
+ using Microsoft.Extensions.Logging;
++using TallyAgent.Core.Data;
+ using static TallyAgent.Core.Tally.TallyXml;
+ 
+ namespace TallyAgent.Core.Tally.Extractors;
+@@ -7,12 +8,161 @@
+ using Row = Dictionary<string, object?>;
+ 
+ /// <summary>Extracts the 13 master/inventory-master collections via TDL FETCH lists.
+-/// Field lists and fallback chains ported from the proven Python connector.</summary>
+-public sealed class MasterExtractor(TallyClient client, ILogger<MasterExtractor> log)
++/// Field lists and fallback chains ported from the proven Python connector.
++///
++/// ONE FETCH PER COLLECTION PER CYCLE (v2.0.5): v2.0.4 asked Tally for the
++/// Ledger collection five times and the StockItem collection four times every
++/// cycle (ledgers, opening_bills, outstanding ×2, bank names; stock_items,
++/// gst_rates, standard costs, standard prices). Each was a full serialization
++/// inside Tally's UI thread. The Ledger and StockItem documents are now
++/// fetched once with the union of fields and cached for the cycle
++/// (<see cref="BeginCycle"/> / <see cref="EndCycle"/>); the dependent
++/// datasets are derived in memory.
++///
++/// COMPUTED BALANCES ONCE A DAY: OPENING/CLOSINGBALANCE on ledgers and
++/// CLOSINGBALANCE/VALUE/RATE on stock items force Tally to walk every voucher
++/// for every master (a full valuation) on each master export. They are
++/// therefore requested from Tally only when the engine says so (the daily
++/// snapshot slot, first run, Force Full Sync, or every cycle when
++/// tally.includeMasterBalances=true) and persisted per GUID in SQLite; every
++/// other master export fills the balance columns from that store, so the
++/// ledgers / stock_items datasets ALWAYS carry balances (as of the last daily
++/// capture) without re-valuing the company each cycle.</summary>
++public sealed class MasterExtractor(TallyClient client, MasterBalanceRepository balanceStore,
++    ILogger<MasterExtractor> log)
+ {
++    private readonly SemaphoreSlim _cacheLock = new(1, 1);
++    private XDocument? _ledgerDoc;
++    private XDocument? _stockItemDoc;
++    private bool _fetchBalances;
++    private string _company = "";
++
++    /// <summary>Start a cycle. <paramref name="fetchBalances"/>: ask Tally for
++    /// computed balances this cycle (and persist them); otherwise balances are
++    /// filled from the last capture.</summary>
++    public void BeginCycle(string company, bool fetchBalances)
++    {
++        EndCycle();
++        _company = company;
++        _fetchBalances = fetchBalances || client.IncludeMasterBalances;
++    }
++    public void EndCycle() { _ledgerDoc = null; _stockItemDoc = null; }
++
++    /// <summary>True when this cycle captured fresh balances from Tally.</summary>
++    public bool FetchedBalancesThisCycle => _fetchBalances;
++
+     private async Task<XDocument> FetchCollection(string type, string[] fields, CancellationToken ct) =>
+         await client.PostAsync(TallyEnvelopes.Collection(type, fields, client.Company), ct);
+ 
++    private static readonly string[] LedgerBaseFields =
++    [
++        "GUID","MASTERID","ALTERID",
++        "NAME","PARENT","PARTYGSTIN","GSTIN",
++        "GSTREGISTRATIONNUMBER","INCOMETAXNUMBER","LEDSTATENAME","COUNTRYNAME","ADDRESS",
++        "PINCODE","LEDGERMOBILE","LEDGERPHONE","EMAIL","LEDGERCONTACT","BANKACCOUNTNUMBER",
++        "IFSCODE","BANKNAME","BRANCHNAME","ISBILLWISEON","ISCOSTCENTRESON",
++        "BILLALLOCATIONS.LIST",   // opening bills
++    ];
++    private static readonly string[] LedgerBalanceFields = ["OPENINGBALANCE","CLOSINGBALANCE"];
++
++    private static readonly string[] StockItemBaseFields =
++    [
++        "GUID","MASTERID","ALTERID",
++        "NAME","PARENT","CATEGORY","BASEUNITS","OPENINGBALANCE","OPENINGVALUE","OPENINGRATE",
++        "GSTRATE","HSNCODE","DESCRIPTION","ADDITIONALNAME",
++        "GSTAPPLICABLE","GSTTYPEOFSUPPLY","TAXCLASSIFICATIONNAME","GSTDETAILS.LIST",
++        "STANDARDCOSTLIST.LIST","STANDARDPRICELIST.LIST",
++    ];
++    private static readonly string[] StockItemBalanceFields = ["CLOSINGBALANCE","CLOSINGVALUE","CLOSINGRATE"];
++
++    /// <summary>The Ledger collection for this cycle (fetched once).</summary>
++    public async Task<XDocument> LedgerDocument(CancellationToken ct)
++    {
++        if (_ledgerDoc is { } cached) return cached;
++        await _cacheLock.WaitAsync(ct);
++        try
++        {
++            if (_ledgerDoc is { } c2) return c2;
++            var fields = _fetchBalances
++                ? LedgerBaseFields.Concat(LedgerBalanceFields).ToArray()
++                : LedgerBaseFields;
++            _ledgerDoc = await FetchCollection("Ledger", fields, ct);
++            return _ledgerDoc;
++        }
++        finally { _cacheLock.Release(); }
++    }
++
++    /// <summary>The StockItem collection for this cycle (fetched once).</summary>
++    public async Task<XDocument> StockItemDocument(CancellationToken ct)
++    {
++        if (_stockItemDoc is { } cached) return cached;
++        await _cacheLock.WaitAsync(ct);
++        try
++        {
++            if (_stockItemDoc is { } c2) return c2;
++            var fields = _fetchBalances
++                ? StockItemBaseFields.Concat(StockItemBalanceFields).ToArray()
++                : StockItemBaseFields;
++            _stockItemDoc = await FetchCollection("StockItem", fields, ct);
++            return _stockItemDoc;
++        }
++        finally { _cacheLock.Release(); }
++    }
++
++    /// <summary>Balance columns: fresh from Tally when fetching this cycle
++    /// (recorded for persistence), otherwise from the last capture by GUID.</summary>
++    private sealed class BalanceSource
++    {
++        private readonly bool _fresh;
++        private readonly Dictionary<string, Dictionary<string, double>> _cached;
++        public readonly Dictionary<string, Dictionary<string, double>> Captured = new(StringComparer.Ordinal);
++        /// <summary>UTC instant the balance columns are "as of" — now when fresh
++        /// from Tally, the last capture time when served from the store, null
++        /// when no capture exists yet. Emitted on every record as
++        /// <c>balance_as_of</c> so the warehouse never mistakes a cached balance
++        /// for one computed at extraction time.</summary>
++        public readonly string? AsOf;
++        public BalanceSource(bool fresh, Dictionary<string, Dictionary<string, double>> cached, string? asOf)
++        { _fresh = fresh; _cached = cached; AsOf = asOf; }
++        public object? Get(XElement el, string guid, string tag)
++        {
++            if (_fresh)
++            {
++                var v = Num(el, tag);
++                if (guid.Length > 0)
++                {
++                    if (!Captured.TryGetValue(guid, out var d)) Captured[guid] = d = new();
++                    d[tag] = v;
++                }
++                return v;
++            }
++            return _cached.TryGetValue(guid, out var c) && c.TryGetValue(tag, out var cv) ? cv : null;
++        }
++    }
++
++    private BalanceSource NewBalanceSource(string dataset)
++    {
++        if (_fetchBalances)
++            return new BalanceSource(true, new(), DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"));
++        try
++        {
++            return new BalanceSource(false, balanceStore.Load(dataset, _company),
++                balanceStore.LastCapturedUtc(dataset, _company));
++        }
++        catch (Exception ex)
++        {
++            log.LogWarning("Master balance cache unavailable for {Dataset} ({Msg}) — balances null this cycle", dataset, ex.Message);
++            return new BalanceSource(false, new(), null);
++        }
++    }
++
++    private void PersistBalances(string dataset, BalanceSource src)
++    {
++        if (!_fetchBalances || src.Captured.Count == 0) return;
++        try { balanceStore.Save(dataset, _company, src.Captured); }
++        catch (Exception ex) { log.LogWarning("Could not persist {Dataset} balances ({Msg})", dataset, ex.Message); }
++    }
++
+     public async Task<List<Row>> Companies(CancellationToken ct)
+     {
+         var doc = await FetchCollection("Company", [
+@@ -59,15 +209,12 @@
+ 
+     public async Task<List<Row>> Ledgers(CancellationToken ct)
+     {
+-        var doc = await FetchCollection("Ledger", [
+-            "GUID","MASTERID","ALTERID",
+-            "NAME","PARENT","OPENINGBALANCE","CLOSINGBALANCE","PARTYGSTIN","GSTIN",
+-            "GSTREGISTRATIONNUMBER","INCOMETAXNUMBER","LEDSTATENAME","COUNTRYNAME","ADDRESS",
+-            "PINCODE","LEDGERMOBILE","LEDGERPHONE","EMAIL","LEDGERCONTACT","BANKACCOUNTNUMBER",
+-            "IFSCODE","BANKNAME","BRANCHNAME","ISBILLWISEON","ISCOSTCENTRESON"], ct);
++        var doc = await LedgerDocument(ct);
+         var rows = new List<Row>();
++        var bal = NewBalanceSource("ledgers");
+         foreach (var el in doc.Descendants("LEDGER"))
+         {
++            var guid = Text(el, "GUID");
+             var gstin = Text(el, "PARTYGSTIN");
+             if (gstin.Length == 0) gstin = Text(el, "GSTIN");
+             if (gstin.Length == 0) gstin = Text(el, "GSTREGISTRATIONNUMBER");
+@@ -78,8 +225,9 @@
+             ["alter_id"] = Int(el, "ALTERID"),
+             ["ledger_name"] = Text(el, "NAME"),
+                 ["parent_group"] = Text(el, "PARENT"),
+-                ["opening_balance"] = Num(el, "OPENINGBALANCE"),
+-                ["closing_balance"] = Num(el, "CLOSINGBALANCE"),
++                ["opening_balance"] = bal.Get(el, guid, "OPENINGBALANCE"),
++                ["closing_balance"] = bal.Get(el, guid, "CLOSINGBALANCE"),
++                ["balance_as_of"] = bal.AsOf,
+                 ["gstin"] = gstin,
+                 ["pan"] = Text(el, "INCOMETAXNUMBER"),
+                 ["state"] = Text(el, "LEDSTATENAME"),
+@@ -98,7 +246,9 @@
+                 ["is_costcentre"] = Bool(el, "ISCOSTCENTRESON"),
+             });
+         }
+-        log.LogInformation("Fetched {N} ledgers", rows.Count);
++        PersistBalances("ledgers", bal);
++        log.LogInformation("Fetched {N} ledgers (balances: {Mode})", rows.Count,
++            _fetchBalances ? "fresh from Tally" : "from last daily capture");
+         return rows;
+     }
+ 
+@@ -200,16 +350,14 @@
+ 
+     public async Task<List<Row>> StockItems(CancellationToken ct)
+     {
+-        var doc = await FetchCollection("StockItem", [
+-            "GUID","MASTERID","ALTERID",
+-            "NAME","PARENT","CATEGORY","BASEUNITS","OPENINGBALANCE","OPENINGVALUE",
+-            "OPENINGRATE","CLOSINGBALANCE","CLOSINGVALUE","CLOSINGRATE","GSTRATE",
+-            "HSNCODE","DESCRIPTION","ADDITIONALNAME"], ct);
++        var doc = await StockItemDocument(ct);
+         var rows = new List<Row>();
++        var bal = NewBalanceSource("stock_items");
+         foreach (var el in doc.Descendants("STOCKITEM"))
+         {
+             var name = Text(el, "NAME");
+             if (name.Length == 0) continue;
++            var guid = Text(el, "GUID");
+             rows.Add(new Row
+             {
+                 ["master_guid"] = Text(el, "GUID"),
+@@ -222,16 +370,19 @@
+                 ["opening_qty"] = Num(el, "OPENINGBALANCE"),
+                 ["opening_value"] = Num(el, "OPENINGVALUE"),
+                 ["opening_rate"] = Num(el, "OPENINGRATE"),
+-                ["closing_qty"] = Num(el, "CLOSINGBALANCE"),
+-                ["closing_value"] = Num(el, "CLOSINGVALUE"),
+-                ["closing_rate"] = Num(el, "CLOSINGRATE"),
++                ["closing_qty"] = bal.Get(el, guid, "CLOSINGBALANCE"),
++                ["closing_value"] = bal.Get(el, guid, "CLOSINGVALUE"),
++                ["closing_rate"] = bal.Get(el, guid, "CLOSINGRATE"),
++                ["balance_as_of"] = bal.AsOf,
+                 ["gst_rate"] = Num(el, "GSTRATE"),
+                 ["hsn_code"] = Text(el, "HSNCODE"),
+                 ["description"] = Text(el, "DESCRIPTION"),
+                 ["alias"] = Text(el, "ADDITIONALNAME"),
+             });
+         }
+-        log.LogInformation("Fetched {N} stock items", rows.Count);
++        PersistBalances("stock_items", bal);
++        log.LogInformation("Fetched {N} stock items (balances: {Mode})", rows.Count,
++            _fetchBalances ? "fresh from Tally" : "from last daily capture");
+         return rows;
+     }
+ 
+@@ -257,10 +408,7 @@
+     /// → RATEDETAILS.LIST; older Tally exposes flat GSTRATE/HSNCODE. Both handled.</summary>
+     public async Task<List<Row>> GstRates(CancellationToken ct)
+     {
+-        var doc = await FetchCollection("StockItem", [
+-            "GUID","MASTERID","ALTERID",
+-            "NAME","GSTRATE","HSNCODE","GSTAPPLICABLE","GSTTYPEOFSUPPLY",
+-            "TAXCLASSIFICATIONNAME","GSTDETAILS.LIST"], ct);
++        var doc = await StockItemDocument(ct);
+         var rows = new List<Row>();
+         foreach (var el in doc.Descendants("STOCKITEM"))
+         {
+@@ -310,9 +458,7 @@
+     /// <summary>Opening bill-wise balances from ledger BILLALLOCATIONS.</summary>
+     public async Task<List<Row>> OpeningBills(CancellationToken ct)
+     {
+-        var doc = await FetchCollection("Ledger",
+-            [
+-            "GUID","MASTERID","ALTERID","NAME","BILLALLOCATIONS.LIST"], ct);
++        var doc = await LedgerDocument(ct);
+         var rows = new List<Row>();
+         foreach (var el in doc.Descendants("LEDGER"))
+         {
+@@ -345,8 +491,7 @@
+ 
+     private async Task<List<Row>> StandardRates(string listTag, CancellationToken ct)
+     {
+-        var doc = await FetchCollection("StockItem", [
+-            "GUID","MASTERID","ALTERID","NAME", listTag], ct);
++        var doc = await StockItemDocument(ct);
+         var rows = new List<Row>();
+         foreach (var el in doc.Descendants("STOCKITEM"))
+         {
+@@ -366,4 +511,20 @@
+         }
+         return rows;
+     }
++
++    /// <summary>Bank ledger names (parent group containing "Bank") for the
++    /// bank-book fan-out — derived from the cycle's cached Ledger document,
++    /// no extra Tally request.</summary>
++    public async Task<HashSet<string>> BankLedgerNames(CancellationToken ct)
++    {
++        var doc = await LedgerDocument(ct);
++        var set = new HashSet<string>(StringComparer.Ordinal);
++        foreach (var el in doc.Descendants("LEDGER"))
++        {
++            var parent = Text(el, "PARENT");
++            if (parent.Contains("Bank", StringComparison.OrdinalIgnoreCase))
++                set.Add(Text(el, "NAME"));
++        }
++        return set;
++    }
+ }
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Tally/Extractors/ReportExtractor.cs agent/src/TallyAgent.Core/Tally/Extractors/ReportExtractor.cs
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Tally/Extractors/ReportExtractor.cs	2026-08-22 06:43:14.947028154 +0000
++++ agent/src/TallyAgent.Core/Tally/Extractors/ReportExtractor.cs	2026-08-22 07:01:52.530347905 +0000
+@@ -11,6 +11,37 @@
+ /// and does not assume report rows are direct children of the XML root.</summary>
+ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor> log)
+ {
++    // Snapshot reports are full-financial-year computations — the heaviest
++    // requests the agent makes. They get their own (longer) budget and are
++    // NEVER retried at the same size within a cycle: a timeout defers the
++    // snapshot to the next snapshot slot instead of queuing more work on Tally.
++    private Task<XDocument> PostReport(string envelope, CancellationToken ct) =>
++        client.PostAsync(envelope, client.SnapshotRequestTimeout, maxTimeoutRetries: 0, ct);
++
++    // Ledger closing balances as-of a date: shared by the two outstanding
++    // datasets and the trial-balance fallback (one Tally request per cycle
++    // instead of three).
++    private readonly SemaphoreSlim _cacheLock = new(1, 1);
++    private (DateOnly To, XDocument Doc)? _ledgerBalances;
++
++    public void BeginCycle() => EndCycle();
++    public void EndCycle() => _ledgerBalances = null;
++
++    private async Task<XDocument> LedgerBalancesDocument(DateOnly to, CancellationToken ct)
++    {
++        if (_ledgerBalances is { } c && c.To == to) return c.Doc;
++        await _cacheLock.WaitAsync(ct);
++        try
++        {
++            if (_ledgerBalances is { } c2 && c2.To == to) return c2.Doc;
++            var doc = await PostReport(TallyEnvelopes.Collection(
++                "Ledger", ["NAME", "PARENT", "CLOSINGBALANCE"], client.Company, null, to), ct);
++            _ledgerBalances = (to, doc);
++            return doc;
++        }
++        finally { _cacheLock.Release(); }
++    }
++
+     private static bool Is(XElement el, string localName) =>
+         el.Name.LocalName.Equals(localName, StringComparison.OrdinalIgnoreCase);
+ 
+@@ -26,7 +57,7 @@
+ 
+     public async Task<List<Row>> TrialBalance(DateOnly from, DateOnly to, CancellationToken ct)
+     {
+-        var doc = await client.PostAsync(
++        var doc = await PostReport(
+             TallyEnvelopes.Report("Trial Balance", from, to, client.Company), ct);
+         var rows = WalkNameAmountPairs(doc, (name, amtEl) =>
+         {
+@@ -55,8 +86,7 @@
+     private async Task<List<Row>> TrialBalanceFromLedgers(DateOnly from, DateOnly to, CancellationToken ct)
+     {
+         log.LogInformation("Trial balance report export was empty — falling back to dated Ledger collection");
+-        var doc = await client.PostAsync(TallyEnvelopes.Collection(
+-            "Ledger", ["NAME", "PARENT", "CLOSINGBALANCE"], client.Company, from, to), ct);
++        var doc = await LedgerBalancesDocument(to, ct);
+         var rows = new List<Row>();
+         foreach (var el in doc.Descendants().Where(e => Is(e, "LEDGER")))
+         {
+@@ -79,7 +109,7 @@
+ 
+     public async Task<List<Row>> BalanceSheet(DateOnly from, DateOnly to, CancellationToken ct)
+     {
+-        var doc = await client.PostAsync(
++        var doc = await PostReport(
+             TallyEnvelopes.Report("Balance Sheet", from, to, client.Company), ct);
+         var rows = WalkNameAmountPairs(doc, (name, amtEl) =>
+         {
+@@ -101,7 +131,7 @@
+ 
+     public async Task<List<Row>> ProfitLoss(DateOnly from, DateOnly to, CancellationToken ct)
+     {
+-        var doc = await client.PostAsync(
++        var doc = await PostReport(
+             TallyEnvelopes.Report("Profit and Loss A/c", from, to, client.Company), ct);
+         var rows = WalkNameAmountPairs(doc, (name, amtEl) =>
+         {
+@@ -128,7 +158,7 @@
+     {
+         log.LogInformation("{Report} report export was empty — falling back to dated Group collection",
+             revenueGroups ? "P&L" : "Balance sheet");
+-        var doc = await client.PostAsync(TallyEnvelopes.Collection(
++        var doc = await PostReport(TallyEnvelopes.Collection(
+             "Group", ["NAME", "PARENT", "ISREVENUE", "CLOSINGBALANCE"], client.Company, from, to), ct);
+         var rows = new List<Row>();
+         foreach (var el in doc.Descendants().Where(e => Is(e, "GROUP")))
+@@ -153,7 +183,7 @@
+ 
+     public async Task<List<Row>> StockSummary(DateOnly from, DateOnly to, CancellationToken ct)
+     {
+-        var doc = await client.PostAsync(
++        var doc = await PostReport(
+             TallyEnvelopes.Report("Stock Summary", from, to, client.Company), ct);
+         var rows = new List<Row>();
+         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+@@ -193,7 +223,7 @@
+     private async Task<List<Row>> StockSummaryFromItems(DateOnly from, DateOnly to, CancellationToken ct)
+     {
+         log.LogInformation("Stock summary report export was empty — falling back to dated StockItem collection");
+-        var doc = await client.PostAsync(TallyEnvelopes.Collection(
++        var doc = await PostReport(TallyEnvelopes.Collection(
+             "StockItem",
+             ["NAME", "PARENT", "OPENINGBALANCE", "OPENINGVALUE", "CLOSINGBALANCE", "CLOSINGVALUE"],
+             client.Company, from, to), ct);
+@@ -222,11 +252,11 @@
+         return rows;
+     }
+ 
+-    /// <summary>Outstanding = closing balances of ledgers under the given parent groups.</summary>
+-    public async Task<List<Row>> Outstanding(string parentGroupContains, CancellationToken ct)
++    /// <summary>Outstanding = closing balances (as of <paramref name="asOf"/>)
++    /// of ledgers under the given parent groups.</summary>
++    public async Task<List<Row>> Outstanding(string parentGroupContains, DateOnly asOf, CancellationToken ct)
+     {
+-        var doc = await client.PostAsync(
+-            TallyEnvelopes.Collection("Ledger", ["NAME", "PARENT", "CLOSINGBALANCE"], client.Company), ct);
++        var doc = await LedgerBalancesDocument(asOf, ct);
+         var rows = new List<Row>();
+         foreach (var el in doc.Descendants().Where(e => Is(e, "LEDGER")))
+         {
+@@ -244,21 +274,6 @@
+         return rows;
+     }
+ 
+-    /// <summary>Bank ledger names (parents containing "Bank") for bank-book fan-out.</summary>
+-    public async Task<HashSet<string>> BankLedgerNames(CancellationToken ct)
+-    {
+-        var doc = await client.PostAsync(
+-            TallyEnvelopes.Collection("Ledger", ["NAME", "PARENT"], client.Company), ct);
+-        var set = new HashSet<string>(StringComparer.Ordinal);
+-        foreach (var el in doc.Descendants().Where(e => Is(e, "LEDGER")))
+-        {
+-            var parent = Text(el, "PARENT");
+-            if (parent.Contains("Bank", StringComparison.OrdinalIgnoreCase))
+-                set.Add(Text(el, "NAME"));
+-        }
+-        return set;
+-    }
+-
+     private static XElement? FollowingSibling(XElement el)
+     {
+         var parent = el.Parent;
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Tally/Extractors/VoucherExtractor.cs agent/src/TallyAgent.Core/Tally/Extractors/VoucherExtractor.cs
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Tally/Extractors/VoucherExtractor.cs	2026-08-22 06:43:15.563028191 +0000
++++ agent/src/TallyAgent.Core/Tally/Extractors/VoucherExtractor.cs	2026-08-22 07:08:42.580734853 +0000
+@@ -47,7 +47,7 @@
+         // so they keep the full retry ladder.
+         var days = to.DayNumber - from.DayNumber + 1;
+         var doc = await client.PostAsync(
+-            TallyEnvelopes.VoucherCollection(from, to, client.Company),
++            TallyEnvelopes.VoucherCollection(from, to, client.Company, client.FetchLegacyVoucherLists),
+             requestTimeout: client.VoucherRequestTimeout,
+             maxTimeoutRetries: days > 1 ? 0 : null, ct);
+         var result = new DayBookResult();
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Tally/TallyClient.cs agent/src/TallyAgent.Core/Tally/TallyClient.cs
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Tally/TallyClient.cs	2026-08-22 06:43:12.851028029 +0000
++++ agent/src/TallyAgent.Core/Tally/TallyClient.cs	2026-08-22 07:08:42.592600746 +0000
+@@ -33,6 +33,19 @@
+ ///    so auto-reconnect now TCP-probes first and only re-sends the full
+ ///    request once the port answers again — no full-payload polling;
+ ///  • cancellation is never retried; all waits honour the caller token.
++///
++/// DRAIN-AFTER-TIMEOUT (v2.0.5):
++///  A client-side timeout only closes OUR socket — Tally keeps computing the
++///  abandoned export on its single XML thread. Sending the next request
++///  straight away (a retry, a split window, the next dataset) just queues it
++///  behind that work, times out again, and piles more abandoned work onto
++///  Tally: that cascade is what operators experienced as "Tally stuck". A TCP
++///  probe cannot detect it because the listener accepts connections while
++///  busy. So after ANY timeout the client sends a tiny CompanyList request
++///  with a long budget and waits for it to answer before anything else is
++///  sent: because Tally serves requests serially, that answer arrives only
++///  once the abandoned work has drained. If even the drain times out, the
++///  request fails NON-retryably and the cycle ends — Tally gets to recover.
+ /// </summary>
+ public sealed class TallyClient : IDisposable
+ {
+@@ -46,6 +59,10 @@
+     private readonly SemaphoreSlim _localGate;
+     private readonly string _gateLockPath;
+     private int _runRetryBudget = int.MaxValue;
++    /// <summary>Set when a request timed out; the next request must first
++    /// wait for Tally to finish the abandoned work.</summary>
++    private volatile bool _needsDrain;
++    private TimeSpan _lastTimedOutBudget = TimeSpan.Zero;
+ 
+     /// <summary>Injectable delay for deterministic offline tests (no real sleeps).</summary>
+     internal Func<TimeSpan, CancellationToken, Task> DelayAsync { get; set; } = Task.Delay;
+@@ -67,6 +84,8 @@
+     }
+ 
+     public string Company => _settings.Company;
++    public bool FetchLegacyVoucherLists => _settings.VoucherFetchLegacyLists;
++    public bool IncludeMasterBalances => _settings.IncludeMasterBalances;
+ 
+     /// <summary>Request budget for windowed voucher extraction — the heaviest
+     /// Tally call. Never below the general request timeout.</summary>
+@@ -74,6 +93,18 @@
+         TimeSpan.FromSeconds(Math.Max(_settings.RequestTimeoutSeconds,
+             _settings.VoucherTimeoutSeconds));
+ 
++    /// <summary>Request budget for full-financial-year snapshot reports.</summary>
++    public TimeSpan SnapshotRequestTimeout =>
++        TimeSpan.FromSeconds(Math.Max(_settings.RequestTimeoutSeconds,
++            _settings.SnapshotTimeoutSeconds));
++
++    /// <summary>True while Tally is believed to still be working on a request
++    /// the agent abandoned (timed out). Cleared by a successful drain.</summary>
++    public bool NeedsDrain => _needsDrain;
++
++    /// <summary>Injectable "is this the drain probe" marker for tests.</summary>
++    internal const string DrainEnvelopeId = "<ID>CompanyList</ID>";
++
+     /// <summary>Arm the per-run retry budget (call at the start of each sync
+     /// cycle). Every timeout-retry and reconnect-resend debits it; when it is
+     /// exhausted the current request fails with a NON-retryable TallyTimeout so
+@@ -174,11 +205,13 @@
+         while (true)
+         {
+             ct.ThrowIfCancellationRequested(); // cancellation is never retried (§F6)
++            if (_needsDrain)
++                await DrainAsync(ct); // throws non-retryable TallyTimeout if Tally is still busy
+             try
+             {
+                 return await PostOnceAsync(envelope, requestTimeout, ct);
+             }
+-            catch (TallyException tex) when (tex.Category == ErrorCategory.TallyTimeout)
++            catch (TallyException tex) when (tex.Category == ErrorCategory.TallyTimeout && !tex.IsRunEnding)
+             {
+                 if (timeoutAttempt >= timeoutRetries)
+                     throw;
+@@ -217,6 +250,9 @@
+                     await DelayAsync(reconnectDelay, ct);
+                     if (await TryTcpProbeAsync(ct)) break;
+                 } while (DateTime.UtcNow < reconnectDeadline);
++                // The listener being up does not mean Tally is idle — make the
++                // next send wait for a real (cheap) answer first.
++                _needsDrain = true;
+             }
+         }
+     }
+@@ -226,6 +262,21 @@
+     private async Task<XDocument> PostOnceAsync(string envelope, TimeSpan? requestTimeout,
+         CancellationToken ct)
+     {
++        try
++        {
++            return await PostOnceCoreAsync(envelope, requestTimeout, ct);
++        }
++        finally
++        {
++            // Pause after success AND failure (a timed-out Tally needs the gap most).
++            if (!ct.IsCancellationRequested)
++                await PauseAfterRequestAsync(ct);
++        }
++    }
++
++    private async Task<XDocument> PostOnceCoreAsync(string envelope, TimeSpan? requestTimeout,
++        CancellationToken ct)
++    {
+         var budget = requestTimeout
+             ?? TimeSpan.FromSeconds(Math.Max(1, _settings.RequestTimeoutSeconds));
+ 
+@@ -251,12 +302,18 @@
+                 using var content = new ByteArrayContent(Encoding.UTF8.GetBytes(envelope));
+                 content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("text/xml");
+                 using var request = new HttpRequestMessage(HttpMethod.Post, _settings.BaseUri) { Content = content };
++                // Tally's HTTP server is happiest with one connection per request;
++                // a lingering keep-alive socket can hold its request slot.
++                request.Headers.ConnectionClose = true;
+                 resp = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token);
+                 body = await ReadBoundedBodyAsync(resp, timeoutCts.Token);
+             }
+             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+             {
+                 resp?.Dispose(); // connection not pinned while the retry loop runs
++                // Tally is still working on what we just abandoned.
++                _needsDrain = true;
++                _lastTimedOutBudget = budget;
+                 throw new TallyException(ErrorCategory.TallyTimeout,
+                     $"Tally request timed out after {(int)budget.TotalSeconds}s " +
+                     $"({_settings.Host}:{_settings.Port}).");
+@@ -275,8 +332,18 @@
+             using (resp)
+             {
+                 if (!resp.IsSuccessStatusCode)
+-                    throw new TallyException(ErrorCategory.TallyPortUnavailable,
+-                        $"Tally returned HTTP {(int)resp.StatusCode} on {_settings.Host}:{_settings.Port}.");
++                {
++                    var code = (int)resp.StatusCode;
++                    // 5xx / 503 = Tally busy or restarting → transient (reconnect path).
++                    // 4xx = the request itself was rejected → permanent; retrying or
++                    // "reconnecting" for 30 minutes would only hammer Tally.
++                    if (code >= 500)
++                        throw new TallyException(ErrorCategory.TallyPortUnavailable,
++                            $"Tally returned HTTP {code} on {_settings.Host}:{_settings.Port}.");
++                    throw new TallyException(ErrorCategory.TallyInvalidXml,
++                        $"Tally rejected the request with HTTP {code} on {_settings.Host}:{_settings.Port} " +
++                        "(not retried — check the TDL/collection or Tally build).");
++                }
+             }
+ 
+             try
+@@ -297,6 +364,40 @@
+         }
+     }
+ 
++    /// <summary>Wait for Tally to finish work abandoned by a timed-out request
++    /// (see class summary). Budget: twice the budget that expired, at least
++    /// 60 s, at most 10 min. Does not debit the retry budget — it sends no
++    /// real work. A drain that itself times out fails NON-retryably so the
++    /// current run ends and Tally is left alone until the next cycle.</summary>
++    private async Task DrainAsync(CancellationToken ct)
++    {
++        var budget = TimeSpan.FromSeconds(Math.Clamp(_lastTimedOutBudget.TotalSeconds * 2, 60, 600));
++        _log.LogWarning("Waiting up to {Budget:F0}s for Tally to finish the request the agent abandoned before sending more work",
++            budget.TotalSeconds);
++        try
++        {
++            await PostOnceAsync(TallyEnvelopes.CompanyList(), budget, ct);
++            _needsDrain = false;
++            _log.LogInformation("Tally is responsive again — resuming");
++        }
++        catch (TallyException tex) when (tex.Category == ErrorCategory.TallyTimeout)
++        {
++            // Still busy after a generous wait: end this run cleanly. The flag
++            // stays set so the NEXT cycle also drains before doing anything.
++            throw new TallyException(ErrorCategory.TallyTimeout,
++                $"Tally is still busy {budget.TotalSeconds:F0}s after a timed-out request — ending this " +
++                "sync cycle so Tally can recover; the run resumes from its checkpoint next cycle.", tex)
++            { IsRunEnding = true };
++        }
++    }
++
++    /// <summary>Give the Tally UI thread a slice after every request. Applied
++    /// OUTSIDE the gates so other processes are not blocked by our pause.</summary>
++    private Task PauseAfterRequestAsync(CancellationToken ct) =>
++        _settings.RequestPauseSeconds > 0
++            ? DelayAsync(TimeSpan.FromSeconds(_settings.RequestPauseSeconds), ct)
++            : Task.CompletedTask;
++
+     /// <summary>Exclusive lock file shared by service, Manager and CLI so a
+     /// diagnostics probe can never hit Tally while an extraction is in flight.
+     /// Crash-safe: the OS releases the handle when the holder exits.</summary>
+@@ -371,7 +472,8 @@
+         if (_runRetryBudget <= 0)
+             throw new TallyException(ErrorCategory.TallyTimeout,
+                 "Per-run Tally retry budget exhausted — ending this sync cycle so Tally can " +
+-                $"recover; the run resumes from its checkpoint next cycle. Last error: {cause.Message}");
++                $"recover; the run resumes from its checkpoint next cycle. Last error: {cause.Message}")
++            { IsRunEnding = true };
+         _runRetryBudget--;
+     }
+ 
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Tally/TallyEnvelopes.cs agent/src/TallyAgent.Core/Tally/TallyEnvelopes.cs
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Tally/TallyEnvelopes.cs	2026-08-22 06:43:12.871028031 +0000
++++ agent/src/TallyAgent.Core/Tally/TallyEnvelopes.cs	2026-08-22 07:00:48.804365095 +0000
+@@ -61,7 +61,8 @@
+     /// extractor still validates each voucher's DATE client-side, so any
+     /// out-of-window voucher a Tally build might leak is skipped and logged.
+     /// </summary>
+-    public static string VoucherCollection(DateOnly from, DateOnly to, string? company)
++    public static string VoucherCollection(DateOnly from, DateOnly to, string? company,
++        bool includeLegacyLists = false)
+     {
+         var sb = new StringBuilder(4096);
+         sb.Append("<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>")
+@@ -76,18 +77,50 @@
+ 
+         sb.Append("</STATICVARIABLES><TDL><TDLMESSAGE>")
+           .Append("<COLLECTION NAME=\"AgentVoucherCollection\"><TYPE>Voucher</TYPE>")
+-          .Append("<FETCH>DATE,VOUCHERTYPENAME,VOUCHERNUMBER,REFERENCE,NARRATION,PARTYLEDGERNAME,GUID,MASTERID,ALTERID,ISCANCELLED,ISOPTIONAL,AMOUNT</FETCH>")
+-          // Explicit dotted sub-object fields ONLY (the exact set the extractor
+-          // reads). Wildcard fetches (ALLLEDGERENTRIES.* etc.) made Tally
+-          // serialize EVERY field of EVERY nested object — including deep GST/
+-          // tax structures nobody consumed — which is what froze the Tally UI
+-          // during extraction. Same technique as tally-database-loader.
+-          .Append("<FETCH>ALLLEDGERENTRIES.LEDGERNAME,ALLLEDGERENTRIES.AMOUNT,ALLLEDGERENTRIES.ISDEEMEDPOSITIVE,LEDGERENTRIES.LEDGERNAME,LEDGERENTRIES.AMOUNT,LEDGERENTRIES.ISDEEMEDPOSITIVE</FETCH>")
+-          .Append("<FETCH>ALLLEDGERENTRIES.BILLALLOCATIONS.NAME,ALLLEDGERENTRIES.BILLALLOCATIONS.AMOUNT,ALLLEDGERENTRIES.BILLALLOCATIONS.BILLTYPE,LEDGERENTRIES.BILLALLOCATIONS.NAME,LEDGERENTRIES.BILLALLOCATIONS.AMOUNT,LEDGERENTRIES.BILLALLOCATIONS.BILLTYPE</FETCH>")
+-          .Append("<FETCH>ALLLEDGERENTRIES.BANKALLOCATIONS.TRANSACTIONTYPE,ALLLEDGERENTRIES.BANKALLOCATIONS.INSTRUMENTDATE,ALLLEDGERENTRIES.BANKALLOCATIONS.INSTRUMENTNUMBER,ALLLEDGERENTRIES.BANKALLOCATIONS.BANKNAME,ALLLEDGERENTRIES.BANKALLOCATIONS.AMOUNT,ALLLEDGERENTRIES.BANKALLOCATIONS.BANKERSDATE,LEDGERENTRIES.BANKALLOCATIONS.TRANSACTIONTYPE,LEDGERENTRIES.BANKALLOCATIONS.INSTRUMENTDATE,LEDGERENTRIES.BANKALLOCATIONS.INSTRUMENTNUMBER,LEDGERENTRIES.BANKALLOCATIONS.BANKNAME,LEDGERENTRIES.BANKALLOCATIONS.AMOUNT,LEDGERENTRIES.BANKALLOCATIONS.BANKERSDATE</FETCH>")
+-          .Append("<FETCH>ALLLEDGERENTRIES.COSTCENTREALLOCATIONS.NAME,ALLLEDGERENTRIES.COSTCENTREALLOCATIONS.AMOUNT,ALLLEDGERENTRIES.CATEGORYALLOCATIONS.CATEGORY,ALLLEDGERENTRIES.CATEGORYALLOCATIONS.COSTCENTREALLOCATIONS.NAME,ALLLEDGERENTRIES.CATEGORYALLOCATIONS.COSTCENTREALLOCATIONS.AMOUNT,LEDGERENTRIES.COSTCENTREALLOCATIONS.NAME,LEDGERENTRIES.COSTCENTREALLOCATIONS.AMOUNT,LEDGERENTRIES.CATEGORYALLOCATIONS.CATEGORY,LEDGERENTRIES.CATEGORYALLOCATIONS.COSTCENTREALLOCATIONS.NAME,LEDGERENTRIES.CATEGORYALLOCATIONS.COSTCENTREALLOCATIONS.AMOUNT</FETCH>")
+-          .Append("<FETCH>ALLINVENTORYENTRIES.STOCKITEMNAME,ALLINVENTORYENTRIES.ACTUALQTY,ALLINVENTORYENTRIES.RATE,ALLINVENTORYENTRIES.AMOUNT,ALLINVENTORYENTRIES.GODOWNNAME,ALLINVENTORYENTRIES.BATCHALLOCATIONS.GODOWNNAME,INVENTORYENTRIES.STOCKITEMNAME,INVENTORYENTRIES.ACTUALQTY,INVENTORYENTRIES.RATE,INVENTORYENTRIES.AMOUNT,INVENTORYENTRIES.GODOWNNAME,INVENTORYENTRIES.BATCHALLOCATIONS.GODOWNNAME</FETCH>")
+-          .Append("</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>");
++          .Append("<FETCH>DATE,VOUCHERTYPENAME,VOUCHERNUMBER,REFERENCE,NARRATION,PARTYLEDGERNAME,GUID,MASTERID,ALTERID,ISCANCELLED,ISOPTIONAL,AMOUNT</FETCH>");
++
++        // Explicit dotted sub-object fields ONLY (the exact set the extractor
++        // reads). Wildcard fetches (ALLLEDGERENTRIES.* etc.) made Tally
++        // serialize EVERY field of EVERY nested object — including deep GST/
++        // tax structures nobody consumed — which is what froze the Tally UI
++        // during extraction. Same technique as tally-database-loader.
++        //
++        // v2.0.5: ONLY the ALL*ENTRIES shape is requested by default. v2.0.3/4
++        // also fetched the legacy LEDGERENTRIES/INVENTORYENTRIES lists, which
++        // made Tally serialize every line TWICE (the extractor then threw one
++        // copy away). Old builds that lack ALL*ENTRIES can opt in via
++        // tally.voucherFetchLegacyLists.
++        var prefixes = includeLegacyLists
++            ? new[] { ("ALLLEDGERENTRIES", "ALLINVENTORYENTRIES"), ("LEDGERENTRIES", "INVENTORYENTRIES") }
++            : new[] { ("ALLLEDGERENTRIES", "ALLINVENTORYENTRIES") };
++
++        foreach (var (led, inv) in prefixes)
++        {
++            sb.Append("<FETCH>")
++              .Append(led).Append(".LEDGERNAME,").Append(led).Append(".AMOUNT,").Append(led).Append(".ISDEEMEDPOSITIVE")
++              .Append("</FETCH>");
++            sb.Append("<FETCH>")
++              .Append(led).Append(".BILLALLOCATIONS.NAME,").Append(led).Append(".BILLALLOCATIONS.AMOUNT,")
++              .Append(led).Append(".BILLALLOCATIONS.BILLTYPE")
++              .Append("</FETCH>");
++            sb.Append("<FETCH>")
++              .Append(led).Append(".BANKALLOCATIONS.TRANSACTIONTYPE,").Append(led).Append(".BANKALLOCATIONS.INSTRUMENTDATE,")
++              .Append(led).Append(".BANKALLOCATIONS.INSTRUMENTNUMBER,").Append(led).Append(".BANKALLOCATIONS.BANKNAME,")
++              .Append(led).Append(".BANKALLOCATIONS.AMOUNT,").Append(led).Append(".BANKALLOCATIONS.BANKERSDATE")
++              .Append("</FETCH>");
++            sb.Append("<FETCH>")
++              .Append(led).Append(".COSTCENTREALLOCATIONS.NAME,").Append(led).Append(".COSTCENTREALLOCATIONS.AMOUNT,")
++              .Append(led).Append(".CATEGORYALLOCATIONS.CATEGORY,")
++              .Append(led).Append(".CATEGORYALLOCATIONS.COSTCENTREALLOCATIONS.NAME,")
++              .Append(led).Append(".CATEGORYALLOCATIONS.COSTCENTREALLOCATIONS.AMOUNT")
++              .Append("</FETCH>");
++            sb.Append("<FETCH>")
++              .Append(inv).Append(".STOCKITEMNAME,").Append(inv).Append(".ACTUALQTY,").Append(inv).Append(".RATE,")
++              .Append(inv).Append(".AMOUNT,").Append(inv).Append(".GODOWNNAME,").Append(inv).Append(".BATCHALLOCATIONS.GODOWNNAME")
++              .Append("</FETCH>");
++        }
++
++        sb.Append("</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>");
+         return sb.ToString();
+     }
+ 
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Tally/TallyException.cs agent/src/TallyAgent.Core/Tally/TallyException.cs
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Core/Tally/TallyException.cs	2026-08-22 06:55:00.769241183 +0000
++++ agent/src/TallyAgent.Core/Tally/TallyException.cs	2026-08-22 07:00:24.581260432 +0000
+@@ -7,4 +7,10 @@
+     : Exception(message, inner)
+ {
+     public ErrorCategory Category { get; } = category;
++
++    /// <summary>True when the failure means "stop talking to Tally for this
++    /// run" (retry budget exhausted, Tally still busy after a drain wait).
++    /// Callers must not retry, split windows, or move on to the next dataset —
++    /// the cycle ends and resumes from checkpoints next time.</summary>
++    public bool IsRunEnding { get; init; }
+ }
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Service/Program.cs agent/src/TallyAgent.Service/Program.cs
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Service/Program.cs	2026-08-22 06:43:19.919028450 +0000
++++ agent/src/TallyAgent.Service/Program.cs	2026-08-22 07:53:47.790775164 +0000
+@@ -82,6 +82,7 @@
+         builder.Services.AddSingleton<CheckpointRepository>();
+         builder.Services.AddSingleton<ErrorLogRepository>();
+         builder.Services.AddSingleton<HeartbeatRepository>();
++        builder.Services.AddSingleton<MasterBalanceRepository>();
+         builder.Services.AddSingleton(sp => new TallyClient(config.Tally,
+             sp.GetRequiredService<ILogger<TallyClient>>()));
+         builder.Services.AddSingleton<MasterExtractor>();
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Service/Workers/SyncWorker.cs agent/src/TallyAgent.Service/Workers/SyncWorker.cs
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/src/TallyAgent.Service/Workers/SyncWorker.cs	2026-08-22 06:43:18.403028359 +0000
++++ agent/src/TallyAgent.Service/Workers/SyncWorker.cs	2026-08-22 07:08:42.618546583 +0000
+@@ -39,6 +39,9 @@
+             var manual = ConsumeTrigger("sync-now") || forceFull;
+             if (DateTime.UtcNow >= nextRun || manual)
+             {
++                // Provisional (in case the cycle crashes before the finally
++                // below); the real next-run time is computed AFTER the cycle
++                // ends so Tally always gets a full idle interval between cycles.
+                 nextRun = DateTime.UtcNow + interval;
+                 state.LastAttemptedSyncUtc = DateTime.UtcNow.ToString("O");
+                 try
+@@ -94,6 +97,12 @@
+                 finally
+                 {
+                     state.CurrentOperation = "idle";
++                    // v2.0.5: schedule from the END of the cycle, not the start.
++                    // v2.0.4 computed nextRun before running, so any cycle longer
++                    // than the interval was followed by another one immediately —
++                    // Tally never got an idle gap during office hours.
++                    nextRun = DateTime.UtcNow + interval;
++                    log.LogInformation("Next scheduled sync at {Next:HH:mm:ss} UTC", nextRun);
+                 }
+             }
+ 
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/tests/TallyAgent.Core.Tests/BatchQueueTests.cs agent/tests/TallyAgent.Core.Tests/BatchQueueTests.cs
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/tests/TallyAgent.Core.Tests/BatchQueueTests.cs	2026-08-22 06:55:04.973241433 +0000
++++ agent/tests/TallyAgent.Core.Tests/BatchQueueTests.cs	2026-08-22 07:53:47.803204114 +0000
+@@ -252,7 +252,7 @@
+         using var cmd2 = conn.CreateCommand();
+         cmd2.CommandText = "SELECT content_checksum FROM upload_batches LIMIT 0";
+         cmd2.ExecuteReader();                                                // v3 column present
+-        Assert.Equal(4, AgentDatabase.CurrentSchemaVersion);
++        Assert.Equal(5, AgentDatabase.CurrentSchemaVersion);
+     }
+ }
+ 
+Only in agent/tests/TallyAgent.Core.Tests: MasterBalanceTests.cs
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/tests/TallyAgent.Core.Tests/TallyEnvelopeTests.cs agent/tests/TallyAgent.Core.Tests/TallyEnvelopeTests.cs
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/tests/TallyAgent.Core.Tests/TallyEnvelopeTests.cs	2026-08-22 06:55:07.605241590 +0000
++++ agent/tests/TallyAgent.Core.Tests/TallyEnvelopeTests.cs	2026-08-22 07:04:59.743149691 +0000
+@@ -43,4 +43,24 @@
+ 
+         Assert.Contains("<SVCURRENTCOMPANY>A &amp; B &lt;India&gt;</SVCURRENTCOMPANY>", xml);
+     }
++
++    [Fact]
++    public void VoucherCollection_RequestsOnlyTheAllEntriesShape_ByDefault()
++    {
++        // v2.0.3/4 fetched both ALLLEDGERENTRIES.* and LEDGERENTRIES.* (and both
++        // inventory shapes): Tally serialized every line twice and the
++        // extractor discarded one copy. Only the ALL* shape is requested now.
++        var xml = TallyEnvelopes.VoucherCollection(new DateOnly(2026, 8, 1), new DateOnly(2026, 8, 7), "Co");
++        Assert.Contains("ALLLEDGERENTRIES.LEDGERNAME", xml);
++        Assert.Contains("ALLINVENTORYENTRIES.STOCKITEMNAME", xml);
++        Assert.DoesNotContain(",LEDGERENTRIES.", xml);
++        Assert.DoesNotContain(">LEDGERENTRIES.", xml);
++        Assert.DoesNotContain(",INVENTORYENTRIES.", xml);
++        Assert.DoesNotContain(">INVENTORYENTRIES.", xml);
++
++        var legacy = TallyEnvelopes.VoucherCollection(new DateOnly(2026, 8, 1), new DateOnly(2026, 8, 7), "Co",
++            includeLegacyLists: true);
++        Assert.Contains(">LEDGERENTRIES.LEDGERNAME", legacy);
++        Assert.Contains(">INVENTORYENTRIES.STOCKITEMNAME", legacy);
++    }
+ }
+diff -ru -x publish /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/tests/TallyAgent.Core.Tests/TallyGateTests.cs agent/tests/TallyAgent.Core.Tests/TallyGateTests.cs
+--- /mnt/user-data/uploads/tally-agent-v2.0.4-server-protection/tests/TallyAgent.Core.Tests/TallyGateTests.cs	2026-08-22 06:55:07.725241597 +0000
++++ agent/tests/TallyAgent.Core.Tests/TallyGateTests.cs	2026-08-22 07:08:42.636321732 +0000
+@@ -72,24 +72,30 @@
+         Assert.Equal(1, handler.MaxConcurrent);              // §D: single-flight
+     }
+ 
++    private static bool IsDrain(HttpRequestMessage req) =>
++        req.Content!.ReadAsStringAsync().Result.Contains(TallyClient.DrainEnvelopeId);
++
+     [Fact]
+-    public async Task Timeout_ReleasesGate_AndBudgetBoundsRetries()
++    public async Task Timeout_WhenTallyStaysBusy_EndsRunAfterOneDrainWait_WithoutHammering()
+     {
++        // v2.0.5: a never-responding Tally is NOT retried 10/30/60s — that only
++        // queued more abandoned work on Tally's single thread. One timed-out
++        // request + one drain probe, then the run ends (non-retryable).
+         var handler = new FakeHandler(async (_, ct) =>
+         {
+             await Task.Delay(Timeout.InfiniteTimeSpan, ct);  // never responds
+             throw new UnreachableException();
+         });
+         using var client = NewClient(handler, s => s.RequestTimeoutSeconds = 10);
+-        client.ResetRunBudget(2);                            // per-run budget: 2 retries
++        client.ResetRunBudget(2);
+ 
+-        // Ladder allows up to 3 retries, but the run budget stops it at 2:
+-        // attempts = 1 initial + 2 budgeted retries = 3 calls, then exhaustion.
+         var ex = await Assert.ThrowsAsync<TallyException>(() =>
+             client.PostAsync("<ENVELOPE/>", TimeSpan.FromMilliseconds(50), 3, CancellationToken.None));
+         Assert.Equal(ErrorCategory.TallyTimeout, ex.Category);
+-        Assert.Contains("budget exhausted", ex.Message);
+-        Assert.Equal(3, handler.Calls);
++        Assert.True(ex.IsRunEnding);
++        Assert.Contains("still busy", ex.Message);
++        Assert.Equal(2, handler.Calls);                      // request + drain, nothing more
++        Assert.True(client.NeedsDrain);                      // next cycle drains first too
+ 
+         // Gate released: a healthy follow-up request succeeds immediately.
+         var healthy = new FakeHandler((_, _) => Task.FromResult(Xml("<ENVELOPE><OK/></ENVELOPE>")));
+@@ -98,6 +104,89 @@
+     }
+ 
+     [Fact]
++    public async Task Timeout_ThenTallyRecovers_DrainsBeforeRetry_AndSucceeds()
++    {
++        // 1st call: hangs (times out). Drain probe: answers (Tally finished the
++        // abandoned work). Retry: answers. Exactly one drain between them.
++        var seq = 0;
++        var handler = new FakeHandler(async (req, ct) =>
++        {
++            var n = Interlocked.Increment(ref seq);
++            if (n == 1) { await Task.Delay(Timeout.InfiniteTimeSpan, ct); throw new UnreachableException(); }
++            if (n == 2) { Assert.True(IsDrain(req)); return Xml("<ENVELOPE><NAME>Co</NAME></ENVELOPE>"); }
++            Assert.False(IsDrain(req));
++            return Xml("<ENVELOPE><OK/></ENVELOPE>");
++        });
++        using var client = NewClient(handler, s => s.RequestTimeoutSeconds = 10);
++        client.ResetRunBudget(5);
++
++        var doc = await client.PostAsync("<ENVELOPE/>", TimeSpan.FromMilliseconds(50), 3, CancellationToken.None);
++        Assert.NotNull(doc);
++        Assert.Equal(3, handler.Calls);
++        Assert.False(client.NeedsDrain);
++    }
++
++    [Fact]
++    public async Task Timeout_RunBudgetExhausted_EndsRun()
++    {
++        // Budget 0: the first timeout may not be retried even though Tally
++        // would answer the drain — the run ends and resumes next cycle.
++        var seq = 0;
++        var handler = new FakeHandler(async (req, ct) =>
++        {
++            if (Interlocked.Increment(ref seq) == 1) { await Task.Delay(Timeout.InfiniteTimeSpan, ct); }
++            return Xml("<ENVELOPE><OK/></ENVELOPE>");
++        });
++        using var client = NewClient(handler, s => s.RequestTimeoutSeconds = 10);
++        client.ResetRunBudget(0);
++        var ex = await Assert.ThrowsAsync<TallyException>(() =>
++            client.PostAsync("<ENVELOPE/>", TimeSpan.FromMilliseconds(50), 3, CancellationToken.None));
++        Assert.True(ex.IsRunEnding);
++        Assert.Contains("budget exhausted", ex.Message);
++    }
++
++    [Fact]
++    public async Task ClientError4xx_IsNotRetried()
++    {
++        var handler = new FakeHandler((_, _) => Task.FromResult(
++            new HttpResponseMessage(HttpStatusCode.BadRequest) { Content = new StringContent("bad TDL") }));
++        using var client = NewClient(handler);
++        var ex = await Assert.ThrowsAsync<TallyException>(() =>
++            client.PostAsync("<ENVELOPE/>", CancellationToken.None));
++        Assert.Equal(ErrorCategory.TallyInvalidXml, ex.Category);
++        Assert.Equal(1, handler.Calls);                      // no 30-minute "reconnect" loop
++    }
++
++    [Fact]
++    public async Task EveryRequest_IsFollowedByTheConfiguredPause()
++    {
++        var pauses = new List<TimeSpan>();
++        var handler = new FakeHandler((_, _) => Task.FromResult(Xml("<ENVELOPE><OK/></ENVELOPE>")));
++        var settings = new TallySettings { RequestTimeoutSeconds = 10, GateWaitSeconds = 5, RequestPauseSeconds = 7 };
++        using var client = new TallyClient(settings, NullLogger<TallyClient>.Instance,
++            new HttpClient(handler), _lockDir)
++        { DelayAsync = (d, _) => { pauses.Add(d); return Task.CompletedTask; } };
++        await client.PostAsync("<ENVELOPE/>", CancellationToken.None);
++        await client.PostAsync("<ENVELOPE/>", CancellationToken.None);
++        Assert.Equal(2, pauses.Count(p => p == TimeSpan.FromSeconds(7)));
++    }
++
++    [Fact]
++    public async Task ConcurrencySetting_IsAlwaysEffectivelyOne()
++    {
++        Assert.Equal(1, new TallySettings { MaxConcurrentTallyRequests = 2 }.EffectiveMaxConcurrentTallyRequests);
++        var handler = new FakeHandler(async (_, ct) =>
++        {
++            await Task.Delay(30, ct);
++            return Xml("<ENVELOPE><OK/></ENVELOPE>");
++        });
++        using var client = NewClient(handler, s => s.MaxConcurrentTallyRequests = 2);
++        await Task.WhenAll(Enumerable.Range(0, 6)
++            .Select(_ => client.PostAsync("<ENVELOPE/>", CancellationToken.None)));
++        Assert.Equal(1, handler.MaxConcurrent);
++    }
++
++    [Fact]
+     public async Task TransientHttpFailure_ReleasesGate_AndRecoversViaProbeFirstReconnect()
+     {
+         // A real loopback listener lets the probe-first reconnect succeed
+@@ -116,10 +205,11 @@
+                     : Task.FromResult(Xml("<ENVELOPE><OK/></ENVELOPE>")));
+             using var client = NewClient(handler, s => { s.Host = "127.0.0.1"; s.Port = port; });
+ 
+-            // HTTP 500 → transient path → probe (listener answers) → single re-send → OK.
++            // HTTP 500 → transient path → TCP probe (listener answers) → drain
++            // probe (Tally may be busy even though the port is up) → re-send → OK.
+             var doc = await client.PostAsync("<ENVELOPE/>", CancellationToken.None);
+             Assert.NotNull(doc);
+-            Assert.Equal(2, handler.Calls);
++            Assert.Equal(3, handler.Calls);
+ 
+             // Gate is free afterwards: an immediate follow-up succeeds.
+             Assert.NotNull(await client.PostAsync("<ENVELOPE/>", CancellationToken.None));
+Only in agent/tests/TallyAgent.Core.Tests: WindowReChunkTests.cs
