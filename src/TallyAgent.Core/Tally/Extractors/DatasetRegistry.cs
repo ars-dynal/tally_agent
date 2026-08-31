@@ -79,7 +79,7 @@ public static class DatasetRegistry
         {
             DatasetKind.Master => s.EnableMasters,
             DatasetKind.Voucher => s.EnableVouchers,
-            DatasetKind.Snapshot => true,
+            DatasetKind.Snapshot => s.EnableSnapshots,
             _ => true,
         };
     }

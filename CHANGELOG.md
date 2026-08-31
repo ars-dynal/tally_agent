@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.0.7 - Snapshot reports can be turned off
+
+Found while running the first year-by-year back-fill: the six snapshot reports
+were hard-wired on, and "Re-extract Whole Range" forces all of them to run.
+Each asks Tally to compute a whole financial year, and `balance_sheet` reliably
+burns its full 300s timeout - roughly 20 minutes of dead time per run, which a
+seven-year back-fill would have paid seven times over.
+
+* **New setting `enableSnapshots`** (default `true`, so nothing changes for
+  existing installs). `DatasetRegistry` now gates `DatasetKind.Snapshot` on it
+  instead of returning `true` unconditionally.
+* **New "Snapshot reports" checkbox** in the configuration window.
+* Turn it OFF on a back-fill machine: the ledgers and vouchers the reports are
+  derived from are still extracted, so nothing is lost that cannot be computed
+  downstream. Leave it ON where the daily 20:00 snapshot is wanted.
+* Three new tests: on by default; off removes exactly those six datasets and
+  nothing else; the master/voucher toggles are unaffected. 75 passing.
+
 ## 2.0.6 - Year-by-year backfill, and a console that shows what is happening
 
 Two problems this release fixes, both reported from the field: there was no way
