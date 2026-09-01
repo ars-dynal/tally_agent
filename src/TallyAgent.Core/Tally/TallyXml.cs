@@ -24,6 +24,16 @@ public static partial class TallyXml
     [GeneratedRegex(@"[^\d.\-]")]
     private static partial Regex NonNumeric();
 
+    /// <summary>A namespace-prefixed element or attribute name: the "UDF" in
+    /// &lt;UDF:FIELD&gt; or in UDF:attr="x".</summary>
+    [GeneratedRegex(@"[<\s]/?([A-Za-z_][\w.\-]*):[A-Za-z_]")]
+    private static partial Regex PrefixedName();
+
+    /// <summary>The document's first real element start tag, skipping the XML
+    /// declaration, comments and processing instructions.</summary>
+    [GeneratedRegex(@"<[A-Za-z_][\w.\-]*(?:\s[^>]*)?>")]
+    private static partial Regex RootStartTag();
+
     /// <summary>Decode + scrub a raw Tally response into parseable XML text.</summary>
     public static string Sanitize(byte[] raw)
     {
@@ -38,7 +48,43 @@ public static partial class TallyXml
         text = BadDecEntity().Replace(text, "");
         text = BadHexEntity().Replace(text, "");
         text = IllegalChars().Replace(text, "");
+        text = DeclareUndeclaredPrefixes(text);
         return text;
+    }
+
+    /// <summary>
+    /// Tally serialises user-defined fields with a namespace prefix - e.g.
+    /// &lt;UDF:MYFIELD&gt; - but never declares the namespace. That makes the
+    /// ENTIRE response invalid XML, so one custom field on one voucher costs a
+    /// whole extraction window (observed: March 2026 vouchers, "'UDF' is an
+    /// undeclared prefix"). Declaring every used-but-undeclared prefix on the
+    /// root element makes the document parseable while leaving every element
+    /// name the extractors read completely untouched - they look up unprefixed
+    /// names, which are unaffected. Over-declaring a prefix is harmless.
+    /// </summary>
+    internal static string DeclareUndeclaredPrefixes(string text)
+    {
+        var prefixes = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (Match m in PrefixedName().Matches(text))
+        {
+            var prefix = m.Groups[1].Value;
+            if (prefix is "xml" or "xmlns") continue;
+            if (text.Contains($"xmlns:{prefix}=", StringComparison.Ordinal)) continue;
+            prefixes.Add(prefix);
+        }
+        if (prefixes.Count == 0) return text;
+
+        var root = RootStartTag().Match(text);
+        if (!root.Success) return text;
+
+        var declarations = new StringBuilder();
+        foreach (var prefix in prefixes)
+            declarations.Append(" xmlns:").Append(prefix)
+                        .Append("=\"urn:tally:udf:").Append(prefix).Append('"');
+
+        // Insert before the tag's closing ">" (or "/>" for an empty root).
+        var closing = root.Value.EndsWith("/>", StringComparison.Ordinal) ? 2 : 1;
+        return text.Insert(root.Index + root.Length - closing, declarations.ToString());
     }
 
     public static XDocument Parse(byte[] raw)

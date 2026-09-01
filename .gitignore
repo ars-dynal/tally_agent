@@ -6,3 +6,4 @@ dist/
 .vs/
 TestResults/
 TestResults/
+release-v*/
