@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.0.8 - Undeclared namespace prefixes no longer lose a whole window
+
+Found during the seven-year back-fill: the March 2026 voucher window failed with
+`TallyInvalidXml: 'UDF' is an undeclared prefix. Line 1912952`. Tally serialises
+user-defined fields with a namespace prefix (`<UDF:MYFIELD>`) but never declares
+the namespace, which makes the ENTIRE response invalid XML. One custom field on
+one voucher cost a full month of data, and every other year was unaffected only
+because the customisation did not exist yet.
+
+* `TallyXml.Sanitize` now scans for namespace prefixes that are used but not
+  declared, and declares them on the root element as `urn:tally:udf:<prefix>`.
+* Element names the extractors read are untouched - they look up unprefixed
+  names, which are unaffected. A prefix that is already declared is left alone,
+  and a response with no prefixes is returned byte-identical.
+* Attribute prefixes (`UDF:TAG="x"`) are handled as well as element prefixes.
+* Six new tests: undeclared prefix parses, several prefixes, prefix on an
+  attribute, already-declared prefix not duplicated, ordinary response
+  unchanged, and the XML declaration not mistaken for the root element.
+
+### After installing
+Re-run the single window that failed: Tally period `1-4-2025 to 31-3-2026`,
+agent dates `2025-04-01` / `2026-03-31`, Re-extract Whole Range.
+
 ## 2.0.7 - Snapshot reports can be turned off
 
 Found while running the first year-by-year back-fill: the six snapshot reports
