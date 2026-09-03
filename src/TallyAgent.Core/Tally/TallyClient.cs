@@ -346,9 +346,10 @@ public sealed class TallyClient : IDisposable
                 }
             }
 
+            XDocument parsed;
             try
             {
-                return TallyXml.Parse(body);
+                parsed = TallyXml.Parse(body);
             }
             catch (Exception ex)
             {
@@ -356,6 +357,22 @@ public sealed class TallyClient : IDisposable
                 throw new TallyException(ErrorCategory.TallyInvalidXml,
                     $"Tally response is not valid XML: {ex.Message}. Response starts with: {preview}", ex);
             }
+
+            // A REFUSAL is not an empty result. "<RESPONSE>Unknown Request,
+            // cannot be processed</RESPONSE>" arrives as HTTP 200, parses
+            // cleanly and contains zero rows — so without this check every
+            // extractor with an `if (rows.Count == 0) → fall back` branch treats
+            // a rejected request as an empty report, silently switches code path
+            // and returns a plausible number. Caught once here for every caller
+            // rather than per dataset. Not retried (the refusal is
+            // deterministic) and NOT run-ending: one dataset fails loudly, the
+            // rest of the cycle continues.
+            if (TallyXml.FindRequestError(parsed) is { } refusal)
+                throw new TallyException(ErrorCategory.TallyRequestRejected,
+                    $"Tally refused the request: {refusal}")
+                { ResponseText = parsed.ToString(SaveOptions.None) };
+
+            return parsed;
         }
         finally
         {

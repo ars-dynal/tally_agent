@@ -175,7 +175,9 @@ static async Task<int> CaptureXml(List<string> a)
     var cfg = new ConfigStore().Load();
     var client = new TallyClient(cfg.Tally, NullLogger<TallyClient>.Instance);
 
+    var dump = a.Remove("--dump");
     string kind = "vouchers", collection = "Ledger";
+    string? envelopeFile = null, envelopeDir = null;
     DateOnly from = DateOnly.FromDateTime(DateTime.Today).AddDays(-7);
     DateOnly to = DateOnly.FromDateTime(DateTime.Today);
     for (var i = 0; i < a.Count - 1; i++)
@@ -186,8 +188,13 @@ static async Task<int> CaptureXml(List<string> a)
             case "--collection": collection = a[++i]; break;
             case "--from": from = DateOnly.Parse(a[++i]); break;
             case "--to": to = DateOnly.Parse(a[++i]); break;
+            case "--envelope-file": envelopeFile = a[++i]; break;
+            case "--envelope-dir": envelopeDir = a[++i]; break;
         }
     }
+
+    if (envelopeFile is not null || envelopeDir is not null)
+        return await PostEnvelopes(client, cfg, envelopeFile, envelopeDir, from, to, dump);
 
     var envelope = kind switch
     {
@@ -207,6 +214,94 @@ static async Task<int> CaptureXml(List<string> a)
     Console.WriteLine($"Captured {xml.Length:N0} chars of sanitized Tally XML to:\n  {file}");
     return 0;
 }
+
+/// <summary>
+/// Post raw envelope files to Tally verbatim and report what came back. No
+/// parsing, no dataset, no rebuild between attempts — the point is to find out
+/// which envelope SHAPE Tally accepts before any extractor is written against
+/// it.
+///
+/// usage: capture-xml --envelope-file  <path> [--from d] [--to d] [--dump]
+///        capture-xml --envelope-dir   <dir>  [--from d] [--to d] [--dump]
+///
+/// Files may use the placeholders {{COMPANY}}, {{FROM}} and {{TO}}; FROM/TO are
+/// substituted in Tally's yyyyMMdd form. A directory is processed in filename
+/// order and does NOT stop on a refusal — the ordering is the experiment, and a
+/// refusal is a result.
+/// </summary>
+static async Task<int> PostEnvelopes(TallyClient client, AgentConfig cfg,
+    string? file, string? dir, DateOnly from, DateOnly to, bool dump)
+{
+    if (await FailFastIfTallyUnreachable(client, cfg, json: false) is { } unreachable)
+        return unreachable;
+
+    var files = new List<string>();
+    if (file is not null) files.Add(file);
+    if (dir is not null)
+        files.AddRange(Directory.EnumerateFiles(dir, "*.xml").OrderBy(f => f, StringComparer.Ordinal));
+    if (files.Count == 0) { Console.Error.WriteLine("No envelope files found."); return 2; }
+
+    var fixtures = Path.Combine(AgentInfo.DataDir, "fixtures");
+    if (dump) Directory.CreateDirectory(fixtures);
+    var accepted = 0;
+
+    foreach (var path in files)
+    {
+        var name = Path.GetFileNameWithoutExtension(path);
+        var envelope = (await File.ReadAllTextAsync(path))
+            .Replace("{{COMPANY}}", TallyXml.XmlEscape(cfg.Tally.Company))
+            .Replace("{{FROM}}", from.ToString("yyyyMMdd"))
+            .Replace("{{TO}}", to.ToString("yyyyMMdd"));
+
+        Console.WriteLine(new string('─', 72));
+        Console.WriteLine($"▶ {name}");
+
+        string? body = null, refusal = null;
+        try
+        {
+            body = await client.PostRawAsync(envelope);
+        }
+        catch (TallyException tex)
+        {
+            refusal = tex.Message;
+            // The rejection check attaches the body, so a refusal is inspected
+            // from the same bytes the extractor saw — no second request.
+            body = tex.ResponseText;
+        }
+        catch (Exception ex) { refusal = ex.Message; }
+
+        if (refusal is not null) Console.WriteLine($"  REFUSED: {refusal}");
+        else { accepted++; Console.WriteLine("  ACCEPTED"); }
+
+        if (body is null) { Console.WriteLine("  (no response body)"); continue; }
+
+        Console.WriteLine($"  {body.Length:N0} chars");
+        try
+        {
+            var doc = System.Xml.Linq.XDocument.Parse(body);
+            var hist = ElementHistogram(doc);
+            Console.WriteLine("  elements: " +
+                (hist.Count == 0 ? "(none)" : string.Join(", ", hist.Select(kv => $"{kv.Key}×{kv.Value}"))));
+        }
+        catch (Exception ex) { Console.WriteLine($"  (not parseable: {ex.Message})"); }
+
+        Console.WriteLine("  head: " + Truncate(body, 600).ReplaceLineEndings(" "));
+
+        if (dump)
+        {
+            var outPath = Path.Combine(fixtures, $"{name}-{DateTime.Now:yyyyMMdd-HHmmss}.xml");
+            await File.WriteAllTextAsync(outPath, body);
+            Console.WriteLine($"  saved: {outPath}");
+        }
+    }
+
+    Console.WriteLine(new string('─', 72));
+    Console.WriteLine($"{accepted} of {files.Count} envelope(s) accepted " +
+                      $"({from:yyyy-MM-dd}..{to:yyyy-MM-dd}, company '{cfg.Tally.Company}').");
+    return accepted > 0 ? 0 : 1;
+}
+
+static string Truncate(string s, int max) => s.Length <= max ? s : s[..max] + "…";
 
 /// <summary>verify-bills — run the two NEW bill-level datasets against a live
 /// Tally and report exactly what came back, so the extraction envelope can be
@@ -510,6 +605,11 @@ static int Usage()
           force-full-sync          (reset checkpoints; re-extract full history)
           capture-xml --kind vouchers|masters|alterids [--from d] [--to d]
                       [--collection Ledger]   (save raw Tally XML fixtures)
+          capture-xml --envelope-file <path> | --envelope-dir <dir>
+                      [--from d] [--to d] [--dump]
+                      (post raw envelopes verbatim; print refusal, element
+                       histogram and response head. Placeholders: {{COMPANY}},
+                       {{FROM}}, {{TO}}. See diagnostics/envelopes/)
           verify-bills [--from d] [--to d] [--dump] [--json]
                       [--expect-rows-payable N]    [--expect-total-payable X]
                       [--expect-rows-receivable N] [--expect-total-receivable X]

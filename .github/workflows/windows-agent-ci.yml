@@ -45,9 +45,13 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           Write-Host "Build version: $version"
 
+      # -AllowVersionMismatch: this job deliberately stamps a run-number version
+      # (1.0.<run>) onto a throwaway PR installer, which cannot match
+      # AgentInfo.Version. The release workflow does NOT pass it, so a release
+      # tag whose code still carries the previous version still fails the build.
       - name: Build, test and package
         shell: pwsh
-        run: .\build\build.ps1 -Version "${{ steps.version.outputs.version }}"
+        run: .\build\build.ps1 -Version "${{ steps.version.outputs.version }}" -AllowVersionMismatch
 
       - name: Upload test results
         if: always()

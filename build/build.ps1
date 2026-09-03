@@ -6,7 +6,14 @@ param(
     # different version numbers for one build. The version now comes from the
     # same file the build itself uses, so the two cannot drift.
     [string]$Version,
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    # CI's per-PR build stamps a run-number version (1.0.<run>) onto a throwaway
+    # installer on purpose, so it cannot satisfy the AgentInfo.Version check
+    # below. Only that job passes this. A RELEASE build must never pass it: the
+    # release workflow builds with the tag version, so the check is exactly what
+    # catches a tag whose code still carries the previous version — the failure
+    # this guard exists for.
+    [switch]$AllowVersionMismatch
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,8 +37,12 @@ $agentVersionFile = Join-Path $Root "src\TallyAgent.Core\AgentVersion.cs"
 $agentVersion = (Select-String -Path $agentVersionFile -Pattern 'Version\s*=\s*"([^"]+)"' |
     Select-Object -First 1).Matches[0].Groups[1].Value
 if ($agentVersion -ne $Version) {
-    throw "Version mismatch: -Version/$Version but AgentInfo.Version is $agentVersion. " +
-          "Both AgentVersion.cs and Directory.Build.props must be bumped."
+    if (-not $AllowVersionMismatch) {
+        throw "Version mismatch: -Version/$Version but AgentInfo.Version is $agentVersion. " +
+              "Both AgentVersion.cs and Directory.Build.props must be bumped."
+    }
+    Write-Host ("Version mismatch allowed: building as $Version while AgentInfo.Version " +
+                "is $agentVersion. This installer is NOT a release artifact.") -ForegroundColor Yellow
 }
 
 Write-Host "Building Tally BigQuery Agent version $Version" -ForegroundColor Cyan

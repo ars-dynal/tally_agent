@@ -93,6 +93,53 @@ public static partial class TallyXml
         return XDocument.Parse(text, LoadOptions.None);
     }
 
+    /// <summary>
+    /// The error text when Tally REFUSED the request, or null when it answered.
+    ///
+    /// This is the most dangerous shape Tally produces, because it is not an
+    /// error by any mechanism the agent was watching:
+    ///
+    ///     &lt;RESPONSE&gt;Unknown Request, cannot be processed&lt;/RESPONSE&gt;
+    ///
+    /// HTTP 200. Well-formed XML. Parses cleanly. Contains zero data rows. Every
+    /// extractor that says <c>if (rows.Count == 0) → fall back</c> therefore
+    /// treats a REFUSAL as an EMPTY REPORT, quietly runs a different code path,
+    /// and returns a plausible number that nothing marks as suspect. The
+    /// zero-row guard does not fire either, because the fallback produced rows.
+    ///
+    /// Same disease as the silently-ignored FETCH entry in CLAUDE.md: a valid
+    /// response that means "no" and reads as "nothing". Detected HERE, once, for
+    /// every caller — never special-cased per dataset.
+    ///
+    /// Deliberately conservative, so a real data response can never be mistaken
+    /// for a refusal:
+    ///   • any LINEERROR element — Tally's TDL error channel;
+    ///   • a root RESPONSE element carrying text and NO child elements.
+    /// A RESPONSE element with children is left alone: import acknowledgements
+    /// use that shape and are not errors.
+    /// </summary>
+    public static string? FindRequestError(XDocument doc)
+    {
+        var lineError = doc.Descendants()
+            .FirstOrDefault(e => e.Name.LocalName.Equals("LINEERROR", StringComparison.OrdinalIgnoreCase));
+        if (lineError is not null)
+        {
+            var text = lineError.Value.Trim();
+            if (text.Length > 0) return text;
+        }
+
+        var root = doc.Root;
+        if (root is not null &&
+            root.Name.LocalName.Equals("RESPONSE", StringComparison.OrdinalIgnoreCase) &&
+            !root.Elements().Any())
+        {
+            var text = root.Value.Trim();
+            if (text.Length > 0) return text;
+        }
+
+        return null;
+    }
+
     // ── field readers (direct children first; attributes as a Tally master fallback) ──
 
     /// <summary>

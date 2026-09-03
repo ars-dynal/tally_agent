@@ -21,6 +21,11 @@ public enum ErrorCategory
     SchemaMismatch,
     ServiceStopped,
     UnexpectedException,
+    /// <summary>Tally answered HTTP 200 with well-formed XML that REFUSES the
+    /// request — "Unknown Request, cannot be processed", or a TDL LINEERROR.
+    /// Appended rather than grouped with the other Tally* values so no stored
+    /// ordinal shifts.</summary>
+    TallyRequestRejected,
 }
 
 public enum ErrorSeverity { Warning, Error, Critical }

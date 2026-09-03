@@ -75,13 +75,19 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
                 ["closing_credit"] = Math.Abs(cr),
                 ["net_amount"] = dr - cr,
                 ["parent_group"] = "",
+                ["source"] = "report",
             };
         });
         if (rows.Count == 0)
             rows = await TrialBalanceFromLedgers(from, to, ct);
-        log.LogInformation("Trial balance: {N} rows", rows.Count);
+        log.LogInformation("Trial balance: {N} rows from {Source}", rows.Count, SourceOf(rows));
         return rows;
     }
+
+    /// <summary>Which route produced these rows, for the log line. The rows
+    /// themselves carry it in <c>source</c>.</summary>
+    private static string SourceOf(List<Row> rows) =>
+        rows.Count > 0 && rows[0].TryGetValue("source", out var s) ? s as string ?? "?" : "nothing";
 
     /// <summary>Fallback when the "Trial Balance" report export yields no rows
     /// (report layouts vary across TallyPrime builds): derive the trial balance
@@ -106,6 +112,12 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
                 ["closing_credit"] = closing > 0 ? closing : 0,
                 ["net_amount"] = -closing,
                 ["parent_group"] = Text(el, "PARENT"),
+                // NOT the "Trial Balance" report. Both routes derive from the
+                // same ledger balances, so a fallback result reconciles to
+                // Tally's screen exactly as the report would — which is why
+                // serving the fallback for weeks would look like success. The
+                // column is how anyone finds out.
+                ["source"] = "ledger_collection",
             });
         }
         return rows;
@@ -125,11 +137,12 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
                 ["amount"] = amount,
                 ["parent_group"] = "",
                 ["category"] = amount >= 0 ? "Liabilities" : "Assets",
+                ["source"] = "report",
             };
         });
         if (rows.Count == 0)
             rows = await GroupBalances(from, to, revenueGroups: false, ct);
-        log.LogInformation("Balance sheet: {N} rows", rows.Count);
+        log.LogInformation("Balance sheet: {N} rows from {Source}", rows.Count, SourceOf(rows));
         return rows;
     }
 
@@ -146,11 +159,12 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
                 ["ledger_name"] = name,
                 ["amount"] = amount,
                 ["parent_group"] = "",
+                ["source"] = "report",
             };
         });
         if (rows.Count == 0)
             rows = await GroupBalances(from, to, revenueGroups: true, ct);
-        log.LogInformation("P&L: {N} rows", rows.Count);
+        log.LogInformation("P&L: {N} rows from {Source}", rows.Count, SourceOf(rows));
         return rows;
     }
 
@@ -177,6 +191,7 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
                 ["ledger_name"] = name,
                 ["amount"] = amount,
                 ["parent_group"] = Text(el, "PARENT"),
+                ["source"] = "group_collection",
             };
             if (!revenueGroups)
                 row["category"] = amount >= 0 ? "Liabilities" : "Assets";
@@ -214,11 +229,12 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
                 ["closing_qty"] = QtyNum(cl, "DSPCLQTY", "DSPSTKCLQTY"),
                 ["closing_value"] = NumByLocalName(cl, "DSPCLAMTA") != 0
                     ? NumByLocalName(cl, "DSPCLAMTA") : NumByLocalName(cl, "DSPSTKCLAMT"),
+                ["source"] = "report",
             });
         }
         if (rows.Count == 0)
             rows = await StockSummaryFromItems(from, to, ct);
-        log.LogInformation("Stock summary: {N} rows", rows.Count);
+        log.LogInformation("Stock summary: {N} rows from {Source}", rows.Count, SourceOf(rows));
         return rows;
     }
 
@@ -251,6 +267,7 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
                 ["outward_value"] = 0d,
                 ["closing_qty"] = closingQty,
                 ["closing_value"] = closingValue,
+                ["source"] = "stockitem_collection",
             });
         }
         return rows;
@@ -324,7 +341,7 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
         var rows = ParseBillsReport(doc, to);
         if (rows.Count == 0)
             rows = await BillsFromCollection(parentGroupContains, from, to, ct);
-        log.LogInformation("{Report}: {N} rows", reportName, rows.Count);
+        log.LogInformation("{Report}: {N} rows from {Source}", reportName, rows.Count, SourceOf(rows));
         return rows;
     }
 
@@ -404,7 +421,7 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
                 ["overdue_days"] = null,
                 ["bill_type"] = Text(el, "BILLTYPE"),
                 ["as_of_date"] = to.ToString("yyyy-MM-dd"),
-                ["source"] = "collection",
+                ["source"] = "bills_collection",
             });
         }
         return rows;

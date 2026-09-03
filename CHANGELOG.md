@@ -4,6 +4,72 @@
 
 The last planned agent release. Everything still outstanding is in it.
 
+### A refused request is no longer read as an empty one
+
+The most important change here, and it was not on the original list.
+
+```xml
+<RESPONSE>Unknown Request, cannot be processed</RESPONSE>
+```
+
+HTTP 200. Well-formed XML. Parses cleanly. Zero rows. Every extractor that says
+`if (rows.Count == 0) → fall back` therefore treated a REFUSED request as an
+EMPTY report: it silently ran a different code path and returned a plausible
+number. The zero-row guard never fired either, because the fallback produced
+rows. That is `TrialBalance`, `BalanceSheet`, `ProfitLoss`, `StockSummary` and
+the new `Bills` - five datasets.
+
+This is the same disease as the silently-ignored FETCH entry above: a valid
+response that means "no" and reads as "nothing".
+
+* `TallyXml.FindRequestError` detects a refusal; `TallyClient` raises
+  `TallyRequestRejected` at the single point every response is parsed. Not
+  special-cased for bills, not repeated per dataset.
+* Conservative by design, so a real response is never mistaken for a refusal:
+  any `LINEERROR` element, or a root `RESPONSE` carrying text and no child
+  elements. A `RESPONSE` **with** children is an import acknowledgement and is
+  left alone. A genuinely empty export is still empty, and its fallback still
+  runs.
+* Not retried - the refusal is deterministic - and **not** run-ending: the one
+  dataset fails loudly and the rest of the cycle continues.
+* The response body travels on the exception, so a diagnostic can show the
+  refusal it tripped on without asking Tally a second time.
+
+**Expect this to surface failures that were previously invisible.** A dataset
+whose report has been refused all along will now error instead of quietly
+serving its fallback. That is the point.
+
+### `source` - which route actually produced these rows
+
+Every dataset with a fallback now records the route on each row:
+`trial_balance`, `balance_sheet`, `profit_loss`, `stock_summary`,
+`bills_payable`, `bills_receivable`. Values are `report` or the specific
+fallback (`ledger_collection`, `group_collection`, `stockitem_collection`,
+`bills_collection`).
+
+`trial_balance` is why this matters. It returns 1,038 rows and reconciles
+exactly to Tally's own screen - but `TrialBalanceFromLedgers` would do that too,
+because both routes derive from the same ledger balances. Nothing in the data
+distinguishes them, so we do not currently know whether `trial_balance` has ever
+come from the report route. If it has been the fallback for weeks, the figures
+are still right; we simply would not have known. **A number that is right by
+accident should still say which route it came by.**
+
+`outstanding_payables` / `outstanding_receivables` are deliberately NOT given
+this column - they have no fallback, and they are not being touched.
+
+### Envelope probing
+
+`capture-xml --envelope-file <path>` / `--envelope-dir <dir>` posts raw envelope
+files to Tally verbatim and prints ACCEPTED/REFUSED with Tally's own words, an
+element histogram and the response head. No parsing, no dataset, no rebuild
+between attempts. Placeholders `{{COMPANY}}`, `{{FROM}}`, `{{TO}}`.
+
+`diagnostics/envelopes/` holds the candidate set, **control first**:
+`00-control-trial-balance` is the report shape that demonstrably works. If it is
+also refused, the problem is the session or the company rather than the report
+name, and every other variant is wasted effort. See that folder's README.
+
 ### bills_payable / bills_receivable - NEW, and the reason this release exists
 
 `outstanding_payables` and `outstanding_receivables` are built from
