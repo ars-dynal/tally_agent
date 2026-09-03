@@ -23,9 +23,13 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
     // instead of three).
     private readonly SemaphoreSlim _cacheLock = new(1, 1);
     private (DateOnly To, XDocument Doc)? _ledgerBalances;
+    /// <summary>The Bills collection is shared by the payable and receivable
+    /// fallbacks — one request per cycle, not one per dataset (same discipline
+    /// as the Ledger/StockItem caches: never ask Tally the same thing twice).</summary>
+    private (DateOnly From, DateOnly To, XDocument Doc)? _billsCollection;
 
     public void BeginCycle() => EndCycle();
-    public void EndCycle() => _ledgerBalances = null;
+    public void EndCycle() { _ledgerBalances = null; _billsCollection = null; }
 
     private async Task<XDocument> LedgerBalancesDocument(DateOnly to, CancellationToken ct)
     {
@@ -371,7 +375,7 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
             if (name.Length > 0) groupOf[name] = Text(el, "PARENT");
         }
 
-        var doc = await PostReport(TallyEnvelopes.BillsCollection(client.Company, from, to), ct);
+        var doc = await BillsDocument(from, to, ct);
         var rows = new List<Row>();
         foreach (var el in doc.Descendants().Where(e => Is(e, "BILLS") || Is(e, "BILL")))
         {
@@ -404,6 +408,22 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
             });
         }
         return rows;
+    }
+
+    /// <summary>The Bills collection for this cycle (fetched once and shared by
+    /// the payable and receivable fallbacks).</summary>
+    private async Task<XDocument> BillsDocument(DateOnly from, DateOnly to, CancellationToken ct)
+    {
+        if (_billsCollection is { } c && c.From == from && c.To == to) return c.Doc;
+        await _cacheLock.WaitAsync(ct);
+        try
+        {
+            if (_billsCollection is { } c2 && c2.From == from && c2.To == to) return c2.Doc;
+            var doc = await PostReport(TallyEnvelopes.BillsCollection(client.Company, from, to), ct);
+            _billsCollection = (from, to, doc);
+            return doc;
+        }
+        finally { _cacheLock.Release(); }
     }
 
     /// <summary>The party a bill row belongs to. Bill rows frequently carry no
