@@ -249,6 +249,8 @@ static async Task<int> VerifyBills(List<string> a, bool json)
     }
 
     using var client = new TallyClient(cfg.Tally, NullLogger<TallyClient>.Instance);
+    if (await FailFastIfTallyUnreachable(client, cfg, json) is { } unreachable) return unreachable;
+
     var results = new List<object>();
     var ok = true;
 
@@ -320,6 +322,26 @@ static async Task<int> VerifyBills(List<string> a, bool json)
     return ok ? 0 : 1;
 }
 
+/// <summary>
+/// Probe Tally once before a diagnostic starts, and give up immediately if it
+/// does not answer. Without this the first real request enters the normal
+/// auto-reconnect loop and a diagnostic run against the wrong network sits there
+/// for reconnectMaxMinutes (default 30) saying nothing. That loop is right for
+/// the service, which must survive Tally restarting; it is wrong for a command a
+/// person is watching. Returns null when Tally answered.
+/// </summary>
+static async Task<int?> FailFastIfTallyUnreachable(TallyClient client, AgentConfig cfg, bool json)
+{
+    var probe = await client.ProbeAsync();
+    if (probe.Ok) return null;
+    Emit(json,
+        new { ok = false, error = probe.Error, host = cfg.Tally.Host, port = cfg.Tally.Port },
+        $"FAILED — Tally did not answer on {cfg.Tally.Host}:{cfg.Tally.Port}: {probe.Error}\n" +
+        "Run this from a machine that can reach the Tally server, with Tally open " +
+        "and the company loaded.");
+    return 1;
+}
+
 /// <summary>Accepts 26351475.28 and Indian-grouped 2,63,51,475.28 alike.</summary>
 static double ParseAmount(string s) =>
     double.Parse(s.Replace(",", "").Trim(), System.Globalization.CultureInfo.InvariantCulture);
@@ -344,6 +366,7 @@ static async Task<int> DiagnoseOpeningBills(List<string> a, bool json)
     var cfg = new ConfigStore().Load();
     var dump = a.Remove("--dump");
     using var client = new TallyClient(cfg.Tally, NullLogger<TallyClient>.Instance);
+    if (await FailFastIfTallyUnreachable(client, cfg, json) is { } unreachable) return unreachable;
 
     string[] baseFields = ["GUID", "NAME", "PARENT", "ISBILLWISEON"];
     var variants = new (string Name, string[] Fields)[]
