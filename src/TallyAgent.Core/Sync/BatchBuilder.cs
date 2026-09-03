@@ -27,8 +27,13 @@ public sealed class BatchBuilder(BatchQueueRepository queue, AgentConfig config,
 
     /// <summary>Audit fields excluded from the CONTENT checksum (batch identity):
     /// they change on every extraction and must never influence dedup or the
-    /// deterministic batch ID. They ARE included in the uploaded payload.</summary>
-    private static readonly string[] AuditFields =
+    /// deterministic batch ID. They ARE included in the uploaded payload.
+    ///
+    /// Shared with <see cref="MasterContentHash"/>: including any of these in a
+    /// content hash makes that hash differ on every single extraction by
+    /// construction, which would silently turn the master re-upload skip into a
+    /// no-op that still looks like it is working.</summary>
+    public static readonly string[] AuditFields =
         ["_sync_timestamp", "_sync_id", "source_last_seen_at"];
 
     private string QueueDir => queueDirOverride ?? AgentInfo.QueueDir;

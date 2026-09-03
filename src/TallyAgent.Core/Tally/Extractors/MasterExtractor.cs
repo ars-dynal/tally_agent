@@ -61,7 +61,21 @@ public sealed class MasterExtractor(TallyClient client, MasterBalanceRepository 
         "GSTREGISTRATIONNUMBER","INCOMETAXNUMBER","LEDSTATENAME","COUNTRYNAME","ADDRESS",
         "PINCODE","LEDGERMOBILE","LEDGERPHONE","EMAIL","LEDGERCONTACT","BANKACCOUNTNUMBER",
         "IFSCODE","BANKNAME","BRANCHNAME","ISBILLWISEON","ISCOSTCENTRESON",
-        "BILLALLOCATIONS.LIST",   // opening bills
+        // Opening bill-wise balances. v2.1.0 and earlier asked for the single
+        // field "BILLALLOCATIONS.LIST" and opening_bills returned zero rows for
+        // its entire history. ".LIST" is how Tally SERIALISES a list-valued
+        // member, not a member you can FETCH, and Tally ignores an unknown FETCH
+        // entry silently — a valid response with the sub-object simply absent.
+        // The dotted sub-field form below is the same technique VoucherCollection
+        // uses for ALLLEDGERENTRIES.BILLALLOCATIONS.*, which does produce rows.
+        // The original entry is kept because over-fetching is harmless and this
+        // has NOT yet been confirmed against a live Tally — run
+        // `TallyAgent.Cli diagnose-opening-bills` on the Tally server, which
+        // reports which variant actually returns bill elements.
+        "BILLALLOCATIONS.NAME","BILLALLOCATIONS.BILLDATE","BILLALLOCATIONS.BILLCREDITPERIOD",
+        "BILLALLOCATIONS.OPENINGBALANCE","BILLALLOCATIONS.CLOSINGBALANCE",
+        "BILLALLOCATIONS.BILLTYPE","BILLALLOCATIONS.ISADVANCE",
+        "BILLALLOCATIONS.LIST",
     ];
     private static readonly string[] LedgerBalanceFields = ["OPENINGBALANCE","CLOSINGBALANCE"];
 
@@ -455,7 +469,13 @@ public sealed class MasterExtractor(TallyClient client, MasterBalanceRepository 
         return rows;
     }
 
-    /// <summary>Opening bill-wise balances from ledger BILLALLOCATIONS.</summary>
+    /// <summary>Opening bill-wise balances from ledger BILLALLOCATIONS.
+    ///
+    /// Reads BOTH serialisation shapes: TallyPrime emits a list-valued member as
+    /// &lt;BILLALLOCATIONS.LIST&gt;, but some builds/TDL emit bare
+    /// &lt;BILLALLOCATIONS&gt;. Matching on local name rather than an exact
+    /// XName also survives the namespace-prefix declaration
+    /// <see cref="TallyXml.Sanitize"/> performs.</summary>
     public async Task<List<Row>> OpeningBills(CancellationToken ct)
     {
         var doc = await LedgerDocument(ct);
@@ -463,7 +483,7 @@ public sealed class MasterExtractor(TallyClient client, MasterBalanceRepository 
         foreach (var el in doc.Descendants("LEDGER"))
         {
             var ledger = Text(el, "NAME");
-            foreach (var ba in el.Descendants("BILLALLOCATIONS.LIST"))
+            foreach (var ba in BillAllocationElements(el))
             {
                 var billRef = Text(ba, "NAME");
                 if (billRef.Length == 0) continue;
@@ -474,14 +494,26 @@ public sealed class MasterExtractor(TallyClient client, MasterBalanceRepository 
             ["alter_id"] = Int(el, "ALTERID"),
             ["ledger_name"] = ledger,
                     ["bill_ref"] = billRef,
+                    ["bill_date"] = Date(ba, "BILLDATE"),
+                    ["bill_credit_period"] = Text(ba, "BILLCREDITPERIOD"),
                     ["bill_type"] = Text(ba, "BILLTYPE"),
+                    ["is_advance"] = Bool(ba, "ISADVANCE"),
                     ["opening_amount"] = Num(ba, "OPENINGBALANCE"),
                     ["closing_amount"] = Num(ba, "CLOSINGBALANCE"),
                 });
             }
         }
+        log.LogInformation("Opening bills: {N} rows from {L} ledgers", rows.Count,
+            doc.Descendants("LEDGER").Count());
         return rows;
     }
+
+    /// <summary>Bill-allocation child elements of a ledger, under either
+    /// serialisation (&lt;BILLALLOCATIONS.LIST&gt; or &lt;BILLALLOCATIONS&gt;).</summary>
+    public static IEnumerable<XElement> BillAllocationElements(XElement ledger) =>
+        ledger.Descendants().Where(e =>
+            e.Name.LocalName.Equals("BILLALLOCATIONS.LIST", StringComparison.OrdinalIgnoreCase) ||
+            e.Name.LocalName.Equals("BILLALLOCATIONS", StringComparison.OrdinalIgnoreCase));
 
     public async Task<List<Row>> StockStandardCosts(CancellationToken ct) =>
         await StandardRates("STANDARDCOSTLIST.LIST", ct);

@@ -10,6 +10,8 @@ public class DatasetRegistryTests
     [
         "trial_balance", "balance_sheet", "profit_loss",
         "stock_summary", "outstanding_payables", "outstanding_receivables",
+        // v2.2.0 — bill-level detail behind the two outstanding balances.
+        "bills_payable", "bills_receivable",
     ];
 
     [Fact]

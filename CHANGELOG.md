@@ -1,6 +1,132 @@
 # Changelog
 
-## 2.1.0 (in progress) - Snapshot reports one at a time; day_book stops being uploaded twice
+## 2.2.0 - Bill-level outstandings; masters stop re-uploading unchanged
+
+The last planned agent release. Everything still outstanding is in it.
+
+### bills_payable / bills_receivable - NEW, and the reason this release exists
+
+`outstanding_payables` and `outstanding_receivables` are built from
+`LedgerBalancesDocument` - a Collection of Ledger with CLOSINGBALANCE. That is
+why they reconcile exactly to the trial balance, and equally why they carry no
+bill detail: a ledger balance is one number per party. The question "which bills
+make up that number, and how late are they" was never asked of Tally.
+
+Tally's own **Bills Payable** and **Bills Receivable** reports hold it: bill
+date, reference number, party, pending amount, due date and overdue days.
+
+* Two new Snapshot datasets, `bills_payable` and `bills_receivable`, with their
+  own checkboxes in the Manager's Reports section.
+* **Additive.** `outstanding_payables` / `outstanding_receivables` are not
+  touched - not their envelope, not their parsing, not their columns. They are
+  correct, they reconcile, and staging views are deployed against them.
+* **Tally's overdue-days figure is kept, never recomputed.** The due date
+  depends on the credit period and the bill type and Tally is the authority on
+  both. A bill with no overdue column stays null rather than becoming 0, which
+  would read downstream as "due today".
+* Falls back to the dated `Bills` collection if the report export comes back
+  empty, the same pattern the other reports here use. That path cannot carry an
+  overdue-day count, so it leaves the column null; every row records which path
+  produced it in `source`.
+* Business key for the staging view: `_company` + `party_name` + `bill_ref` +
+  `bill_date` + `as_of_date`. The same reference can repeat across parties, and
+  the dataset is a snapshot as of a date - see the inventory unit-of-measure
+  incident in CLAUDE.md for what a short key costs.
+
+**Not yet verified against live Tally.** The exact element names TallyPrime uses
+in these report exports were not confirmed while this was written (the Tally
+server was unreachable from the build machine), so the parser accepts several
+candidate shapes and the tests pin its behaviour rather than the tag names.
+Run this on the Tally server before trusting a load:
+
+```powershell
+TallyAgent.Cli verify-bills --from 2026-04-01 --to 2026-09-03 `
+  --expect-rows-payable 251    --expect-total-payable 2,63,51,475.28 `
+  --expect-rows-receivable 358 --expect-total-receivable 15,21,10,022.43
+```
+
+It exits non-zero on a mismatch and, when nothing parses, prints the element
+histogram of the actual response - which is what the parser needs to be fixed
+from. `--dump` saves the raw XML.
+
+### opening_bills - diagnosed, not yet confirmed fixed
+
+`opening_bills` has checkpointed on zero rows for its entire history while
+bill-wise details are enabled in Tally.
+
+The ledger FETCH list asked for one field, `BILLALLOCATIONS.LIST`. `.LIST` is
+how Tally *serialises* a list-valued member, not a member that can be fetched -
+and Tally ignores an unknown FETCH entry **silently**, returning a valid
+response with the sub-object simply absent. Zero rows, no error, forever. The
+dotted sub-field form is the technique `VoucherCollection` already uses for
+`ALLLEDGERENTRIES.BILLALLOCATIONS.*`, which does produce rows.
+
+* The request now asks for `BILLALLOCATIONS.NAME`, `.BILLDATE`,
+  `.BILLCREDITPERIOD`, `.OPENINGBALANCE`, `.CLOSINGBALANCE`, `.BILLTYPE` and
+  `.ISADVANCE`, and keeps the old entry - over-fetching is harmless.
+* The parser reads either serialisation (`<BILLALLOCATIONS.LIST>` or bare
+  `<BILLALLOCATIONS>`), matched case-insensitively.
+* New columns: `bill_date`, `bill_credit_period`, `is_advance`.
+
+This hypothesis is **not confirmed** - it was reasoned from the code, not
+observed. `TallyAgent.Cli diagnose-opening-bills` sends the old and new field
+lists and reports how many bill elements each returns, alongside how many
+ledgers have bill-wise tracking on. Three outcomes, three different conclusions,
+printed with the result. Run it before believing this is fixed.
+
+### Masters stop being re-uploaded unchanged
+
+Masters are re-extracted every cycle by design - they are cheap collections -
+but they were also re-*uploaded* every cycle unchanged: ~10,757 rows an hour,
+~247,000 redundant rows across the back-fill. `FindEquivalentActiveBatch`
+already suppressed a duplicate while the earlier batch was still queued, but an
+acked batch leaves `upload_batches`, so the next cycle minted a fresh one.
+
+* New `master_content_hashes` table (schema v6) holding, per (dataset, company),
+  the content hash of the last master extraction the cloud **acknowledged**.
+* A hash is recorded as *pending* at enqueue and promoted to *confirmed* only
+  when every batch it produced has been acked - inside the ack transaction. Only
+  a confirmed hash can suppress an upload.
+* `_sync_id` and `_sync_timestamp` are excluded from the hash. They are stamped
+  on every row at enqueue and differ on every upload by construction; including
+  them would make the hash never match and turn the whole optimisation into a
+  silent no-op that still looked like it was working. `_company` is excluded for
+  the same reason - the upload path writes it, so it is not what Tally said.
+  `balance_as_of` is deliberately **not** excluded: it marks which daily balance
+  capture the row carries, so it changes exactly when the balances do.
+* Snapshots are never skipped - they are dated as-of values.
+* Force Full Sync clears the hashes, so a re-walk always re-uploads.
+* Expect hourly master uploads to become roughly daily (balances move once a
+  day), not to stop - a ~24x reduction.
+
+The failure mode this guards against is masters silently not uploading, which
+nothing would notice. Eight tests pin it: first run uploads, changed content
+uploads, unchanged content skips only after an ack, a failed upload records
+nothing and recovers on retry, a partially acked upload does not confirm, an
+unrelated dataset's ack does not confirm this one, and the hash survives being
+enqueued.
+
+### extractionStartDate no longer lies
+
+It is only read inside the `!FullSyncDone` branch, so once the full-history walk
+latches, editing it does nothing at all. Silently ignored settings are traps.
+
+* The Manager shows a red note under the field, but only while it is actually
+  inert.
+* Changing it in that state now offers the one action that applies it -
+  re-extract all history - and says what declining means. The value is saved
+  either way.
+* The service logs a warning every cycle the setting is present and inert.
+
+### Release tooling
+
+* `build.ps1` no longer defaults `-Version` to the four-versions-stale
+  "1.0.0". It reads `<Version>` from `Directory.Build.props`, and now **fails
+  the build** if `AgentInfo.Version` disagrees - the mismatch that ships a
+  stale installer under a new tag.
+* `.gitignore`: `__pycache__/`, `*.patch`.
+
+## 2.1.0 - Snapshot reports one at a time; day_book stops being uploaded twice
 
 ### Per-dataset snapshot control
 

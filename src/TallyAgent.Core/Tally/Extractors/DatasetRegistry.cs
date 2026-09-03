@@ -54,6 +54,10 @@ public static class DatasetRegistry
         new("stock_summary",          DatasetKind.Snapshot, "tally_stock_summary"),
         new("outstanding_payables",   DatasetKind.Snapshot, "tally_outstanding_payables"),
         new("outstanding_receivables",DatasetKind.Snapshot, "tally_outstanding_receivables"),
+        // Bill-level detail behind those two balances (v2.2.0). Additive: the
+        // outstanding_* datasets keep their exact meaning and their staging views.
+        new("bills_payable",          DatasetKind.Snapshot, "tally_bills_payable"),
+        new("bills_receivable",       DatasetKind.Snapshot, "tally_bills_receivable"),
     ];
 
     private static readonly HashSet<string> InventoryDatasets =

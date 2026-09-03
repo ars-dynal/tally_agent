@@ -1,6 +1,11 @@
+using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using Microsoft.Extensions.Logging.Abstractions;
+using TallyAgent.Core;
 using TallyAgent.Core.Configuration;
+using TallyAgent.Core.Data;
+using TallyAgent.Core.Sync;
 
 namespace TallyAgent.Manager;
 
@@ -10,6 +15,12 @@ public partial class ConfigWindow : Window
 {
     private readonly ConfigStore _store = new();
     private readonly AgentConfig _config;
+    /// <summary>extractionStartDate as loaded, so Save can tell whether the
+    /// operator actually changed it.</summary>
+    private readonly string _originalStartDate;
+    /// <summary>True when the full-history walk has latched and the start date
+    /// therefore does nothing on its own.</summary>
+    private readonly bool _startDateInert;
 
     public ConfigWindow()
     {
@@ -22,6 +33,9 @@ public partial class ConfigWindow : Window
         PortBox.Text = _config.Tally.Port.ToString();
         CompanyBox.Text = _config.Tally.Company;
         StartDateBox.Text = _config.Tally.ExtractionStartDate;
+        _originalStartDate = _config.Tally.ExtractionStartDate;
+        _startDateInert = FullHistorySyncHasCompleted();
+        if (_startDateInert) StartDateInertText.Visibility = Visibility.Visible;
         EndDateBox.Text = _config.Tally.ExtractionEndDate;
         FrequencyBox.Text = _config.Tally.SyncFrequencyMinutes.ToString();
         LookbackBox.Text = _config.Tally.IncrementalLookbackDays.ToString();
@@ -32,6 +46,8 @@ public partial class ConfigWindow : Window
         TrialBalanceCheck.IsChecked = _config.Tally.IsSnapshotEnabled("trial_balance");
         OutstandingPayablesCheck.IsChecked = _config.Tally.IsSnapshotEnabled("outstanding_payables");
         OutstandingReceivablesCheck.IsChecked = _config.Tally.IsSnapshotEnabled("outstanding_receivables");
+        BillsPayableCheck.IsChecked = _config.Tally.IsSnapshotEnabled("bills_payable");
+        BillsReceivableCheck.IsChecked = _config.Tally.IsSnapshotEnabled("bills_receivable");
         BalanceSheetCheck.IsChecked = _config.Tally.IsSnapshotEnabled("balance_sheet");
         ProfitLossCheck.IsChecked = _config.Tally.IsSnapshotEnabled("profit_loss");
         StockSummaryCheck.IsChecked = _config.Tally.IsSnapshotEnabled("stock_summary");
@@ -69,6 +85,8 @@ public partial class ConfigWindow : Window
                 ["trial_balance"] = TrialBalanceCheck.IsChecked == true,
                 ["outstanding_payables"] = OutstandingPayablesCheck.IsChecked == true,
                 ["outstanding_receivables"] = OutstandingReceivablesCheck.IsChecked == true,
+                ["bills_payable"] = BillsPayableCheck.IsChecked == true,
+                ["bills_receivable"] = BillsReceivableCheck.IsChecked == true,
                 ["balance_sheet"] = BalanceSheetCheck.IsChecked == true,
                 ["profit_loss"] = ProfitLossCheck.IsChecked == true,
                 ["stock_summary"] = StockSummaryCheck.IsChecked == true,
@@ -93,6 +111,7 @@ public partial class ConfigWindow : Window
             if (SlackBox.Password.Length > 0) _config.Notifications.SlackWebhookUrl = SlackBox.Password;
 
             _store.Save(_config);
+            RequestHistoryRewalkIfStartDateChanged();
             DialogResult = true;
             Close();
         }
@@ -100,6 +119,63 @@ public partial class ConfigWindow : Window
         {
             MessageBox.Show(this, $"Cannot save configuration:\n\n{ex.Message}",
                 "Update Configuration", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    /// <summary>Has the voucher full-history walk already completed? That is
+    /// precisely the condition under which extractionStartDate stops being read
+    /// (see <see cref="SyncPlanner.ExtractionStartDateIsInert"/>). Any failure to
+    /// read the database is treated as "not inert" — a missing warning is better
+    /// than a wrong one.</summary>
+    private static bool FullHistorySyncHasCompleted()
+    {
+        try
+        {
+            var db = new AgentDatabase(NullLogger<AgentDatabase>.Instance);
+            // The company may be blank here (auto-discovery), so match on the
+            // dataset row rather than on a company name the window may not know.
+            var checkpoint = new CheckpointRepository(db).All()
+                .FirstOrDefault(c => c.Dataset == "_vouchers_window");
+            return SyncPlanner.ExtractionStartDateIsInert(checkpoint);
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// A changed start date does nothing once the checkpoint has latched, so
+    /// rather than saving it into silence, offer the one action that applies it:
+    /// re-walking history. Declining still saves the value — it will apply on the
+    /// next Force Full Sync — and says so.
+    /// </summary>
+    private void RequestHistoryRewalkIfStartDateChanged()
+    {
+        var newStartDate = _config.Tally.ExtractionStartDate;
+        if (!_startDateInert || newStartDate == _originalStartDate) return;
+
+        var answer = MessageBox.Show(this,
+            $"Extraction start date changed to '{newStartDate}'.\n\n" +
+            "The full history sync has already completed, so on its own this " +
+            "setting changes nothing — it is only read while that sync is still " +
+            "outstanding.\n\n" +
+            "Re-extract all history now so the new date takes effect?\n\n" +
+            "This re-walks every financial year and takes hours. Choosing No " +
+            "keeps the saved date, which will apply the next time history is " +
+            "re-extracted.",
+            "Extraction start date", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+        if (answer != MessageBoxResult.Yes) return;
+
+        try
+        {
+            AgentInfo.EnsureDirectories();
+            File.WriteAllText(Path.Combine(AgentInfo.TriggerDir, "force-full.trigger"),
+                DateTime.UtcNow.ToString("O"));
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this,
+                "The date was saved, but the re-extract request could not be written:\n\n" +
+                $"{ex.Message}\n\nUse Advanced ▸ Re-extract All History instead.",
+                "Extraction start date", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
     }
 }

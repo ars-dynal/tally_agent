@@ -1,11 +1,38 @@
 param(
-    [string]$Version = "1.0.0",
+    # No literal default. It used to be "1.0.0", which went four minor versions
+    # stale: omitting -Version stamped 1.0.0 onto every assembly and the
+    # installer through -p:Version=, overriding Directory.Build.props, while the
+    # Manager title bar still read the real version from AgentInfo.Version — two
+    # different version numbers for one build. The version now comes from the
+    # same file the build itself uses, so the two cannot drift.
+    [string]$Version,
     [switch]$SkipTests
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
+
+if (-not $Version) {
+    $propsPath = Join-Path $Root "Directory.Build.props"
+    if (-not (Test-Path $propsPath)) { throw "Cannot default -Version: $propsPath not found" }
+    $Version = @(([xml](Get-Content $propsPath -Raw)).Project.PropertyGroup.Version) |
+        Where-Object { $_ } | Select-Object -First 1
+    if (-not $Version) { throw "Cannot default -Version: no <Version> in $propsPath" }
+    $Version = $Version.ToString().Trim()
+    Write-Host "No -Version supplied; using <Version> from Directory.Build.props" -ForegroundColor Yellow
+}
+
+# AgentInfo.Version is the third place the version lives and is what the Manager
+# displays. A mismatch here is the "stale installer under a new tag" failure, so
+# it stops the build rather than shipping two numbers for one artifact.
+$agentVersionFile = Join-Path $Root "src\TallyAgent.Core\AgentVersion.cs"
+$agentVersion = (Select-String -Path $agentVersionFile -Pattern 'Version\s*=\s*"([^"]+)"' |
+    Select-Object -First 1).Matches[0].Groups[1].Value
+if ($agentVersion -ne $Version) {
+    throw "Version mismatch: -Version/$Version but AgentInfo.Version is $agentVersion. " +
+          "Both AgentVersion.cs and Directory.Build.props must be bumped."
+}
 
 Write-Host "Building Tally BigQuery Agent version $Version" -ForegroundColor Cyan
 

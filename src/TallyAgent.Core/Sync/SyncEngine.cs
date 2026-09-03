@@ -28,6 +28,7 @@ public sealed class SyncEngine(
     ReportExtractor reports,
     BatchBuilder batchBuilder,
     CheckpointRepository checkpoints,
+    MasterContentHashRepository masterHashes,
     BatchQueueRepository queue,
     ErrorReporter reporter,
     AgentDatabase db,
@@ -213,7 +214,7 @@ public sealed class SyncEngine(
                         continue;
                     }
 
-                    EnqueueAndCheckpoint(ds.Name, company, syncId, rows, null, null, fullDone: true);
+                    EnqueueMasterOrSnapshot(ds, company, syncId, rows);
                     ok++;
                     if (balancesDue && isBalanceDataset) balanceDatasetsOk++;
                 }
@@ -258,6 +259,18 @@ public sealed class SyncEngine(
             if (!runEnded && enabled.Any(d => d.Kind == DatasetKind.Voucher))
             {
                 var plan = PlanVouchers(company);
+
+                // A configured extractionStartDate that can no longer do anything
+                // is a trap: the operator believes they have moved the range and
+                // nothing happens. Say it in the log every cycle it is true.
+                if (!string.IsNullOrWhiteSpace(config.Tally.ExtractionStartDate) &&
+                    SyncPlanner.ExtractionStartDateIsInert(checkpoints.Get("_vouchers_window", company)))
+                    log.LogWarning(
+                        "extractionStartDate is set to {Date} but has NO effect: the full-history " +
+                        "sync for '{Company}' has already completed, and the setting is only read " +
+                        "while it is outstanding. Run Re-extract All History to apply it.",
+                        config.Tally.ExtractionStartDate, company);
+
                 var skipVouchers = vouchersUnchanged && !plan.IsFullSync;
                 if (skipVouchers)
                 {
@@ -505,6 +518,15 @@ public sealed class SyncEngine(
     {
         checkpoints.Upsert(new SyncCheckpoint("_vouchers_window", company,
             null, null, null, null, FullSyncDone: false));
+        // Force Full Sync means "send everything again", so the master skip must
+        // forget what it believes is already in the warehouse — otherwise the
+        // re-walk would quietly ship vouchers and no masters.
+        try { masterHashes.Clear(company); }
+        catch (Exception ex)
+        {
+            log.LogWarning("Could not clear master content hashes ({Msg}) — " +
+                "unchanged masters may be skipped during this re-walk", ex.Message);
+        }
         log.LogWarning("Force Full Sync — voucher checkpoint reset for '{Company}'", company);
     }
 
@@ -571,6 +593,8 @@ public sealed class SyncEngine(
             "stock_summary" => await reports.StockSummary(fyStart, today, ct),
             "outstanding_payables" => await reports.Outstanding("Sundry Creditors", today, ct),
             "outstanding_receivables" => await reports.Outstanding("Sundry Debtors", today, ct),
+            "bills_payable" => await reports.Bills("Bills Payable", "Sundry Creditors", fyStart, today, ct),
+            "bills_receivable" => await reports.Bills("Bills Receivable", "Sundry Debtors", fyStart, today, ct),
             _ => throw new InvalidOperationException($"Unknown dataset '{dataset}'"),
         };
     }
@@ -634,14 +658,76 @@ public sealed class SyncEngine(
 
     // ── persistence helpers ───────────────────────────────────────
 
-    private void EnqueueAndCheckpoint(string dataset, string company, string syncId,
+    private List<string> EnqueueAndCheckpoint(string dataset, string company, string syncId,
         List<Row> rows, string? windowFrom, string? windowTo, bool fullDone)
     {
         var now = DateTime.UtcNow;
-        batchBuilder.BuildAndEnqueue(dataset, company, syncId, rows, now, now,
+        var ids = batchBuilder.BuildAndEnqueue(dataset, company, syncId, rows, now, now,
             windowFrom, windowTo, config.Cloud.UploadBatchMaxRecords);
         checkpoints.Upsert(new SyncCheckpoint(dataset, company, windowFrom, windowTo,
             null, now.ToString("O"), fullDone));
+        return ids;
+    }
+
+    /// <summary>
+    /// Enqueue one master/snapshot dataset, skipping the upload when a MASTER's
+    /// content is byte-identical to the last extraction the cloud acknowledged.
+    ///
+    /// Masters are re-extracted every cycle by design (they are cheap
+    /// collections), but they were also re-UPLOADED every cycle unchanged:
+    /// ~10,757 rows an hour, ~247,000 redundant rows across the back-fill.
+    ///
+    /// Three rules make this safe against the failure mode that matters —
+    /// masters silently not uploading, which nothing would notice:
+    ///   • only a CONFIRMED hash (every batch acked) can suppress an upload;
+    ///   • the checkpoint still advances on a skip, so a skip is a success, not
+    ///     a gap that looks like a stall;
+    ///   • the hash excludes _sync_id/_sync_timestamp, which change on every
+    ///     upload by construction (see <see cref="MasterContentHash"/>).
+    /// Snapshots are never skipped: they are dated as-of values, and a report
+    /// that happens to repeat is still evidence for that day.
+    /// </summary>
+    private void EnqueueMasterOrSnapshot(DatasetDefinition ds, string company, string syncId,
+        List<Row> rows)
+    {
+        if (ds.Kind != DatasetKind.Master || rows.Count == 0)
+        {
+            EnqueueAndCheckpoint(ds.Name, company, syncId, rows, null, null, fullDone: true);
+            return;
+        }
+
+        var hash = MasterContentHash.Compute(ds.Name, company, rows);
+        string? confirmed;
+        try
+        {
+            confirmed = masterHashes.ConfirmedHash(ds.Name, company);
+        }
+        catch (Exception ex)
+        {
+            // The skip is an optimisation; never let it cost an upload.
+            log.LogWarning("Master content hash unavailable for {Dataset} ({Msg}) — uploading",
+                ds.Name, ex.Message);
+            EnqueueAndCheckpoint(ds.Name, company, syncId, rows, null, null, fullDone: true);
+            return;
+        }
+
+        if (confirmed == hash)
+        {
+            checkpoints.Upsert(new SyncCheckpoint(ds.Name, company, null, null, null,
+                DateTime.UtcNow.ToString("O"), true));
+            log.LogInformation(
+                "Dataset {Dataset} unchanged since the last acknowledged upload " +
+                "({Rows} rows, hash {Hash}) — upload skipped", ds.Name, rows.Count, hash[..12]);
+            return;
+        }
+
+        var ids = EnqueueAndCheckpoint(ds.Name, company, syncId, rows, null, null, fullDone: true);
+        try { masterHashes.RecordPending(ds.Name, company, hash, ids); }
+        catch (Exception ex)
+        {
+            // Losing the hash only costs one redundant upload next cycle.
+            log.LogWarning("Could not record content hash for {Dataset} ({Msg})", ds.Name, ex.Message);
+        }
     }
 
     private string ResolveCompany(IReadOnlyList<string> openCompanies)
