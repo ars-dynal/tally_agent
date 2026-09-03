@@ -60,6 +60,14 @@ After building, check the installer's timestamp and size actually changed.
 - **Tally serialises user-defined fields with an undeclared namespace prefix**
   (`<UDF:FIELD>`), which invalidates the whole response. `TallyXml.Sanitize`
   declares undeclared prefixes. Do not remove it.
+- **Tally silently ignores an unknown `<FETCH>` entry.** `.LIST` is how Tally
+  SERIALISES a list-valued member, not a member you can fetch — ask for it and
+  you get a valid response with the sub-object absent, zero rows and no error.
+  Use the dotted form (`ALLLEDGERENTRIES.BILLALLOCATIONS.*`). **A dataset
+  returning nothing with no error is the signature.** `opening_bills` fetched
+  `BILLALLOCATIONS.LIST` and returned zero rows for its entire history while
+  bill-wise details were enabled in Tally; nothing ever reported a problem
+  because nothing had gone wrong as far as Tally was concerned.
 - **Do not reintroduce a `<FILTER>` on `$Date` in `VoucherCollection`.** Tried;
   made things worse.
 
