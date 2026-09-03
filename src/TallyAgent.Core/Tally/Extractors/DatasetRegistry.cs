@@ -66,6 +66,30 @@ public static class DatasetRegistry
     private static readonly HashSet<string> CostCentreDatasets =
         ["cost_centres","cost_categories","cost_centre_allocations"];
 
+    /// <summary>Reports known to make Tally compute across the whole company.
+    /// On 2026-09-02 a cycle with snapshots enabled reached balance_sheet and
+    /// hung tally.exe until it was force-closed; the datasets after it in run
+    /// order (including both outstandings) were never attempted. Recommended
+    /// off — derive them in BigQuery from ledgers/groups, vouchers and
+    /// stock_items/inventory_entries instead.</summary>
+    public static readonly IReadOnlySet<string> HeavyReports =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "balance_sheet", "profit_loss", "stock_summary" };
+
+    /// <summary>Datasets where zero rows is a suspicious result rather than a
+    /// legitimately empty table. Every Snapshot already qualifies by kind; this
+    /// set adds the Masters for which silence has hidden a real problem.
+    /// opening_bills is the reason it exists: it is a Master, so the snapshot
+    /// zero-row guard never fired, and it has been checkpointing successfully
+    /// on nothing (bill-wise details are most likely not enabled in Tally).</summary>
+    public static readonly IReadOnlySet<string> ExpectedNonEmptyMasters =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "opening_bills" };
+
+    /// <summary>Should a zero-row result from this dataset be reported rather
+    /// than checkpointed as a success?</summary>
+    public static bool ExpectsRows(DatasetDefinition d) =>
+        d.Kind == DatasetKind.Snapshot || ExpectedNonEmptyMasters.Contains(d.Name);
+
     /// <summary>Datasets enabled by the config toggles.</summary>
     public static IReadOnlyList<DatasetDefinition> Enabled(TallySettings s) =>
         All.Where(d => IsEnabled(d, s)).ToList();
@@ -79,7 +103,7 @@ public static class DatasetRegistry
         {
             DatasetKind.Master => s.EnableMasters,
             DatasetKind.Voucher => s.EnableVouchers,
-            DatasetKind.Snapshot => s.EnableSnapshots,
+            DatasetKind.Snapshot => s.IsSnapshotEnabled(d.Name),
             _ => true,
         };
     }

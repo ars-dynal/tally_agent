@@ -92,6 +92,25 @@ public sealed class TallySettings
     /// ledgers are extracted anyway, so the reports can be derived downstream,
     /// and skipping them removes the longest stalls from the walk.</summary>
     [JsonPropertyName("enableSnapshots")] public bool EnableSnapshots { get; set; } = true;
+    /// <summary>Per-report override of <see cref="EnableSnapshots"/>, keyed by
+    /// dataset name (balance_sheet, outstanding_payables, ...). Exists because
+    /// the six snapshot reports are NOT equivalent: balance_sheet, profit_loss
+    /// and stock_summary make Tally compute across the whole company and have
+    /// been observed to hang tally.exe outright, while the two outstanding
+    /// reports are needed for AR/AP reconciliation. With a single all-or-nothing
+    /// flag the outstandings sit behind balance_sheet in run order and are never
+    /// reached at all. A dataset with no entry here falls back to
+    /// enableSnapshots, so an existing config file keeps its current behaviour;
+    /// enableSnapshots=false still disables every report regardless of entries.</summary>
+    [JsonPropertyName("snapshotDatasets")]
+    public Dictionary<string, bool>? SnapshotDatasets { get; set; }
+    /// <summary>Keep producing the legacy <c>vouchers</c> dataset, which is a
+    /// byte-identical copy of <c>day_book</c> — VoucherExtractor adds the same
+    /// row object to both. Measured at 170,073 vs 170,056 rows in raw for the
+    /// same data. Off by default from v2.1.0; turn on only while something
+    /// downstream still reads the <c>vouchers</c> name.</summary>
+    [JsonPropertyName("emitLegacyVouchersDataset")]
+    public bool EmitLegacyVouchersDataset { get; set; } = false;
     [JsonPropertyName("enableMasters")] public bool EnableMasters { get; set; } = true;
     [JsonPropertyName("enableVouchers")] public bool EnableVouchers { get; set; } = true;
     [JsonPropertyName("enableInventory")] public bool EnableInventory { get; set; } = true;
@@ -102,6 +121,20 @@ public sealed class TallySettings
     /// shrinks windows adaptively (never grows them within a run) when a window
     /// times out or takes more than 60% of voucherTimeoutSeconds.</summary>
     [JsonPropertyName("fullSyncChunkDays")] public int FullSyncChunkDays { get; set; } = 7;
+
+    /// <summary>Is this snapshot report enabled? A per-dataset entry wins over
+    /// the blanket flag; an absent entry (or absent section) falls back to it.
+    /// <see cref="EnableSnapshots"/> remains a master switch: false disables
+    /// every report even where an entry says true.</summary>
+    public bool IsSnapshotEnabled(string dataset)
+    {
+        if (!EnableSnapshots) return false;
+        if (SnapshotDatasets is { Count: > 0 })
+            foreach (var kv in SnapshotDatasets)
+                if (string.Equals(kv.Key, dataset, StringComparison.OrdinalIgnoreCase))
+                    return kv.Value;
+        return true;
+    }
 
     public Uri BaseUri => new($"http://{Host}:{Port}/");
 }

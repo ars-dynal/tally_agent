@@ -82,20 +82,50 @@
             </StackPanel>
         </Border>
 
-        <!-- Action buttons -->
-        <WrapPanel Grid.Row="3" Margin="0,0,0,4">
-            <Button x:Name="TestTallyBtn" Content="Test Tally Connection" Click="TestTally_Click"/>
-            <Button x:Name="TestCloudBtn" Content="Test Cloud Connection" Click="TestCloud_Click"/>
-            <Button x:Name="StartBtn" Content="Start Service" Click="StartService_Click"/>
-            <Button x:Name="StopBtn" Content="Stop Service" Click="StopService_Click"/>
-            <Button x:Name="RestartBtn" Content="Restart Service" Click="RestartService_Click"/>
-            <Button x:Name="SyncNowBtn" Content="Sync Now (catch up)" Click="SyncNow_Click"/>
-            <Button x:Name="ForceFullBtn" Content="Re-extract Whole Range" Click="ForceFull_Click"/>
-            <Button x:Name="RetryBtn" Content="Retry Failed Batches" Click="RetryFailed_Click"/>
-            <Button Content="Open Log Folder" Click="OpenLogs_Click"/>
-            <Button Content="Export Diagnostics" Click="ExportDiag_Click"/>
-            <Button Content="Update Configuration" Click="EditConfig_Click"/>
-        </WrapPanel>
+        <!-- Actions.  One primary button; everything that is rare, slow or
+             destructive lives under Advanced.  "Sync Now (catch up)" sat one
+             click away from "Re-extract Whole Range" - a one-minute job beside
+             a seven-hour one, with nothing to tell them apart. -->
+        <StackPanel Grid.Row="3" Margin="0,0,0,4">
+            <WrapPanel>
+                <Button x:Name="SyncNowBtn" Content="Sync Now" Click="SyncNow_Click"
+                        FontWeight="Bold" Padding="18,7" Margin="0,0,10,6"
+                        ToolTip="Runs a normal sync straight away: yesterday's changes plus the lookback window. Takes about a minute."/>
+                <Button Content="Settings" Click="EditConfig_Click" Padding="12,7" Margin="0,0,10,6"/>
+                <Button x:Name="TestTallyBtn" Content="Test Tally Connection" Click="TestTally_Click"
+                        Padding="12,7" Margin="0,0,10,6"/>
+                <Button x:Name="TestCloudBtn" Content="Test Cloud Connection" Click="TestCloud_Click"
+                        Padding="12,7" Margin="0,0,10,6"/>
+            </WrapPanel>
+
+            <Expander Header="Advanced" Margin="0,2,0,0" Foreground="#555555">
+                <Border BorderBrush="#DDDDDD" BorderThickness="1" Padding="10" Margin="0,6,0,0"
+                        Background="#FAFAFA">
+                    <StackPanel>
+                        <WrapPanel>
+                            <Button x:Name="RestartBtn" Content="Restart Service" Click="RestartService_Click"
+                                    Margin="0,0,8,6"/>
+                            <Button x:Name="StartBtn" Content="Start Service" Click="StartService_Click"
+                                    Margin="0,0,8,6"/>
+                            <Button x:Name="StopBtn" Content="Stop Service" Click="StopService_Click"
+                                    Margin="0,0,8,6"/>
+                            <Button x:Name="RetryBtn" Content="Retry Failed Batches" Click="RetryFailed_Click"
+                                    Margin="0,0,8,6"/>
+                            <Button Content="Open Log Folder" Click="OpenLogs_Click" Margin="0,0,8,6"/>
+                            <Button Content="Export Diagnostics" Click="ExportDiag_Click" Margin="0,0,8,6"/>
+                        </WrapPanel>
+
+                        <Separator Margin="0,6,0,8"/>
+
+                        <Button x:Name="ForceFullBtn" Content="Re-extract All History…" Click="ForceFull_Click"
+                                Foreground="#A4262C" HorizontalAlignment="Left" Padding="12,6"
+                                ToolTip="Re-walks every financial year from the beginning."/>
+                        <TextBlock Margin="0,6,0,0" TextWrapping="Wrap" FontSize="11" Foreground="#A4262C"
+                                   Text="Takes several hours and slows Tally the whole time. Only needed if data is found to be missing — a normal sync already keeps everything up to date."/>
+                    </StackPanel>
+                </Border>
+            </Expander>
+        </StackPanel>
 
         <!-- Recent errors -->
         <GroupBox Grid.Row="4" Header="Recent errors" Margin="0,4,0,8">

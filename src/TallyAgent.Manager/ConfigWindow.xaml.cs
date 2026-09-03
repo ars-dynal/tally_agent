@@ -26,6 +26,15 @@ public partial class ConfigWindow : Window
         FrequencyBox.Text = _config.Tally.SyncFrequencyMinutes.ToString();
         LookbackBox.Text = _config.Tally.IncrementalLookbackDays.ToString();
         SnapshotsCheck.IsChecked = _config.Tally.EnableSnapshots;
+        // Per-report flags (v2.1.0). A report with no entry in snapshotDatasets
+        // falls back to the blanket flag, which is what an upgraded config has,
+        // so an existing install shows exactly the state it was already in.
+        TrialBalanceCheck.IsChecked = _config.Tally.IsSnapshotEnabled("trial_balance");
+        OutstandingPayablesCheck.IsChecked = _config.Tally.IsSnapshotEnabled("outstanding_payables");
+        OutstandingReceivablesCheck.IsChecked = _config.Tally.IsSnapshotEnabled("outstanding_receivables");
+        BalanceSheetCheck.IsChecked = _config.Tally.IsSnapshotEnabled("balance_sheet");
+        ProfitLossCheck.IsChecked = _config.Tally.IsSnapshotEnabled("profit_loss");
+        StockSummaryCheck.IsChecked = _config.Tally.IsSnapshotEnabled("stock_summary");
         MastersCheck.IsChecked = _config.Tally.EnableMasters;
         VouchersCheck.IsChecked = _config.Tally.EnableVouchers;
         InventoryCheck.IsChecked = _config.Tally.EnableInventory;
@@ -53,6 +62,17 @@ public partial class ConfigWindow : Window
             _config.Tally.SyncFrequencyMinutes = int.Parse(FrequencyBox.Text.Trim());
             _config.Tally.IncrementalLookbackDays = int.Parse(LookbackBox.Text.Trim());
             _config.Tally.EnableSnapshots = SnapshotsCheck.IsChecked == true;
+            // Always write every report explicitly, so what the window shows is
+            // what the file says - no silent fallback once a person has chosen.
+            _config.Tally.SnapshotDatasets = new Dictionary<string, bool>
+            {
+                ["trial_balance"] = TrialBalanceCheck.IsChecked == true,
+                ["outstanding_payables"] = OutstandingPayablesCheck.IsChecked == true,
+                ["outstanding_receivables"] = OutstandingReceivablesCheck.IsChecked == true,
+                ["balance_sheet"] = BalanceSheetCheck.IsChecked == true,
+                ["profit_loss"] = ProfitLossCheck.IsChecked == true,
+                ["stock_summary"] = StockSummaryCheck.IsChecked == true,
+            };
             _config.Tally.EnableMasters = MastersCheck.IsChecked == true;
             _config.Tally.EnableVouchers = VouchersCheck.IsChecked == true;
             _config.Tally.EnableInventory = InventoryCheck.IsChecked == true;

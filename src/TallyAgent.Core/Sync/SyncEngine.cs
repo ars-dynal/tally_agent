@@ -198,14 +198,17 @@ public sealed class SyncEngine(
                     // SNAPSHOT report (trial_balance, balance_sheet, …) is a
                     // suspicious outcome, not a success — do NOT advance its
                     // checkpoint (it retries next cycle) and surface a grouped
-                    // warning. Masters may legitimately be empty.
-                    if (ds.Kind == DatasetKind.Snapshot && rows.Count == 0)
+                    // warning. Most Masters may legitimately be empty, but a
+                    // few may not: opening_bills checkpointed silently on zero
+                    // rows for months because the guard was keyed on Kind alone.
+                    if (rows.Count == 0 && DatasetRegistry.ExpectsRows(ds))
                     {
-                        log.LogWarning("Snapshot dataset {Dataset} returned 0 rows — " +
+                        log.LogWarning("Dataset {Dataset} returned 0 rows where rows were expected — " +
                             "checkpoint NOT advanced; will retry next cycle", ds.Name);
                         await reporter.ReportAsync(ErrorCategory.UnexpectedException,
                             ErrorSeverity.Warning,
-                            $"Snapshot dataset '{ds.Name}' returned 0 rows (report and fallback both empty).",
+                            $"Dataset '{ds.Name}' returned 0 rows where rows were expected " +
+                            "(report and fallback both empty).",
                             operation: CurrentOperation, dataset: ds.Name, ct: CancellationToken.None);
                         continue;
                     }
@@ -310,7 +313,7 @@ public sealed class SyncEngine(
                             var wf = from.ToString("yyyy-MM-dd");
                             var wt = to.ToString("yyyy-MM-dd");
 
-                            foreach (var (name, rows) in FanOut(result))
+                            foreach (var (name, rows) in FanOut(result, config.Tally.EmitLegacyVouchersDataset))
                             {
                                 if (!enabled.Any(d => d.Name == name)) continue;
                                 totalRows += rows.Count;
@@ -601,9 +604,20 @@ public sealed class SyncEngine(
         return errors;
     }
 
-    private static IEnumerable<(string Name, List<Row> Rows)> FanOut(VoucherExtractor.DayBookResult r)
+    /// <summary>Split one Day Book response into its datasets.
+    ///
+    /// <paramref name="emitLegacyVouchers"/> (v2.1.0): VoucherExtractor adds the
+    /// SAME row object to both <c>Vouchers</c> and <c>DayBook</c>
+    /// (<c>result.Vouchers.Add(flat); result.DayBook.Add(new Row(flat))</c>), so
+    /// the two datasets are byte-identical by construction — measured at 170,073
+    /// and 170,056 rows in raw. Off by default: <c>day_book</c> is the Tally
+    /// report this data actually is, and <c>vouchers</c> is a second copy of it
+    /// under an older name. Set <c>emitLegacyVouchersDataset: true</c> to keep
+    /// producing it while anything downstream still reads it.</summary>
+    private static IEnumerable<(string Name, List<Row> Rows)> FanOut(
+        VoucherExtractor.DayBookResult r, bool emitLegacyVouchers)
     {
-        yield return ("vouchers", r.Vouchers);
+        if (emitLegacyVouchers) yield return ("vouchers", r.Vouchers);
         yield return ("voucher_headers", r.VoucherHeaders);
         yield return ("voucher_lines", r.VoucherLines);
         yield return ("bill_allocations", r.BillAllocations);
