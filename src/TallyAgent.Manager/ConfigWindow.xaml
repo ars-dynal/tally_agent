@@ -33,17 +33,58 @@
             </Grid>
         </GroupBox>
 
-        <GroupBox Header="Datasets" Padding="8" Margin="0,8,0,0">
+        <GroupBox Header="What to extract" Padding="8" Margin="0,8,0,0">
             <WrapPanel>
-                <CheckBox x:Name="MastersCheck" Content="Masters" Margin="0,0,14,0"/>
-                <CheckBox x:Name="VouchersCheck" Content="Vouchers" Margin="0,0,14,0"/>
+                <CheckBox x:Name="MastersCheck" Content="Masters" Margin="0,0,14,0"
+                          ToolTip="Ledgers, groups, stock items, units, voucher types."/>
+                <CheckBox x:Name="VouchersCheck" Content="Transactions" Margin="0,0,14,0"
+                          ToolTip="Vouchers and their lines, allocations and inventory entries."/>
                 <CheckBox x:Name="InventoryCheck" Content="Inventory" Margin="0,0,14,0"/>
                 <CheckBox x:Name="GstCheck" Content="GST" Margin="0,0,14,0"/>
                 <CheckBox x:Name="CostCentresCheck" Content="Cost centres" Margin="0,0,14,0"/>
-                <CheckBox x:Name="SnapshotsCheck" Content="Snapshot reports" Margin="0,0,14,0"
-                          ToolTip="Trial Balance, Balance Sheet, P&amp;L, Stock Summary, outstandings.&#x0a;The heaviest requests the agent makes. Turn OFF on a back-fill machine."/>
                 <CheckBox x:Name="AutoDiscoverCheck" Content="Auto-discover company"/>
             </WrapPanel>
+        </GroupBox>
+
+        <GroupBox Header="Reports — each one asks Tally to compute" Padding="8" Margin="0,8,0,0">
+            <StackPanel>
+                <CheckBox x:Name="SnapshotsCheck" Content="Extract reports at all"
+                          FontWeight="Bold" Margin="0,0,0,6"
+                          ToolTip="Master switch. Unticking this turns off every report below."/>
+
+                <CheckBox x:Name="TrialBalanceCheck" Content="Trial Balance" Margin="16,3,0,0"/>
+                <TextBlock Text="Used nightly to prove our figures match Tally's own."
+                           Margin="34,0,0,4" Foreground="Gray" FontSize="11"/>
+
+                <CheckBox x:Name="OutstandingPayablesCheck" Content="Outstanding Payables" Margin="16,3,0,0"/>
+                <TextBlock Text="What we owe suppliers, bill by bill. Needed for AP ageing."
+                           Margin="34,0,0,4" Foreground="Gray" FontSize="11"/>
+
+                <CheckBox x:Name="OutstandingReceivablesCheck" Content="Outstanding Receivables" Margin="16,3,0,0"/>
+                <TextBlock Text="What customers owe us, bill by bill."
+                           Margin="34,0,0,8" Foreground="Gray" FontSize="11"/>
+
+                <CheckBox x:Name="BalanceSheetCheck" Content="Balance Sheet  — known to freeze Tally"
+                          Foreground="#A4262C" Margin="16,3,0,0"/>
+                <TextBlock Text="Recommended OFF — calculated in BigQuery from ledgers and groups."
+                           Margin="34,0,0,4" Foreground="Gray" FontSize="11"/>
+
+                <CheckBox x:Name="ProfitLossCheck" Content="Profit and Loss  — known to freeze Tally"
+                          Foreground="#A4262C" Margin="16,3,0,0"/>
+                <TextBlock Text="Recommended OFF — calculated in BigQuery from vouchers."
+                           Margin="34,0,0,4" Foreground="Gray" FontSize="11"/>
+
+                <CheckBox x:Name="StockSummaryCheck" Content="Stock Summary  — known to freeze Tally"
+                          Foreground="#A4262C" Margin="16,3,0,0"/>
+                <TextBlock Text="Recommended OFF — calculated in BigQuery from inventory entries."
+                           Margin="34,0,0,4" Foreground="Gray" FontSize="11"/>
+
+                <Border Background="#F3F3F3" BorderBrush="#DDDDDD" BorderThickness="1"
+                        Padding="8" Margin="0,8,0,0">
+                    <TextBlock TextWrapping="Wrap" FontSize="11" Foreground="#444444"
+                               Text="Reports run once a day after 8pm, never during office hours. The three marked above make Tally compute across the whole company and have been observed to stop it responding until it is force-closed."/>
+                </Border>
+            </StackPanel>
         </GroupBox>
 
         <GroupBox Header="Cloud" Padding="8" Margin="0,8,0,0">
@@ -94,9 +135,15 @@
             </Grid>
         </GroupBox>
 
-        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
-            <Button Content="Save" Width="110" Click="Save_Click" Margin="0,0,8,0"/>
-            <Button Content="Cancel" Width="110" IsCancel="True"/>
-        </StackPanel>
+        <DockPanel Margin="0,14,0,0">
+            <TextBlock DockPanel.Dock="Left" VerticalAlignment="Center" Foreground="Gray" FontSize="11"
+                       TextWrapping="Wrap" MaxWidth="300"
+                       Text="Saving restarts the sync service so the new settings take effect — about 5 seconds."/>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button Content="Save &amp; restart" Width="130" Click="Save_Click" Margin="0,0,8,0"
+                        IsDefault="True"/>
+                <Button Content="Cancel" Width="110" IsCancel="True"/>
+            </StackPanel>
+        </DockPanel>
     </StackPanel>
 </Window>

@@ -1,5 +1,75 @@
 # Changelog
 
+## 2.1.0 (in progress) - Snapshot reports one at a time; day_book stops being uploaded twice
+
+### Per-dataset snapshot control
+
+v2.0.7 made the six snapshot reports switchable, but as a single all-or-nothing
+flag. That turned out to hide a worse problem. On 2026-09-02, with snapshots on,
+a manual sync reached dataset 16 of 34 - `balance_sheet` - and hung tally.exe
+until it was force-closed. Everything before it extracted normally (35,386
+records). `outstanding_payables` and `outstanding_receivables` sit after
+`balance_sheet` in run order, so they were never attempted at all - which
+matches the evidence that neither has ever produced a single GCS object.
+
+They were never broken. They were unreachable, behind a report that hangs Tally.
+
+* `snapshotDatasets` - a per-report override keyed by dataset name. A report
+  with no entry falls back to `enableSnapshots`, so an existing config.json
+  keeps its current behaviour exactly. `enableSnapshots: false` still disables
+  every report regardless of entries.
+* `DatasetRegistry.HeavyReports` names the three that compute across the whole
+  company (`balance_sheet`, `profit_loss`, `stock_summary`). Recommended off -
+  derive them downstream from ledgers/groups, vouchers and
+  stock_items/inventory_entries, which are extracted anyway.
+* Zero-row reporting no longer keys on `DatasetKind` alone. `opening_bills` is a
+  Master, so the snapshot guard never fired and it checkpointed successfully on
+  nothing, month after month. `DatasetRegistry.ExpectsRows` now covers it: a
+  dataset that returns nothing where rows are expected does not advance its
+  checkpoint and reports a warning.
+* Nine new tests, including the migration guarantee (no `snapshotDatasets`
+  section behaves identically to before) and the production shape (heavy
+  reports off, outstandings on).
+
+### After installing
+Set the three heavy reports off and leave the outstandings on, then run one
+cycle. If the outstandings still produce nothing, they will now say so through
+`/errors` instead of failing silently.
+
+### The `vouchers` dataset was a second copy of `day_book`
+
+`VoucherExtractor` adds the same row object to both lists:
+
+    result.Vouchers.Add(flat);
+    result.DayBook.Add(new Row(flat));
+
+So the two datasets are byte-identical by construction. Raw holds 170,073 rows
+under `vouchers` and 170,056 under `day_book` - the same data, stored, loaded
+and scanned twice.
+
+* `emitLegacyVouchersDataset` (default **false**) stops producing `vouchers`.
+  `day_book` is the Tally report this data actually is; `vouchers` is an older
+  name for the same thing.
+* Turn it on only while something downstream still reads the `vouchers` name.
+  Check the staging views before upgrading.
+* Nothing already in raw is touched - this only stops adding more.
+
+### Not in this release
+Timeout and continue-past-failure were on the list and turned out to already
+exist and behave correctly - `snapshotTimeoutSeconds` (300s) had not elapsed
+when Tally was force-closed at 2.5 minutes, and `TallyClient.NeedsDrain`
+already models "Tally is still busy with a request we abandoned". No timeout
+can help here: cancelling the request does not stop Tally computing. The fix is
+not asking for the report.
+
+The four stock datasets (`stock_items`, `gst_rates`, `stock_standard_costs`,
+`stock_standard_prices`) were suspected of being four copies of one collection
+because they carry identical row counts. They are not. `MasterExtractor`
+already fetches the StockItem document ONCE per cycle (v2.0.5) and derives all
+four in memory, and each projects different fields - item attributes, GST/HSN
+details, standard cost entries, standard price entries. The counts match only
+because every item happens to have exactly one of each. No change made.
+
 ## 2.0.8 - Undeclared namespace prefixes no longer lose a whole window
 
 Found during the seven-year back-fill: the March 2026 voucher window failed with

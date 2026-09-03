@@ -300,13 +300,21 @@ public partial class MainWindow : Window
 
     private void ForceFull_Click(object sender, RoutedEventArgs e)
     {
+        var officeHours = DateTime.Now.Hour is >= 9 and < 20
+            && DateTime.Now.DayOfWeek is not (DayOfWeek.Saturday or DayOfWeek.Sunday);
         var confirm = MessageBox.Show(this,
-            "Force Full Sync resets the extraction checkpoints and re-extracts the " +
-            "ENTIRE voucher history from the configured start date.\n\n" +
-            "Re-uploaded data does not create duplicates (the warehouse merges on " +
-            "stable keys), but the full walk can take a long time on large companies.\n\n" +
-            "Continue?",
-            "Force Full Sync", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+            "This re-extracts the ENTIRE voucher history from the configured start " +
+            "date — every financial year, from the beginning.\n\n" +
+            "It takes SEVERAL HOURS and Tally will be slow for anyone using it the " +
+            "whole time.\n\n" +
+            "You do not need this for normal operation: the hourly sync already keeps " +
+            "everything up to date. Use it only if data is found to be missing.\n\n" +
+            (officeHours
+                ? "It is currently office hours. Running this now will affect people " +
+                  "working in Tally. Consider running it this evening instead.\n\n"
+                : "")
+            + "Continue?",
+            "Re-extract All History", MessageBoxButton.YesNo, MessageBoxImage.Warning);
         if (confirm != MessageBoxResult.Yes) return;
         try
         {
@@ -386,8 +394,25 @@ public partial class MainWindow : Window
         if (win.ShowDialog() == true)
         {
             LoadBackend();
+
+            // v2.1.0: the running service loaded config.json at startup and does
+            // not re-read it. Telling the operator to "restart to apply" was a
+            // trap - a saved change looked applied and silently was not, and a
+            // full sync ran against the old settings. Do the restart here.
+            var wasRunning = false;
+            try
+            {
+                using var probe = new ServiceController(AgentInfo.ServiceName);
+                wasRunning = probe.Status == ServiceControllerStatus.Running;
+            }
+            catch { /* service not installed - nothing to restart */ }
+
+            if (wasRunning)
+                RestartService_Click(sender, e);   // reports its own outcome
+            else
+                FooterText.Text = "Configuration saved. Start the service to apply it.";
+
             RefreshStatus();
-            FooterText.Text = "Configuration saved. Restart the service to apply changes.";
         }
     }
 
