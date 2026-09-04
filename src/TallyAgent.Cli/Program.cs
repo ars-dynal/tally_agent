@@ -285,7 +285,7 @@ static async Task<int> PostEnvelopes(TallyClient client, AgentConfig cfg,
         }
         catch (Exception ex) { Console.WriteLine($"  (not parseable: {ex.Message})"); }
 
-        Console.WriteLine("  head: " + Truncate(body, 600).ReplaceLineEndings(" "));
+        Console.WriteLine("  head: " + Truncate(body, 1200).ReplaceLineEndings(" "));
 
         if (dump)
         {

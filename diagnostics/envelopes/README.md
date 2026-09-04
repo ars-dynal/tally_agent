@@ -46,6 +46,39 @@ shown it. That is why every row now carries a `source` column.
 | `06-ledger-outstandings-report` | Report name `Ledger Outstandings`. |
 | `07-bills-receivable-no-explodeflag` | The receivable mirror of `01`, to confirm whatever works is not payable-only. |
 
+## `08` and `09` answer a different question
+
+These two are not about bills. They ask whether Tally holds an **alias / part
+number** on stock items and ledgers — because if the TRICO item code or vendor
+code is sitting in one, the TRICO↔Tally bridge stops being a name-token
+heuristic and becomes an exact join.
+
+What the agent extracts today:
+
+| Dataset | Alias column | Sourced from |
+|---|---|---|
+| `stock_items` | `alias` | `ADDITIONALNAME` only |
+| `voucher_types` | `alias` | `ADDITIONALNAME` only |
+| `ledgers` | **none** | — |
+
+Tally normally stores an alias as the SECOND `<NAME>` inside
+`<LANGUAGENAME.LIST><NAME.LIST>`, which the agent does **not** fetch. So a code
+entered the usual way would read as empty in `stock_items.alias` even though it
+is present in Tally, and for ledgers there is no column at all.
+
+`08` and `09` fetch `ADDITIONALNAME`, `LANGUAGENAME.LIST` and `PARTNO` together
+so the response head shows which of them actually carries a value. Unknown FETCH
+entries are ignored silently by Tally, so asking for all of them costs nothing.
+
+These two are full master collections, so they are the heaviest requests in the
+folder. They are the same collections the agent already fetches every cycle, but
+run them outside office hours with the rest.
+
+| File | What it tests |
+|---|---|
+| `08-stockitem-alias-fields` | Stock item alias / part number. |
+| `09-ledger-alias-fields` | Ledger alias (vendor code). |
+
 ## What to send back
 
 The whole console output. If something is ACCEPTED, its element histogram is
