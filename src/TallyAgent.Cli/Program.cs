@@ -30,6 +30,7 @@ try
         "sync-now" => WriteTrigger("sync-now"),
         "force-full-sync" => WriteTrigger("force-full"),
         "capture-xml" => await CaptureXml(argv.Skip(1).ToList()),
+        "verify" => await Verify(argv.Skip(1).ToList(), json),
         "verify-bills" => await VerifyBills(argv.Skip(1).ToList(), json),
         "diagnose-opening-bills" => await DiagnoseOpeningBills(argv.Skip(1).ToList(), json),
         "retry-failed" => RetryFailed(json),
@@ -302,6 +303,274 @@ static async Task<int> PostEnvelopes(TallyClient client, AgentConfig cfg,
 }
 
 static string Truncate(string s, int max) => s.Length <= max ? s : s[..max] + "…";
+
+
+// ── the v2.3.0 gate ────────────────────────────────────────────────
+//
+// The reference is TALLY'S OWN EXPORT, not a number someone remembers. Every
+// comparison below is record-for-record against a file Tally produced from its
+// own UI, so "it reconciles" is never accepted as evidence on its own.
+
+/// <summary>
+/// verify — prove the agent's extraction against Tally's own export files.
+///
+/// usage: verify --bills &lt;Bills.xml&gt; --trial-balance &lt;TrialBal.xml&gt;
+///               [--live] [--from d] [--to d] [--json]
+///
+/// Without --live this runs the REFERENCE FILES through the exact parsers the
+/// agent uses and reports what they yield. That proves the parser against real
+/// Tally output and needs no Tally connection.
+///
+/// With --live it additionally asks Tally for the same reports and diffs the
+/// agent's response against the reference RECORD FOR RECORD.
+///
+/// Exit code 1 on any mismatch, so this can gate a release.
+/// </summary>
+static async Task<int> Verify(List<string> a, bool json)
+{
+    var live = a.Remove("--live");
+    string? billsRef = null, tbRef = null;
+    var today = DateOnly.FromDateTime(DateTime.Today);
+    var from = new DateOnly(today.Month >= 4 ? today.Year : today.Year - 1, 4, 1);
+    var to = today;
+    for (var i = 0; i < a.Count - 1; i++)
+    {
+        switch (a[i])
+        {
+            case "--bills": billsRef = a[++i]; break;
+            case "--trial-balance": tbRef = a[++i]; break;
+            case "--from": from = DateOnly.Parse(a[++i]); break;
+            case "--to": to = DateOnly.Parse(a[++i]); break;
+        }
+    }
+
+    var results = new List<object>();
+    var ok = true;
+
+    // ── reference files, through the agent's own parsers ──────────
+    List<Dictionary<string, object?>>? refBills = null, refTb = null;
+    if (billsRef is not null)
+    {
+        refBills = ReportExtractor.ParseBillsReport(LoadReference(billsRef), to);
+        results.Add(new
+        {
+            check = "reference:bills",
+            file = billsRef,
+            rows = refBills.Count,
+            total = Math.Round(refBills.Sum(r => Convert.ToDouble(r["pending_amount"] ?? 0d)), 2),
+            with_overdue_days = refBills.Count(r => r["overdue_days"] is not null),
+            blank_overdue_days = refBills.Count(r => r["overdue_days"] is null),
+            parsed_bill_dates = refBills.Count(r => r["bill_date"] is not null),
+            parsed_due_dates = refBills.Count(r => r["due_date"] is not null),
+            distinct_parties = refBills.Select(r => (string?)r["party_name"] ?? "").Distinct().Count(),
+            zero_amounts = refBills.Count(r => Convert.ToDouble(r["pending_amount"] ?? 0d) == 0),
+            sample = refBills.Take(3).ToList(),
+        });
+    }
+    if (tbRef is not null)
+    {
+        refTb = ReportExtractor.ParseTrialBalanceReport(LoadReference(tbRef));
+        results.Add(new
+        {
+            check = "reference:trial_balance",
+            file = tbRef,
+            rows = refTb.Count,
+            debit_total = Math.Round(refTb.Sum(r => Convert.ToDouble(r["closing_debit"] ?? 0d)), 2),
+            credit_total = Math.Round(refTb.Sum(r => Convert.ToDouble(r["closing_credit"] ?? 0d)), 2),
+            groups = refTb.Select(r => (string?)r["ledger_name"]).ToList(),
+        });
+    }
+
+    // ── live Tally, diffed against the reference ──────────────────
+    if (live)
+    {
+        var cfg = new ConfigStore().Load();
+        using var client = new TallyClient(cfg.Tally, NullLogger<TallyClient>.Instance);
+        if (await FailFastIfTallyUnreachable(client, cfg, json) is { } unreachable) return unreachable;
+
+        var period = await client.GetActivePeriodAsync();
+        results.Add(new
+        {
+            check = "active_period",
+            period = period is null ? "unknown"
+                : $"{period.Value.From:yyyy-MM-dd}..{period.Value.To:yyyy-MM-dd}",
+            requested = $"{from:yyyy-MM-dd}..{to:yyyy-MM-dd}",
+            covers_request = period is null ? (bool?)null
+                : period.Value.From <= from && period.Value.To >= to,
+        });
+
+        var reports = new ReportExtractor(client, NullLogger<ReportExtractor>.Instance);
+        reports.BeginCycle();
+
+        if (tbRef is not null)
+        {
+            var liveTb = await reports.TrialBalance(from, to, CancellationToken.None);
+            var diff = DiffRows(refTb!, liveTb, ["ledger_name"],
+                ["closing_debit", "closing_credit"]);
+            if (diff.Count > 0) ok = false;
+            results.Add(new
+            {
+                check = "live:trial_balance",
+                rows = liveTb.Count,
+                source = liveTb.Count > 0 ? liveTb[0]["source"] : null,
+                mismatches = diff.Count,
+                first_mismatches = diff.Take(10).ToList(),
+            });
+        }
+
+        if (billsRef is not null)
+        {
+            var liveBills = await reports.Bills("Bills Payable", "Sundry Creditors",
+                from, to, CancellationToken.None);
+            var diff = DiffRows(refBills!, liveBills, ["bill_ref", "party_name"],
+                ["pending_amount", "bill_date", "due_date", "overdue_days"]);
+            if (diff.Count > 0) ok = false;
+            results.Add(new
+            {
+                check = "live:bills_payable",
+                rows = liveBills.Count,
+                source = liveBills.Count > 0 ? liveBills[0]["source"] : null,
+                total = Math.Round(liveBills.Sum(r => Convert.ToDouble(r["pending_amount"] ?? 0d)), 2),
+                mismatches = diff.Count,
+                first_mismatches = diff.Take(10).ToList(),
+            });
+        }
+
+        // ── the dataset list, with ROW COUNTS rather than assertions ──
+        //
+        // voucher_lines in particular: emitLegacyVouchersDataset going false
+        // removed only the `vouchers` copy of day_book, and this is where that
+        // is demonstrated rather than claimed.
+        var db = new AgentDatabase(NullLogger<AgentDatabase>.Instance);
+        var masters = new MasterExtractor(client, new MasterBalanceRepository(db),
+            NullLogger<MasterExtractor>.Instance);
+        masters.BeginCycle(cfg.Tally.Company, fetchBalances: false);
+        var voucherExtractor = new VoucherExtractor(client, NullLogger<VoucherExtractor>.Instance);
+
+        var counts = new List<object>();
+        foreach (var ds in DatasetRegistry.Enabled(cfg.Tally).Where(d => d.Kind == DatasetKind.Master))
+        {
+            try
+            {
+                var rows = await ExtractMasterByName(masters, ds.Name);
+                counts.Add(new { dataset = ds.Name, kind = "master", rows = rows?.Count, error = (string?)null });
+            }
+            catch (Exception ex)
+            {
+                ok = false;
+                counts.Add(new { dataset = ds.Name, kind = "master", rows = (int?)null, error = (string?)ex.Message });
+            }
+        }
+
+        // One voucher window (the incremental lookback) fans out to every
+        // voucher-derived dataset in a single Tally request.
+        var vFrom = to.AddDays(-Math.Max(1, cfg.Tally.IncrementalLookbackDays));
+        try
+        {
+            var banks = await masters.BankLedgerNames(CancellationToken.None);
+            var fan = await voucherExtractor.ExtractWindow(vFrom, to, banks, CancellationToken.None);
+            foreach (var (name, rows) in new (string, int)[]
+            {
+                ("voucher_headers", fan.VoucherHeaders.Count),
+                ("voucher_lines", fan.VoucherLines.Count),
+                ("bill_allocations", fan.BillAllocations.Count),
+                ("bank_allocations", fan.BankAllocations.Count),
+                ("cost_centre_allocations", fan.CostCentreAllocations.Count),
+                ("inventory_entries", fan.InventoryEntries.Count),
+                ("day_book", fan.DayBook.Count),
+                ("bank_book", fan.BankBook.Count),
+                ("sales_register", fan.SalesRegister.Count),
+                ("purchase_register", fan.PurchaseRegister.Count),
+                ("sales_invoice_lines", fan.SalesInvoiceLines.Count),
+                ("voucher_guid_manifest", fan.Manifest.Count),
+                ("vouchers (legacy copy of day_book)", fan.Vouchers.Count),
+            })
+                counts.Add(new { dataset = name, kind = "voucher", rows = (int?)rows, error = (string?)null });
+        }
+        catch (Exception ex)
+        {
+            ok = false;
+            counts.Add(new { dataset = "vouchers[window]", kind = "voucher", rows = (int?)null, error = (string?)ex.Message });
+        }
+
+        results.Add(new
+        {
+            check = "dataset_row_counts",
+            voucher_window = $"{vFrom:yyyy-MM-dd}..{to:yyyy-MM-dd}",
+            emit_legacy_vouchers_dataset = cfg.Tally.EmitLegacyVouchersDataset,
+            datasets = counts,
+        });
+    }
+
+    Console.WriteLine(JsonSerializer.Serialize(new { ok, live, results },
+        new JsonSerializerOptions { WriteIndented = true }));
+    return ok ? 0 : 1;
+}
+
+/// <summary>Master datasets by name, matching SyncEngine's dispatch.</summary>
+static async Task<List<Dictionary<string, object?>>?> ExtractMasterByName(
+    MasterExtractor m, string dataset) => dataset switch
+{
+    "companies" => await m.Companies(CancellationToken.None),
+    "groups" => await m.Groups(CancellationToken.None),
+    "ledgers" => await m.Ledgers(CancellationToken.None),
+    "voucher_types" => await m.VoucherTypes(CancellationToken.None),
+    "cost_centres" => await m.CostCentres(CancellationToken.None),
+    "cost_categories" => await m.CostCategories(CancellationToken.None),
+    "currencies" => await m.Currencies(CancellationToken.None),
+    "uom" => await m.Units(CancellationToken.None),
+    "gst_rates" => await m.GstRates(CancellationToken.None),
+    "stock_groups" => await m.StockGroups(CancellationToken.None),
+    "stock_items" => await m.StockItems(CancellationToken.None),
+    "godowns" => await m.Godowns(CancellationToken.None),
+    "stock_standard_costs" => await m.StockStandardCosts(CancellationToken.None),
+    "stock_standard_prices" => await m.StockStandardPrices(CancellationToken.None),
+    _ => null,
+};
+
+/// <summary>Load a Tally export file through the SAME decode path the agent
+/// uses for a live response — UTF-16LE with a BOM included.</summary>
+static System.Xml.Linq.XDocument LoadReference(string path) =>
+    TallyXml.Parse(File.ReadAllBytes(path));
+
+/// <summary>Record-for-record diff, keyed on <paramref name="keyFields"/> and
+/// compared on <paramref name="compareFields"/>. Reports records missing from
+/// either side as well as value differences.</summary>
+static List<string> DiffRows(
+    List<Dictionary<string, object?>> reference,
+    List<Dictionary<string, object?>> actual,
+    string[] keyFields, string[] compareFields)
+{
+    static string Key(Dictionary<string, object?> r, string[] fields) =>
+        string.Join("", fields.Select(f => r.TryGetValue(f, out var v) ? V(v) : ""));
+    static string V(object? v) => v switch
+    {
+        null => "",
+        double d => d.ToString("F2", System.Globalization.CultureInfo.InvariantCulture),
+        _ => v.ToString() ?? "",
+    };
+
+    var diffs = new List<string>();
+    var refByKey = new Dictionary<string, Dictionary<string, object?>>();
+    foreach (var r in reference) refByKey[Key(r, keyFields)] = r;
+    var actByKey = new Dictionary<string, Dictionary<string, object?>>();
+    foreach (var r in actual) actByKey[Key(r, keyFields)] = r;
+
+    foreach (var (k, r) in refByKey)
+    {
+        if (!actByKey.TryGetValue(k, out var b)) { diffs.Add($"MISSING from agent: {k}"); continue; }
+        foreach (var f in compareFields)
+        {
+            var rv = r.TryGetValue(f, out var x) ? V(x) : "";
+            var bv = b.TryGetValue(f, out var y) ? V(y) : "";
+            if (rv != bv) diffs.Add($"{k} :: {f}: reference={rv} agent={bv}");
+        }
+    }
+    foreach (var k in actByKey.Keys)
+        if (!refByKey.ContainsKey(k)) diffs.Add($"EXTRA in agent (not in reference): {k}");
+
+    return diffs;
+}
 
 /// <summary>verify-bills — run the two NEW bill-level datasets against a live
 /// Tally and report exactly what came back, so the extraction envelope can be
@@ -610,6 +879,11 @@ static int Usage()
                       (post raw envelopes verbatim; print refusal, element
                        histogram and response head. Placeholders: {{COMPANY}},
                        {{FROM}}, {{TO}}. See diagnostics/envelopes/)
+          verify --bills <Bills.xml> --trial-balance <TrialBal.xml>
+                      [--live] [--from d] [--to d] [--json]
+                      (THE GATE: run Tally's own export through the agent's
+                       parsers; with --live also diff the agent's response
+                       against it record for record. Exit 1 on any mismatch.)
           verify-bills [--from d] [--to d] [--dump] [--json]
                       [--expect-rows-payable N]    [--expect-total-payable X]
                       [--expect-rows-receivable N] [--expect-total-receivable X]

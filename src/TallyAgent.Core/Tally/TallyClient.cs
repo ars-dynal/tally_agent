@@ -185,6 +185,54 @@ public sealed class TallyClient : IDisposable
         return null;
     }
 
+    /// <summary>
+    /// The open company's period, or null when Tally does not report one.
+    ///
+    /// Tally bounds every voucher and report export by this period no matter
+    /// what SVFROMDATE/SVTODATE say, and a request outside it comes back valid
+    /// and EMPTY. Callers use it to fail loudly instead of checkpointing a
+    /// silent nothing.
+    ///
+    /// NOT YET CONFIRMED against a live Tally: which Company field carries the
+    /// ACTIVE (Alt+F2) period as opposed to the books period. STARTINGFROM /
+    /// ENDINGAT is the pair used here, and the raw values are reported wherever
+    /// the guard fires so a wrong assumption is visible on the first run rather
+    /// than inferred. If STARTINGFROM turns out to be the books beginning, the
+    /// computed period is WIDER than the real one — the guard under-fires and
+    /// nothing breaks, which is the safe direction to be wrong in.
+    /// </summary>
+    public async Task<(DateOnly From, DateOnly To)?> GetActivePeriodAsync(CancellationToken ct = default)
+    {
+        XDocument doc;
+        try
+        {
+            doc = await PostAsync(TallyEnvelopes.CompanyPeriod(_settings.Company), ct);
+        }
+        catch (TallyException ex)
+        {
+            _log.LogWarning("Active period unavailable ({Msg}) — period guard inactive this run", ex.Message);
+            return null;
+        }
+
+        foreach (var el in doc.Descendants("COMPANY"))
+        {
+            var name = TallyXml.Text(el, "NAME");
+            if (!string.IsNullOrWhiteSpace(_settings.Company) && name.Length > 0 &&
+                !name.Equals(_settings.Company, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var from = ParseDate(TallyXml.Date(el, "STARTINGFROM"))
+                    ?? ParseDate(TallyXml.Date(el, "BOOKSFROM"));
+            var to = ParseDate(TallyXml.Date(el, "ENDINGAT"));
+            if (from is { } f && to is { } t && t >= f) return (f, t);
+        }
+        return null;
+    }
+
+    private static DateOnly? ParseDate(string? iso) =>
+        DateOnly.TryParse(iso, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None, out var d) ? d : null;
+
     public Task<XDocument> PostAsync(string envelope, CancellationToken ct = default) =>
         PostAsync(envelope, null, null, ct);
 
@@ -297,6 +345,7 @@ public sealed class TallyClient : IDisposable
 
             HttpResponseMessage? resp = null;
             byte[] body;
+            string? httpCharset = null;
             try
             {
                 using var content = new ByteArrayContent(Encoding.UTF8.GetBytes(envelope));
@@ -307,6 +356,9 @@ public sealed class TallyClient : IDisposable
                 request.Headers.ConnectionClose = true;
                 resp = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token);
                 body = await ReadBoundedBodyAsync(resp, timeoutCts.Token);
+                // Last-resort encoding hint, below the BOM and the XML
+                // declaration (see TallyXml.Decode).
+                httpCharset = resp.Content.Headers.ContentType?.CharSet;
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
@@ -349,7 +401,7 @@ public sealed class TallyClient : IDisposable
             XDocument parsed;
             try
             {
-                parsed = TallyXml.Parse(body);
+                parsed = TallyXml.Parse(body, httpCharset);
             }
             catch (Exception ex)
             {

@@ -150,10 +150,12 @@ public static class TallyEnvelopes
             sb.Append("<SVCURRENTCOMPANY>").Append(TallyXml.XmlEscape(company)).Append("</SVCURRENTCOMPANY>");
         sb.Append("<SVFROMDATE>").Append(from.ToString("yyyyMMdd")).Append("</SVFROMDATE>")
           .Append("<SVTODATE>").Append(to.ToString("yyyyMMdd")).Append("</SVTODATE>")
-          // Ask for the bill-level rows rather than the party-level summary the
-          // report opens on: without these the export collapses to one line per
-          // party and every bill column comes back empty.
-          .Append("<EXPLODEFLAG>Yes</EXPLODEFLAG>")
+          // NO EXPLODEFLAG. v2.2.0 added one on the reasoning that the export
+          // would otherwise collapse to a party-level summary. Tally's own UI
+          // export disproves it: Bills.xml is bill-level (351 BILLFIXED records)
+          // and this envelope is otherwise identical to Report(), which the
+          // Trial Balance export shows working. It was the only thing separating
+          // the two, and it was never evidence.
           .Append("<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>")
           .Append("</STATICVARIABLES></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>");
         return sb.ToString();
@@ -191,6 +193,18 @@ public static class TallyEnvelopes
           .Append("</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>");
         return sb.ToString();
     }
+
+    /// <summary>
+    /// The open company's period. Tally bounds EVERY export by the active
+    /// period (Alt+F2) regardless of SVFROMDATE/SVTODATE: a request outside it
+    /// returns a valid, EMPTY response with no error — which is exactly how six
+    /// years once looked empty for three weeks (see CLAUDE.md). Anyone with the
+    /// Tally UI open can change it at any moment, so it is read at the start of
+    /// every run rather than assumed.
+    /// </summary>
+    public static string CompanyPeriod(string? company) =>
+        Collection("Company",
+            ["NAME", "STARTINGFROM", "ENDINGAT", "BOOKSFROM"], company);
 
     /// <summary>Lightweight company-list probe (also the connection test).</summary>
     public static string CompanyList() =>

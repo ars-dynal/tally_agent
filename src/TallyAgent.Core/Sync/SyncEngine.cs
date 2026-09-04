@@ -56,6 +56,10 @@ public sealed class SyncEngine(
     /// <summary>Checkpoint row that records the last daily master-balance capture.</summary>
     private const string MasterBalancesCheckpoint = "_master_balances";
 
+    /// <summary>The company's active period, read fresh at the start of every
+    /// run. Null when Tally did not report one (the guard is then inactive).</summary>
+    private (DateOnly From, DateOnly To)? _activePeriod;
+
     public Task<SyncResult> RunCycleAsync(string mode, CancellationToken ct) =>
         RunCycleAsync(mode, null, ct);
 
@@ -131,6 +135,22 @@ public sealed class SyncEngine(
             }
 
             var company = ResolveCompany(probe.Companies);
+
+            // ── Active period ─────────────────────────────────────
+            // Tally bounds EVERY export by the company's active period (Alt+F2)
+            // no matter what SVFROMDATE/SVTODATE say, and a request outside it
+            // returns a valid, EMPTY response with no error. Six years of
+            // vouchers once looked empty for three weeks because of exactly
+            // this. Anyone with the Tally UI open can change it mid-run, so it
+            // is read at the start of every run rather than configured.
+            _activePeriod = await tally.GetActivePeriodAsync(ct);
+            if (_activePeriod is { } ap)
+                log.LogInformation("Tally active period: {From:yyyy-MM-dd}..{To:yyyy-MM-dd}",
+                    ap.From, ap.To);
+            else
+                log.LogWarning("Tally did not report an active period — the period guard is " +
+                    "INACTIVE this run, so an out-of-period range would extract as empty.");
+
             var enabled = DatasetRegistry.Enabled(config.Tally);
             log.LogInformation("Sync {SyncId} ({Mode}) starting: company='{Company}', {N} datasets",
                 syncId, mode, company, enabled.Count);
@@ -320,6 +340,7 @@ public sealed class SyncEngine(
                         CurrentOperation = $"extract:vouchers {from:yyyy-MM-dd}..{to:yyyy-MM-dd}";
                         try
                         {
+                            GuardActivePeriod(from, to, "this voucher window");
                             var sw = System.Diagnostics.Stopwatch.StartNew();
                             var result = await vouchers.ExtractWindow(from, to, bankLedgers, ct);
                             sw.Stop();
@@ -570,6 +591,11 @@ public sealed class SyncEngine(
         var today = DateOnly.FromDateTime(DateTime.Today);
         var fyStart = new DateOnly(today.Month >= 4 ? today.Year : today.Year - 1, 4, 1);
 
+        // Snapshot reports are computed over fyStart..today; masters are not
+        // date-ranged and are unaffected.
+        if (DatasetRegistry.All.FirstOrDefault(d => d.Name == dataset)?.Kind == DatasetKind.Snapshot)
+            GuardActivePeriod(fyStart, today, $"the {dataset} report range");
+
         return dataset switch
         {
             "companies" => await masters.Companies(ct),
@@ -581,7 +607,6 @@ public sealed class SyncEngine(
             "currencies" => await masters.Currencies(ct),
             "uom" => await masters.Units(ct),
             "gst_rates" => await masters.GstRates(ct),
-            "opening_bills" => await masters.OpeningBills(ct),
             "stock_groups" => await masters.StockGroups(ct),
             "stock_items" => await masters.StockItems(ct),
             "godowns" => await masters.Godowns(ct),
@@ -597,6 +622,28 @@ public sealed class SyncEngine(
             "bills_receivable" => await reports.Bills("Bills Receivable", "Sundry Debtors", fyStart, today, ct),
             _ => throw new InvalidOperationException($"Unknown dataset '{dataset}'"),
         };
+    }
+
+    /// <summary>
+    /// Fail loudly when the requested range falls outside Tally's active period.
+    ///
+    /// This is an ERROR, not a log line, precisely because the symptom is
+    /// silence: Tally answers a request outside its active period with a valid,
+    /// EMPTY response. Without this the dataset checkpoints on nothing and the
+    /// run reports success. The actual period is printed in the message because
+    /// the fix is a person pressing Alt+F2 in Tally.
+    /// </summary>
+    private void GuardActivePeriod(DateOnly from, DateOnly to, string what)
+    {
+        if (_activePeriod is not { } p) return;          // unknown ⇒ cannot judge
+        if (p.From <= from && p.To >= to) return;        // covered
+
+        throw new TallyException(ErrorCategory.TallyActivePeriodTooNarrow,
+            $"Tally's active period is {p.From:dd-MMM-yyyy} to {p.To:dd-MMM-yyyy}, which does not " +
+            $"cover {what} ({from:dd-MMM-yyyy} to {to:dd-MMM-yyyy}). Tally bounds every export by " +
+            "the active period regardless of the requested dates and returns an EMPTY response " +
+            "outside it, so this would have extracted nothing and reported success. " +
+            "Widen the period in Tally (Alt+F2) and re-run.");
     }
 
     private static List<string> ValidateExtractionCounts(IReadOnlyDictionary<string, int> counts)

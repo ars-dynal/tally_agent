@@ -11,21 +11,19 @@ using Xunit;
 namespace TallyAgent.Core.Tests;
 
 /// <summary>
-/// v2.2.0 — opening_bills has returned zero rows for its entire history while
-/// bill-wise details are enabled in Tally.
+/// opening_bills — RETIRED in v2.3.0 (see DatasetRegistry.RetiredOpeningBills).
 ///
-/// The leading hypothesis is the FETCH list: v2.1.0 asked for the single field
-/// "BILLALLOCATIONS.LIST", but ".LIST" is how Tally SERIALISES a list-valued
-/// member, not a member that can be fetched — and Tally ignores an unknown FETCH
-/// entry silently, returning a valid response with the sub-object simply absent.
-/// The dotted sub-field form is the technique VoucherCollection already uses for
-/// ALLLEDGERENTRIES.BILLALLOCATIONS.*, which does produce rows.
+/// It returned zero rows for its entire history. The diagnosis was that the
+/// FETCH list asked for "BILLALLOCATIONS.LIST" — a serialisation name, not a
+/// fetchable member, which Tally ignores silently — but that was reasoned from
+/// the code and never confirmed against a live Tally, so the dataset was removed
+/// rather than shipped with an unverified fix that might have left it
+/// checkpointing on nothing for another few months.
 ///
-/// THIS IS NOT YET CONFIRMED against a live Tally — the server was unreachable
-/// from the build machine. `TallyAgent.Cli diagnose-opening-bills` sends both
-/// field lists and reports which one actually returns bill elements. What these
-/// tests pin is that the request now asks for both forms and that the parser
-/// reads whichever shape comes back.
+/// MasterExtractor.OpeningBills and `TallyAgent.Cli diagnose-opening-bills`
+/// remain, so it can be revived the moment there is evidence. These tests keep
+/// the parser honest in the meantime, and pin that the LEDGER export no longer
+/// carries bill allocations no dataset consumes.
 /// </summary>
 public sealed class OpeningBillsTests : IDisposable
 {
@@ -90,19 +88,15 @@ public sealed class OpeningBillsTests : IDisposable
         """;
 
     [Fact]
-    public async Task LedgerRequest_AsksForBillAllocationSubFields_NotJustTheListName()
+    public async Task LedgerRequest_NoLongerCarriesBillAllocations()
     {
+        // opening_bills is retired, so making Tally serialise a bill-allocation
+        // sub-object for every ledger would be pure waste - the same cost
+        // v2.0.5 removed elsewhere. diagnose-opening-bills sends its own fields.
         var (ex, h) = Build(LedgerWithBillsDotList);
-        await ex.OpeningBills(CancellationToken.None);
+        await ex.Ledgers(CancellationToken.None);
 
-        var request = h.Requests.Single();
-        // The dotted sub-fields are the change; the old entry is kept because
-        // over-fetching is harmless and the true cause is not yet confirmed.
-        Assert.Contains("BILLALLOCATIONS.NAME", request);
-        Assert.Contains("BILLALLOCATIONS.BILLDATE", request);
-        Assert.Contains("BILLALLOCATIONS.OPENINGBALANCE", request);
-        Assert.Contains("BILLALLOCATIONS.CLOSINGBALANCE", request);
-        Assert.Contains("BILLALLOCATIONS.LIST", request);
+        Assert.DoesNotContain("BILLALLOCATIONS", h.Requests.Single());
     }
 
     [Fact]

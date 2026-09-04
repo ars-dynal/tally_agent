@@ -63,26 +63,54 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
     {
         var doc = await PostReport(
             TallyEnvelopes.Report("Trial Balance", from, to, client.Company), ct);
-        var rows = WalkNameAmountPairs(doc, (name, amtEl) =>
-        {
-            var dr = Child(amtEl, "DSPCLDR") is not null ? NumByLocalName(amtEl, "DSPCLDR") : 0;
-            var cr = Child(amtEl, "DSPCLCR") is not null ? NumByLocalName(amtEl, "DSPCLCR") : 0;
-            if (dr == 0 && cr == 0) dr = NumByLocalName(amtEl, "BSMAINAMT");
-            return new Row
-            {
-                ["ledger_name"] = name,
-                ["closing_debit"] = Math.Abs(dr),
-                ["closing_credit"] = Math.Abs(cr),
-                ["net_amount"] = dr - cr,
-                ["parent_group"] = "",
-                ["source"] = "report",
-            };
-        });
+        var rows = ParseTrialBalanceReport(doc);
         if (rows.Count == 0)
             rows = await TrialBalanceFromLedgers(from, to, ct);
         log.LogInformation("Trial balance: {N} rows from {Source}", rows.Count, SourceOf(rows));
         return rows;
     }
+
+    /// <summary>
+    /// Parse a "Trial Balance" report export.
+    ///
+    /// Verified against Tally's own UI export (TrialBal.xml, 11 primary groups):
+    ///
+    ///     &lt;DSPACCNAME&gt;&lt;DSPDISPNAME&gt;Current Liabilities&lt;/DSPDISPNAME&gt;&lt;/DSPACCNAME&gt;
+    ///     &lt;DSPACCINFO&gt;
+    ///       &lt;DSPCLDRAMT&gt;&lt;DSPCLDRAMTA&gt;-110996207.04&lt;/DSPCLDRAMTA&gt;&lt;/DSPCLDRAMT&gt;
+    ///       &lt;DSPCLCRAMT&gt;&lt;DSPCLCRAMTA&gt;56888982.54&lt;/DSPCLCRAMTA&gt;&lt;/DSPCLCRAMT&gt;
+    ///     &lt;/DSPACCINFO&gt;
+    ///
+    /// DEBITS ARE NEGATIVE, and an empty amount element means "nothing on this
+    /// side". The pre-v2.3.0 code looked for DSPCLDR / DSPCLCR / BSMAINAMT, none
+    /// of which appear here - so if this report had ever answered, it would have
+    /// produced 11 rows of zeros rather than no rows at all.
+    ///
+    /// Public so the verification tool can run the reference export through the
+    /// exact code the agent uses.
+    /// </summary>
+    public static List<Row> ParseTrialBalanceReport(XDocument doc) =>
+        WalkNameAmountPairs(doc, (name, amtEl) =>
+        {
+            var dr = NumByLocalName(amtEl, "DSPCLDRAMTA");
+            var cr = NumByLocalName(amtEl, "DSPCLCRAMTA");
+            // Other layouts, kept as fallbacks WITHIN the report route.
+            if (dr == 0) dr = NumByLocalName(amtEl, "DSPCLDR");
+            if (cr == 0) cr = NumByLocalName(amtEl, "DSPCLCR");
+            if (dr == 0 && cr == 0) dr = NumByLocalName(amtEl, "BSMAINAMT");
+            var debit = Math.Abs(dr);
+            var credit = Math.Abs(cr);
+            return new Row
+            {
+                ["ledger_name"] = name,
+                ["closing_debit"] = debit,
+                ["closing_credit"] = credit,
+                // Debit-positive, matching the ledger fallback's -closing.
+                ["net_amount"] = debit - credit,
+                ["parent_group"] = "",
+                ["source"] = "report",
+            };
+        });
 
     /// <summary>Which route produced these rows, for the log line. The rows
     /// themselves carry it in <c>source</c>.</summary>
@@ -302,24 +330,37 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
     // the trial balance, and staging views are deployed against them. These two
     // answer the different question "which bills make up that balance".
 
-    /// <summary>Row-container element names to try, in priority order. The FIRST
-    /// name that yields any rows wins — the shapes nest inside one another on
-    /// some builds, so unioning them would double-count every bill.</summary>
-    private static readonly string[] BillContainers =
-        ["BILLFIXED", "BILLS", "DSPBILLINFO", "BILLOUTSTANDING", "BILL"];
+    /// <summary>
+    /// The record container in Tally's Bills Payable / Bills Receivable export.
+    ///
+    /// Verified against Tally's own UI export (Bills.xml, 351 records):
+    ///
+    ///     &lt;BILLFIXED&gt;
+    ///       &lt;BILLDATE&gt;1-Nov-21&lt;/BILLDATE&gt;
+    ///       &lt;BILLREF&gt;PO/21-22/00172&lt;/BILLREF&gt;
+    ///       &lt;BILLPARTY&gt;Apar Industries Limited&lt;/BILLPARTY&gt;
+    ///     &lt;/BILLFIXED&gt;
+    ///     &lt;BILLCL&gt;-369.00&lt;/BILLCL&gt;
+    ///     &lt;BILLDUE&gt;1-Nov-21&lt;/BILLDUE&gt;
+    ///     &lt;BILLOVERDUE&gt;1768&lt;/BILLOVERDUE&gt;
+    ///
+    /// The amount, due date and overdue count are FOLLOWING SIBLINGS of
+    /// BILLFIXED, not children of it. Searching inside the container - which is
+    /// what the first cut did - finds the reference and the party but never the
+    /// amount, and yields 351 rows of 0.00 that look like a working extraction.
+    /// </summary>
+    private const string BillRecordContainer = "BILLFIXED";
 
-    private static readonly string[] BillRefTags =
-        ["BILLREF", "BILLNAME", "DSPBILLREF", "NAME"];
-    private static readonly string[] BillDateTags =
-        ["BILLDATE", "DSPBILLDATE", "BILLDT", "DATE"];
-    private static readonly string[] BillPartyTags =
-        ["BILLPARTY", "PARTYNAME", "PARTYLEDGERNAME", "LEDGERNAME", "DSPDISPNAME", "PARENT"];
+    /// <summary>Amounts are negative for credit and are kept EXACTLY as Tally
+    /// reports them; the sign is information, not a formatting accident.</summary>
     private static readonly string[] BillAmountTags =
-        ["BILLAMT", "DSPBILLAMT", "CLOSINGBALANCE", "BILLCLBALANCE", "PENDINGAMOUNT", "AMOUNT"];
-    private static readonly string[] BillDueTags =
-        ["BILLDUE", "BILLDUEDATE", "DSPBILLDUEDATE", "DUEDATE"];
-    private static readonly string[] BillOverdueTags =
-        ["BILLOVERDUE", "DSPBILLOVERDUE", "OVERDUEDAYS", "AGEINGDAYS", "BILLAGE"];
+        ["BILLCL", "BILLAMT", "DSPBILLAMT", "CLOSINGBALANCE"];
+    private static readonly string[] BillRefTags = ["BILLREF", "BILLNAME", "NAME"];
+    private static readonly string[] BillDateTags = ["BILLDATE", "DSPBILLDATE"];
+    private static readonly string[] BillPartyTags =
+        ["BILLPARTY", "PARTYNAME", "PARTYLEDGERNAME", "LEDGERNAME", "DSPDISPNAME"];
+    private static readonly string[] BillDueTags = ["BILLDUE", "BILLDUEDATE", "DUEDATE"];
+    private static readonly string[] BillOverdueTags = ["BILLOVERDUE", "OVERDUEDAYS", "BILLAGE"];
 
     /// <summary>
     /// Bill-level outstandings from Tally's own "Bills Payable" / "Bills
@@ -349,32 +390,45 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
     /// response and report what matched without a second request to Tally.</summary>
     public static List<Row> ParseBillsReport(XDocument doc, DateOnly asOf)
     {
-        foreach (var container in BillContainers)
+        var rows = new List<Row>();
+        foreach (var el in doc.Descendants().Where(e => Is(e, BillRecordContainer)))
         {
-            var rows = new List<Row>();
-            foreach (var el in doc.Descendants().Where(e => Is(e, container)))
+            // A record is the container PLUS the siblings that follow it, up to
+            // the next container. Both the flat layout Tally actually emits and
+            // a nested one therefore read the same way.
+            var scope = RecordScope(el);
+
+            var billRef = FirstText(scope, BillRefTags);
+            var amount = FirstNum(scope, BillAmountTags);
+            if (billRef.Length == 0 && amount == 0) continue;
+
+            rows.Add(new Row
             {
-                var billRef = FirstText(el, BillRefTags);
-                var amount = FirstNum(el, BillAmountTags);
-                // A container carrying neither a reference nor an amount is a
-                // layout node (a party header, a total line), not a bill.
-                if (billRef.Length == 0 && amount == 0) continue;
-                rows.Add(new Row
-                {
-                    ["party_name"] = PartyFor(el),
-                    ["bill_ref"] = billRef,
-                    ["bill_date"] = FirstDate(el, BillDateTags),
-                    ["pending_amount"] = amount,
-                    ["due_date"] = FirstDate(el, BillDueTags),
-                    ["overdue_days"] = FirstOverdueDays(el),
-                    ["bill_type"] = FirstText(el, ["BILLTYPE", "DSPBILLTYPE"]),
-                    ["as_of_date"] = asOf.ToString("yyyy-MM-dd"),
-                    ["source"] = "report",
-                });
-            }
-            if (rows.Count > 0) return rows;
+                ["party_name"] = FirstText(scope, BillPartyTags),
+                ["bill_ref"] = billRef,
+                ["bill_date"] = FirstDate(scope, BillDateTags),
+                ["pending_amount"] = amount,
+                ["due_date"] = FirstDate(scope, BillDueTags),
+                ["overdue_days"] = FirstOverdueDays(scope),
+                ["as_of_date"] = asOf.ToString("yyyy-MM-dd"),
+                ["source"] = "report",
+            });
         }
-        return [];
+        return rows;
+    }
+
+    /// <summary>The elements belonging to one bill record: the container and
+    /// every following sibling up to the next container.</summary>
+    private static List<XElement> RecordScope(XElement container)
+    {
+        var scope = new List<XElement> { container };
+        for (var sib = container.NextNode as XElement; sib is not null;
+             sib = sib.NextNode as XElement)
+        {
+            if (Is(sib, BillRecordContainer)) break;
+            scope.Add(sib);
+        }
+        return scope;
     }
 
     /// <summary>Fallback: the period-bound Bills collection. Payable vs
@@ -419,7 +473,6 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
                     ? bd.AddDays(creditDays).ToString("yyyy-MM-dd") : null,
                 // Never computed — Tally's figure does not exist on this path.
                 ["overdue_days"] = null,
-                ["bill_type"] = Text(el, "BILLTYPE"),
                 ["as_of_date"] = to.ToString("yyyy-MM-dd"),
                 ["source"] = "bills_collection",
             });
@@ -443,74 +496,54 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
         finally { _cacheLock.Release(); }
     }
 
-    /// <summary>The party a bill row belongs to. Bill rows frequently carry no
-    /// party of their own — the report groups them under a party header — so an
-    /// ancestor's name field is the fallback.</summary>
-    private static string PartyFor(XElement el)
-    {
-        var direct = FirstText(el, BillPartyTags);
-        if (direct.Length > 0) return direct;
-
-        for (var a = el.Parent; a is not null; a = a.Parent)
-        {
-            var nameEl = a.Elements().FirstOrDefault(e => Is(e, "DSPACCNAME"));
-            if (nameEl is not null)
-            {
-                var name = DspName(nameEl);
-                if (name.Length > 0) return name;
-            }
-            foreach (var tag in BillPartyTags)
-            {
-                var child = a.Elements().FirstOrDefault(e => Is(e, tag));
-                var value = child?.Value.Trim();
-                if (!string.IsNullOrEmpty(value)) return value;
-            }
-        }
-        return "";
-    }
-
-    /// <summary>Tally's overdue-day count, kept verbatim. Some builds render it
-    /// as "45 Days" rather than a bare number, so digits are extracted; a row
-    /// with no overdue column at all stays null rather than becoming 0, which
-    /// would read as "due today" downstream.</summary>
-    private static long? FirstOverdueDays(XElement el)
+    /// <summary>Tally's overdue-day count, kept verbatim. An EMPTY element stays
+    /// null rather than becoming 0 - 38 of the 351 reference records have no
+    /// overdue value, and "0" (due today) is a different fact from blank (not
+    /// yet due).</summary>
+    private static long? FirstOverdueDays(List<XElement> scope)
     {
         foreach (var tag in BillOverdueTags)
         {
-            var target = el.DescendantsAndSelf().FirstOrDefault(e => Is(e, tag));
+            var target = Find(scope, tag);
             if (target is null) continue;
-            var digits = new string(target.Value.Where(c => char.IsDigit(c) || c == '-').ToArray());
+            var raw = target.Value.Trim();
+            if (raw.Length == 0) return null;
+            var digits = new string(raw.Where(c => char.IsDigit(c) || c == '-').ToArray());
             if (digits.Length > 0 && long.TryParse(digits, out var days)) return days;
         }
         return null;
     }
 
-    private static string FirstText(XElement el, string[] tags)
+    private static XElement? Find(List<XElement> scope, string tag) =>
+        scope.SelectMany(e => e.DescendantsAndSelf()).FirstOrDefault(e => Is(e, tag));
+
+    private static string FirstText(List<XElement> scope, string[] tags)
     {
         foreach (var tag in tags)
         {
-            var target = el.DescendantsAndSelf().FirstOrDefault(e => Is(e, tag));
-            var value = target?.Value.Trim();
+            var value = Find(scope, tag)?.Value.Trim();
             if (!string.IsNullOrEmpty(value)) return value;
         }
         return "";
     }
 
-    private static double FirstNum(XElement el, string[] tags)
+    private static double FirstNum(List<XElement> scope, string[] tags)
     {
         foreach (var tag in tags)
         {
-            var v = NumByLocalName(el, tag);
+            var target = Find(scope, tag);
+            if (target is null) continue;
+            var v = TallyXml.Num(new XElement("X", new XElement(tag, target.Value)), tag);
             if (v != 0) return v;
         }
         return 0;
     }
 
-    private static string? FirstDate(XElement el, string[] tags)
+    private static string? FirstDate(List<XElement> scope, string[] tags)
     {
         foreach (var tag in tags)
         {
-            var target = el.DescendantsAndSelf().FirstOrDefault(e => Is(e, tag));
+            var target = Find(scope, tag);
             if (target is null) continue;
             var iso = TallyXml.Date(new XElement("X", new XElement(tag, target.Value)), tag);
             if (iso is not null) return iso;
@@ -547,7 +580,7 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
         return 0;
     }
 
-    private List<Row> WalkNameAmountPairs(XDocument doc, Func<string, XElement, Row> mapPair)
+    private static List<Row> WalkNameAmountPairs(XDocument doc, Func<string, XElement, Row> mapPair)
     {
         var rows = new List<Row>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

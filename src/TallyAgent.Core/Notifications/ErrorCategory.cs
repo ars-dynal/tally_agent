@@ -26,6 +26,10 @@ public enum ErrorCategory
     /// Appended rather than grouped with the other Tally* values so no stored
     /// ordinal shifts.</summary>
     TallyRequestRejected,
+    /// <summary>The company's active period (Alt+F2) does not cover the range
+    /// being extracted. Tally bounds every export by it regardless of
+    /// SVFROMDATE/SVTODATE and returns a valid, EMPTY response outside it.</summary>
+    TallyActivePeriodTooNarrow,
 }
 
 public enum ErrorSeverity { Warning, Error, Critical }

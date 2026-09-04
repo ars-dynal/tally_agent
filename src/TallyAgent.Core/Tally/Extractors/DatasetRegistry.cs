@@ -26,7 +26,6 @@ public static class DatasetRegistry
         new("currencies",             DatasetKind.Master,   "tally_currencies"),
         new("uom",                    DatasetKind.Master,   "tally_uom"),
         new("gst_rates",              DatasetKind.Master,   "tally_gst_rates"),
-        new("opening_bills",          DatasetKind.Master,   "tally_opening_bills"),
         // Inventory masters
         new("stock_groups",           DatasetKind.Master,   "tally_stock_groups"),
         new("stock_items",            DatasetKind.Master,   "tally_stock_items"),
@@ -82,12 +81,34 @@ public static class DatasetRegistry
 
     /// <summary>Datasets where zero rows is a suspicious result rather than a
     /// legitimately empty table. Every Snapshot already qualifies by kind; this
-    /// set adds the Masters for which silence has hidden a real problem.
-    /// opening_bills is the reason it exists: it is a Master, so the snapshot
-    /// zero-row guard never fired, and it has been checkpointing successfully
-    /// on nothing (bill-wise details are most likely not enabled in Tally).</summary>
+    /// set adds the Masters for which silence would hide a real problem.
+    ///
+    /// EMPTY since v2.3.0. It existed for opening_bills, which is now retired
+    /// (see below) rather than left checkpointing on nothing.</summary>
     public static readonly IReadOnlySet<string> ExpectedNonEmptyMasters =
-        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "opening_bills" };
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// RETIRED in v2.3.0: opening_bills.
+    ///
+    /// It produced zero rows for its entire history. The cause was diagnosed as
+    /// the FETCH list asking for "BILLALLOCATIONS.LIST" — a serialisation name,
+    /// not a fetchable member, which Tally ignores silently — but the fix was
+    /// never confirmed against a live Tally, and shipping an unverified fix for
+    /// a dataset that has never produced a row is how it stayed broken for
+    /// months in the first place.
+    ///
+    /// It is removed rather than left in place because a registered dataset that
+    /// checkpoints successfully on nothing is worse than no dataset at all: it
+    /// reports health it does not have. Nothing is lost — it has never carried a
+    /// single row — and the outstanding bill detail it was meant to provide is
+    /// now covered by bills_payable / bills_receivable.
+    ///
+    /// MasterExtractor.OpeningBills and `TallyAgent.Cli diagnose-opening-bills`
+    /// are both still present, so it can be revived the moment there is evidence
+    /// that the request returns data.
+    /// </summary>
+    public const string RetiredOpeningBills = "opening_bills";
 
     /// <summary>Should a zero-row result from this dataset be reported rather
     /// than checkpointed as a success?</summary>

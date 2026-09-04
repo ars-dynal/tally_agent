@@ -1,5 +1,134 @@
 # Changelog
 
+## 2.3.0 - Verified against Tally's own export
+
+The final agent release for this phase. Everything in it was checked against
+export files Tally produced from its own UI (TrialBal.xml, Bills.xml), not
+against a number anyone remembered. Those files are live accounting data and are
+deliberately not committed; `TallyAgent.Cli verify` runs them through the exact
+parsers the agent uses.
+
+### The bills envelope and parser were both wrong
+
+Tally's export puts the amount OUTSIDE the record container:
+
+```xml
+<BILLFIXED>
+  <BILLDATE>1-Nov-21</BILLDATE>
+  <BILLREF>PO/21-22/00172</BILLREF>
+  <BILLPARTY>Apar Industries Limited</BILLPARTY>
+</BILLFIXED>
+<BILLCL>-369.00</BILLCL>
+<BILLDUE>1-Nov-21</BILLDUE>
+<BILLOVERDUE>1768</BILLOVERDUE>
+```
+
+`BILLCL`, `BILLDUE` and `BILLOVERDUE` are FOLLOWING SIBLINGS of `BILLFIXED`.
+v2.2.0 searched inside the container, so it would have found the reference and
+the party but never the amount: **351 rows of 0.00 that look like a working
+extraction**. A record is now the container plus the siblings up to the next
+container.
+
+* Amount tag is `BILLCL`, not the guessed `BILLAMT`/`CLOSINGBALANCE`.
+* Amounts are **negative for credit** and are kept exactly as Tally reports them.
+* `EXPLODEFLAG` is **removed**. v2.2.0 added it reasoning the export would
+  otherwise collapse to a party summary; Tally's own bill-level export disproves
+  that, and it was the only thing separating this envelope from `Report()`.
+* An empty `BILLOVERDUE` stays null; `0` stays 0. 38 of the 351 records are
+  blank, and "not yet due" is not "due today".
+
+Offline gate result against Tally's own file: **351 records, total
+-139,723,340.43, 313 with overdue days, 38 blank, 351/351 dates parsed, 0 zero
+amounts, 123 parties.**
+
+### Trial Balance: it has always been the ledger fallback
+
+Tally's export uses `DSPCLDRAMTA` / `DSPCLCRAMTA` inside `DSPCLDRAMT` /
+`DSPCLCRAMT`, with **debits negative**. The parser read `DSPCLDR` / `DSPCLCR` /
+`BSMAINAMT` - none of which exist in that shape.
+
+That settles the open question. The report route could only ever have produced
+11 rows of zeros. `trial_balance` returns 1,038 rows and reconciles, so it has
+**never** come from the report - it has been `TrialBalanceFromLedgers` the whole
+time. The figures were right; nothing said which route produced them.
+
+Offline gate result: **11 primary groups, debit 756,250,338.64, credit
+756,250,338.64.**
+
+`source` is on every dataset with a fallback (`trial_balance`, `balance_sheet`,
+`profit_loss`, `stock_summary`, both bills datasets) - `report` or the specific
+fallback. `net_amount` is debit-positive on both routes so they cannot disagree
+on sign.
+
+### Encoding: read what the response declares
+
+Tally's exports are UTF-16LE with a BOM, and item names contain the
+multiplication sign. `TallyXml.Decode` now resolves the encoding in the order it
+can be trusted: BOM, then the XML declaration's `encoding=`, then the HTTP
+`Content-Type` charset, then strict UTF-8 falling back to Latin-1.
+
+* `SS M8×40MM` no longer arrives as `SS M8<U+FFFD>40MM`. Decoding single-byte
+  text as UTF-8 turned every byte above 0x7F into U+FFFD - silently, because
+  U+FFFD is a valid character nothing downstream could distinguish from data.
+* A decoded BOM survives as U+FEFF and `XDocument.Parse` rejects it outright
+  ("Data at the root level is invalid"). It is stripped after decoding. Reading
+  a real Tally UI export failed on byte one before this.
+* `d-MMM-yy` and `dd-MMM-yy` added to the date formats. Report exports use
+  `1-Nov-21`; without them every bill date and due date parsed to null while the
+  row still looked complete.
+
+### Active period guard
+
+Tally bounds every export by the company's active period (Alt+F2) regardless of
+`SVFROMDATE`/`SVTODATE`, and a request outside it returns a valid, EMPTY response
+with no error. That is how six years once looked empty for three weeks.
+
+The period is read at the start of every run and any dataset whose range falls
+outside it now **fails with the actual period in the message** rather than
+checkpointing on nothing. It is an error, not a log line, precisely because the
+symptom is silence.
+
+Not yet confirmed: which Company field carries the ACTIVE period rather than the
+books period. `STARTINGFROM`/`ENDINGAT` is used and the values are printed
+wherever the guard fires. If `STARTINGFROM` turns out to be the books beginning,
+the computed period is WIDER than the real one - the guard under-fires and
+nothing breaks, which is the safe direction to be wrong in.
+
+### Heavy reports off permanently
+
+`balance_sheet`, `profit_loss` and `stock_summary` now default to **false** with
+no config entry at all. They hang tally.exe and all three are derived downstream
+from ledgers plus the group hierarchy. This deliberately breaks v2.1.0's promise
+that an absent entry falls back to `enableSnapshots` - for these three only. An
+explicit entry still wins, so a deliberate override is still possible.
+
+### opening_bills is retired
+
+Zero rows for its entire history. The diagnosis (a `.LIST` FETCH that Tally
+ignores silently) was reasoned from the code and never confirmed against a live
+Tally, and shipping an unverified fix for a dataset that has never produced a row
+is how it stayed broken for months. It is removed from the registry rather than
+left checkpointing successfully on nothing - a dataset that reports health it
+does not have is worse than no dataset.
+
+Nothing is lost: it never carried a row, and outstanding bill detail is now
+covered by `bills_payable` / `bills_receivable`. `MasterExtractor.OpeningBills`
+and `diagnose-opening-bills` remain so it can be revived with evidence. The
+ledger export no longer fetches bill allocations no dataset consumes.
+
+### The gate
+
+`TallyAgent.Cli verify --bills <Bills.xml> --trial-balance <TrialBal.xml>`
+runs Tally's own exports through the agent's parsers. With `--live` it also asks
+Tally for the same reports and diffs the response against the reference **record
+for record**, reports the active period, and lists every dataset with its row
+count - including `voucher_lines`, so the effect of
+`emitLegacyVouchersDataset: false` is shown rather than asserted. Exit 1 on any
+mismatch.
+
+The 251 / 26,351,475.28 and 358 / 152,110,022.43 targets are retired: they could
+not be sourced to any report. Tally's own export is the reference now.
+
 ## 2.2.0 - Bill-level outstandings; masters stop re-uploading unchanged
 
 The last planned agent release. Everything still outstanding is in it.

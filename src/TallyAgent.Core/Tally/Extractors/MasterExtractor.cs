@@ -61,21 +61,11 @@ public sealed class MasterExtractor(TallyClient client, MasterBalanceRepository 
         "GSTREGISTRATIONNUMBER","INCOMETAXNUMBER","LEDSTATENAME","COUNTRYNAME","ADDRESS",
         "PINCODE","LEDGERMOBILE","LEDGERPHONE","EMAIL","LEDGERCONTACT","BANKACCOUNTNUMBER",
         "IFSCODE","BANKNAME","BRANCHNAME","ISBILLWISEON","ISCOSTCENTRESON",
-        // Opening bill-wise balances. v2.1.0 and earlier asked for the single
-        // field "BILLALLOCATIONS.LIST" and opening_bills returned zero rows for
-        // its entire history. ".LIST" is how Tally SERIALISES a list-valued
-        // member, not a member you can FETCH, and Tally ignores an unknown FETCH
-        // entry silently — a valid response with the sub-object simply absent.
-        // The dotted sub-field form below is the same technique VoucherCollection
-        // uses for ALLLEDGERENTRIES.BILLALLOCATIONS.*, which does produce rows.
-        // The original entry is kept because over-fetching is harmless and this
-        // has NOT yet been confirmed against a live Tally — run
-        // `TallyAgent.Cli diagnose-opening-bills` on the Tally server, which
-        // reports which variant actually returns bill elements.
-        "BILLALLOCATIONS.NAME","BILLALLOCATIONS.BILLDATE","BILLALLOCATIONS.BILLCREDITPERIOD",
-        "BILLALLOCATIONS.OPENINGBALANCE","BILLALLOCATIONS.CLOSINGBALANCE",
-        "BILLALLOCATIONS.BILLTYPE","BILLALLOCATIONS.ISADVANCE",
-        "BILLALLOCATIONS.LIST",
+        // No BILLALLOCATIONS here. opening_bills is retired (see
+        // DatasetRegistry.RetiredOpeningBills) and nothing else reads them, so
+        // asking for them would make Tally serialise a sub-object per ledger
+        // that no dataset consumes — the same waste v2.0.5 removed elsewhere.
+        // `TallyAgent.Cli diagnose-opening-bills` sends its own field list.
     ];
     private static readonly string[] LedgerBalanceFields = ["OPENINGBALANCE","CLOSINGBALANCE"];
 

@@ -11,14 +11,12 @@ namespace TallyAgent.Core.Tests;
 /// outstanding balances (date, reference, party, pending amount, due date and
 /// TALLY'S OWN overdue days).
 ///
-/// SCOPE OF THESE TESTS: the exact element names TallyPrime uses in a "Bills
-/// Payable" export were NOT confirmed against a live Tally when these were
-/// written (the Tally server was unreachable from the build machine), so the
-/// parser accepts several candidate shapes. What is pinned here is the parser's
-/// BEHAVIOUR — no double counting, Tally's overdue figure kept rather than
-/// recomputed, layout rows ignored, party inherited from a group header — not
-/// that the candidate tag names are the right ones. That is settled by
-/// `TallyAgent.Cli verify-bills` against the real company.
+/// SCOPE: these pin parser BEHAVIOUR against tolerated alternative tag spellings
+/// (BILLAMT nested inside the container, overdue rendered with a unit, layout
+/// nodes ignored). The SHAPE Tally actually emits — BILLCL/BILLDUE/BILLOVERDUE
+/// as siblings of BILLFIXED, two-digit-year dates, negative credit amounts — was
+/// confirmed against Tally's own UI export in v2.3.0 and is pinned separately in
+/// ReportShapeTests.
 /// </summary>
 public class BillsExtractionTests
 {
@@ -112,18 +110,17 @@ public class BillsExtractionTests
     }
 
     [Fact]
-    public void PartyHeaderRows_AreNotBills_ButDoNameTheBillsBeneathThem()
+    public void PartyComesFromTheRecordItself()
     {
+        // v2.2.0 guessed that bill rows inherited a party from a DSPACCNAME
+        // group header. Tally's own export disproves it: BILLPARTY sits inside
+        // BILLFIXED on every record. See ReportShapeTests for the real shape.
         var rows = ReportExtractor.ParseBillsReport(Doc("""
-            <DSPACCNAME><DSPDISPNAME>Beta Traders</DSPDISPNAME></DSPACCNAME>
-            <PARTYBLOCK>
-              <DSPACCNAME><DSPDISPNAME>Beta Traders</DSPDISPNAME></DSPACCNAME>
-              <BILLFIXED><BILLREF>B-9</BILLREF><BILLAMT>750.25</BILLAMT></BILLFIXED>
-            </PARTYBLOCK>
+            <BILLFIXED><BILLREF>B-9</BILLREF><BILLPARTY>Beta Traders</BILLPARTY></BILLFIXED>
+            <BILLCL>750.25</BILLCL>
             """), AsOf);
 
-        Assert.Single(rows);
-        Assert.Equal("Beta Traders", rows[0]["party_name"]);
+        Assert.Equal("Beta Traders", Assert.Single(rows)["party_name"]);
     }
 
     [Fact]
@@ -156,8 +153,9 @@ public class BillsExtractionTests
         Assert.Contains("<SVFROMDATE>20260401</SVFROMDATE>", xml);
         Assert.Contains("<SVTODATE>20260903</SVTODATE>", xml);
         Assert.Contains("<SVCURRENTCOMPANY>Dynalektric Equipment Private Limited</SVCURRENTCOMPANY>", xml);
-        // Without this the export collapses to one line per party.
-        Assert.Contains("<EXPLODEFLAG>Yes</EXPLODEFLAG>", xml);
+        // v2.3.0: no EXPLODEFLAG. It was added on reasoning, and Tally's own
+        // bill-level export shows the plain Report() shape is what works.
+        Assert.DoesNotContain("EXPLODEFLAG", xml);
     }
 
     // ── registry: additive only ──────────────────────────────────────────
