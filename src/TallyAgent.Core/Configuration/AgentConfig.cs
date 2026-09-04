@@ -119,7 +119,22 @@ public sealed class TallySettings
     [JsonPropertyName("incrementalLookbackDays")] public int IncrementalLookbackDays { get; set; } = 7;
     /// <summary>Initial voucher window size for a history walk. The engine
     /// shrinks windows adaptively (never grows them within a run) when a window
-    /// times out or takes more than 60% of voucherTimeoutSeconds.</summary>
+    /// times out or takes more than 60% of voucherTimeoutSeconds.
+    ///
+    /// SIZE THIS FROM MEASURED BYTES. Measured 2026-09-04 against the live
+    /// server: one day of the Day Book report is 424,860 bytes for 3 vouchers
+    /// (~142 KB per voucher - Tally serialises full detail including GST duty
+    /// heads, address lists and invoice lines), against an observed ~28
+    /// vouchers a day. So:
+    ///
+    ///     7 days   ~28 MB    ~9x headroom under maxResponseMb 256   (default)
+    ///    30 days  ~119 MB    ~2x headroom - too little for a busy month-end
+    ///
+    /// The stalled 2026-09-04 full sync used ~34-day windows. That was survivable
+    /// on size and fatal for a different reason (the request was a Voucher
+    /// collection, which ignores SVFROMDATE), but 7 days is the value the
+    /// arithmetic supports and it is the default for that reason, not by
+    /// habit.</summary>
     [JsonPropertyName("fullSyncChunkDays")] public int FullSyncChunkDays { get; set; } = 7;
 
     /// <summary>Is this snapshot report enabled? A per-dataset entry wins over

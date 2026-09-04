@@ -60,7 +60,20 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
         // so they keep the full retry ladder.
         var days = to.DayNumber - from.DayNumber + 1;
         var doc = await client.PostAsync(
-            TallyEnvelopes.VoucherCollection(from, to, client.Company, client.FetchLegacyVoucherLists),
+            // THE DAY BOOK REPORT, not a Voucher collection.
+            //
+            // Reports honour SVFROMDATE/SVTODATE; Voucher collections ignore
+            // SVFROMDATE and serve from the financial-year start, so every
+            // window asked Tally to serialise a whole year and the agent threw
+            // ~99% of it away. Eighty-five windows, eighty-five years' worth of
+            // serialisation, on a single-threaded Tally.
+            //
+            // This is a straight revert of aeb6dca, which changed ONLY the
+            // envelope — this parser was written against the Day Book report
+            // and never stopped being a Day Book parser. The report path looked
+            // broken at the time because TallyEnvelopes.Report() was sending a
+            // shape Tally refuses outright; that is fixed in the same release.
+            TallyEnvelopes.Report("Day Book", from, to, client.Company),
             requestTimeout: client.VoucherRequestTimeout,
             maxTimeoutRetries: days > 1 ? 0 : null, ct);
         var result = new DayBookResult();
@@ -100,7 +113,11 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
             }
 
             var guid = Text(v, "GUID");
+            // Day Book emits VCHTYPE as an ATTRIBUTE on <VOUCHER>; the
+            // collection emitted VOUCHERTYPENAME as a child. Text() checks
+            // children then attributes, so both shapes read the same way.
             var vchType = Text(v, "VOUCHERTYPENAME");
+            if (vchType.Length == 0) vchType = Text(v, "VCHTYPE");
             var voucherNumber = Text(v, "VOUCHERNUMBER");
             var voucherKey = guid.Length > 0
                 ? guid

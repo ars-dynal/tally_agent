@@ -1,5 +1,98 @@
 # Changelog
 
+## 2.4.0 - The report envelope was wrong all along
+
+A full sync stalled Tally on 2026-09-04: 85 windows, each asking Tally to
+serialise a whole financial year, on a single application thread. Five probes
+against the live server found the cause, and it was not where anyone had been
+looking.
+
+### Measured, 2026-09-04, same server and company, seconds apart
+
+| Request | Result |
+|---|---|
+| `TALLYREQUEST=Export Data` + `EXPORTDATA/REQUESTDESC/REPORTNAME` | **REFUSED** - "Unknown Request, cannot be processed" |
+| `TALLYREQUEST=Export` + `TYPE=Data` + `ID=<report>` | **ACCEPTED** |
+| Voucher collection, 1 day, no filter | 4,355 vouchers, 5,640,137 bytes |
+| Voucher collection, 1 day, `##SVFromDate` filter | 4,355 vouchers, **byte-identical** |
+| Voucher collection, 1 day, literal `$$Date:"1-Sep-2026"` | **4 vouchers**, 6,874 bytes |
+| Day Book report, 1 day | full voucher detail, 424,860 bytes |
+| Trial Balance report | `DSPACCNAME` x11, `DSPCLDRAMTA` x11, 3,055 bytes |
+
+Day Book shows 3 vouchers on that day.
+
+### The report envelope
+
+The agent has sent the refused shape since its first commit. Every report
+request it has ever made was refused. That single fact explains three separate
+investigations:
+
+* `trial_balance` had never once come from the report route - it has always
+  served its ledger fallback, which is why it reconciled while nothing recorded
+  which route produced it;
+* the bills envelope hunt could never converge, because no bills envelope in
+  that shape could be accepted;
+* the Day Book voucher path was abandoned in `aeb6dca` for a Voucher collection,
+  because the report "did not work".
+
+`TallyEnvelopes.Report()` now sends the accepted shape and every report is
+unblocked at once. `BillsReport` is simply `Report` - there is no second shape
+left to get wrong.
+
+### Vouchers go back to the Day Book report
+
+Voucher collections ignore `SVFROMDATE` and serve from the financial-year start,
+so windowing had no effect: 85 windows, each a year's worth of serialisation,
+~99% discarded client-side.
+
+This is a straight revert of `aeb6dca`, which changed **only** the envelope -
+`VoucherExtractor` was written against the Day Book report and never stopped
+being a Day Book parser. The revert reunites it with the response it was built
+for. `VCHTYPE` is read as a fallback for `VOUCHERTYPENAME`, since Day Book
+carries it as an attribute.
+
+### The `$Date` filter ban was a misattribution
+
+`197f055` removed the TDL date filter because 4-day and 1-month windows timed
+out identically, and concluded the filter was forcing a full scan. It was not:
+with and without the filter the response is **byte-identical**. The filter was
+inert because `##SVFromDate` does not resolve inside a TDL formula here, and
+`<FILTER>` versus `<FILTERS>` makes no difference either.
+
+Identical timings across window sizes are exactly what you see when the window
+never mattered - which happens with or without a filter. One symptom, two
+candidate causes, only one of them tested. Literal dates work
+(`VoucherDatesForCounting`), and that is what the per-financial-year counts use.
+
+### The guard had to be re-derived, not kept
+
+The v2.3.0 period guard fired on Tally OVER-serving a window. That is the
+symptom of the bug this release fixes, so under the new mechanism it could never
+fire again - it would have passed silently forever while appearing to protect
+something. A guard that cannot fire is worse than none.
+
+Same evidence, opposite polarity: **any** out-of-window row is now an alarm
+(`TallyWindowNotHonoured`), checked on every window of every run, naming the two
+things that could have regressed. The client-side skip stays as the second line
+of defence.
+
+Completeness is proven separately, because the in-cycle guard cannot see
+truncation: `TallyAgent.Cli verify --fy-counts` asks Tally how many vouchers it
+holds per financial year, using a literal-date filtered collection. That is the
+independent number a finished walk is measured against.
+
+### Window sizing, from bytes
+
+One day of Day Book is 424,860 bytes for 3 vouchers - ~142 KB each, full detail
+with GST duty heads, address lists and invoice lines - at ~28 vouchers/day.
+7 days is ~28 MB against `maxResponseMb` 256 (~9x headroom); 30 days is ~119 MB
+(~2x, too little for a busy month-end). The default stays 7, now for a measured
+reason. A test asserts a default window stays under a quarter of the cap.
+
+`FETCH` does not reduce the payload: a `FETCH DATE` collection still returned 21
+fields per voucher. Do not size on the assumption that asking for less costs
+less.
+
 ## 2.3.0 - Verified against Tally's own export
 
 The final agent release for this phase. Everything in it was checked against

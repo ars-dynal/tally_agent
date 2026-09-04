@@ -329,6 +329,7 @@ static string Truncate(string s, int max) => s.Length <= max ? s : s[..max] + "�
 static async Task<int> Verify(List<string> a, bool json)
 {
     var live = a.Remove("--live");
+    var fyCounts = a.Remove("--fy-counts");
     string? billsRef = null, tbRef = null;
     var today = DateOnly.FromDateTime(DateTime.Today);
     var from = new DateOnly(today.Month >= 4 ? today.Year : today.Year - 1, 4, 1);
@@ -346,6 +347,35 @@ static async Task<int> Verify(List<string> a, bool json)
 
     var results = new List<object>();
     var ok = true;
+
+    // ── gate (b): what Tally holds per financial year ─────────────
+    if (fyCounts)
+    {
+        var cfgFy = new ConfigStore().Load();
+        using var fyClient = new TallyClient(cfgFy.Tally, NullLogger<TallyClient>.Instance);
+        if (await FailFastIfTallyUnreachable(fyClient, cfgFy, json) is { } down) return down;
+
+        var years = new List<object>();
+        long total = 0;
+        for (var y = from.Year; y <= to.Year; y++)
+        {
+            var fyFrom = new DateOnly(y, 4, 1);
+            var fyTo = new DateOnly(y + 1, 3, 31);
+            if (fyTo < from || fyFrom > to) continue;
+            var (n, min, max) = await fyClient.CountVouchersAsync(fyFrom, fyTo, CancellationToken.None);
+            total += n;
+            years.Add(new
+            {
+                financial_year = $"{y}-{(y + 1) % 100:D2}",
+                range = $"{fyFrom:yyyy-MM-dd}..{fyTo:yyyy-MM-dd}",
+                vouchers_in_tally = n,
+                first = min,
+                last = max,
+            });
+            Console.Error.WriteLine($"  {y}-{(y + 1) % 100:D2}: {n,7:N0}   {min}..{max}");
+        }
+        results.Add(new { check = "tally_voucher_counts_by_financial_year", total, years });
+    }
 
     // ── reference files, through the agent's own parsers ──────────
     List<Dictionary<string, object?>>? refBills = null, refTb = null;
@@ -881,8 +911,11 @@ static int Usage()
                       (post raw envelopes verbatim; print refusal, element
                        histogram and response head. Placeholders: {{COMPANY}},
                        {{FROM}}, {{TO}}. See diagnostics/envelopes/)
-          verify --bills <Bills.xml> --trial-balance <TrialBal.xml>
-                      [--live] [--from d] [--to d] [--json]
+          verify [--bills <Bills.xml>] [--trial-balance <TrialBal.xml>]
+                      [--fy-counts] [--live] [--from d] [--to d] [--json]
+                      (--fy-counts asks Tally how many vouchers it holds per
+                       financial year - the independent number a completed
+                       walk is measured against)
                       (THE GATE: run Tally's own export through the agent's
                        parsers; with --live also diff the agent's response
                        against it record for record. Exit 1 on any mismatch.)
