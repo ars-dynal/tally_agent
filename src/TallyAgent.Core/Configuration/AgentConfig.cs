@@ -133,6 +133,17 @@ public sealed class TallySettings
             foreach (var kv in SnapshotDatasets)
                 if (string.Equals(kv.Key, dataset, StringComparison.OrdinalIgnoreCase))
                     return kv.Value;
+
+        // v2.3.0: balance_sheet, profit_loss and stock_summary default to FALSE
+        // and are not to be re-enabled. Each makes Tally compute across the whole
+        // company and each has been observed to hang tally.exe until it was
+        // force-closed; all three are now derived downstream from ledgers plus
+        // the group hierarchy. Before this, an absent entry fell back to
+        // enableSnapshots (true), so a fresh install turned them ON by default.
+        // An EXPLICIT entry above still wins, so an operator who deliberately
+        // sets one true gets it.
+        if (Tally.Extractors.DatasetRegistry.HeavyReports.Contains(dataset)) return false;
+
         return true;
     }
 

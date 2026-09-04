@@ -10,7 +10,7 @@ namespace TallyAgent.Core.Data;
 /// </summary>
 public sealed class AgentDatabase
 {
-    public const int CurrentSchemaVersion = 5;
+    public const int CurrentSchemaVersion = 6;
 
     private readonly string _connectionString;
     private readonly ILogger<AgentDatabase> _log;
@@ -59,6 +59,7 @@ public sealed class AgentDatabase
         if (version < 3) MigrateToV3(conn, tx);
         if (version < 4) MigrateToV4(conn, tx);
         if (version < 5) MigrateToV5(conn, tx);
+        if (version < 6) MigrateToV6(conn, tx);
         // future: additive only
 
         Exec(conn, tx, """
@@ -226,6 +227,33 @@ public sealed class AgentDatabase
               values_json  TEXT NOT NULL,
               captured_utc TEXT NOT NULL,
               PRIMARY KEY (dataset, company, guid)
+            );
+            """);
+    }
+
+    /// <summary>V6: master_content_hashes — the content hash of the last master
+    /// extraction whose upload the cloud actually ACKNOWLEDGED, per
+    /// (dataset, company). An extraction whose hash matches is not enqueued
+    /// again, which is what stops ~10,757 unchanged master rows being re-uploaded
+    /// every cycle.
+    ///
+    /// A hash becomes "confirmed" only when every batch it produced is acked;
+    /// until then it sits in pending_hash / pending_batches. That ordering is the
+    /// whole safety property: recording the hash at enqueue time would let a
+    /// batch that later fails permanently suppress every future upload of that
+    /// dataset — masters silently not uploading, which nothing would notice.</summary>
+    private static void MigrateToV6(SqliteConnection conn, SqliteTransaction tx)
+    {
+        Exec(conn, tx, """
+            CREATE TABLE IF NOT EXISTS master_content_hashes (
+              dataset         TEXT NOT NULL,
+              company         TEXT NOT NULL,
+              confirmed_hash  TEXT,
+              confirmed_utc   TEXT,
+              pending_hash    TEXT,
+              pending_batches TEXT,
+              pending_utc     TEXT,
+              PRIMARY KEY (dataset, company)
             );
             """);
     }

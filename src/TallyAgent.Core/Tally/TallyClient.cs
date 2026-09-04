@@ -185,6 +185,51 @@ public sealed class TallyClient : IDisposable
         return null;
     }
 
+    /// <summary>
+    /// The company's BOOKS range — the outer bound of what data can exist.
+    ///
+    /// This is NOT the active period. Measured on the Tally server: the agent
+    /// read 2019-04-01..2026-09-04 from STARTINGFROM/ENDINGAT while Tally's own
+    /// Gateway showed an active period of 1-Apr-26 to 31-Mar-27. Tally does not
+    /// appear to expose the Alt+F2 period over XML at all, so it is INFERRED
+    /// from what Tally actually serves — see
+    /// <c>SyncEngine.NoteServedVoucherRange</c>.
+    ///
+    /// Still worth reading: nothing can exist outside the books range, so it is
+    /// a valid (if loose) outer guard, and it is useful context in the log.
+    /// </summary>
+    public async Task<(DateOnly From, DateOnly To)?> GetBooksPeriodAsync(CancellationToken ct = default)
+    {
+        XDocument doc;
+        try
+        {
+            doc = await PostAsync(TallyEnvelopes.CompanyPeriod(_settings.Company), ct);
+        }
+        catch (TallyException ex)
+        {
+            _log.LogWarning("Active period unavailable ({Msg}) — period guard inactive this run", ex.Message);
+            return null;
+        }
+
+        foreach (var el in doc.Descendants("COMPANY"))
+        {
+            var name = TallyXml.Text(el, "NAME");
+            if (!string.IsNullOrWhiteSpace(_settings.Company) && name.Length > 0 &&
+                !name.Equals(_settings.Company, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var from = ParseDate(TallyXml.Date(el, "STARTINGFROM"))
+                    ?? ParseDate(TallyXml.Date(el, "BOOKSFROM"));
+            var to = ParseDate(TallyXml.Date(el, "ENDINGAT"));
+            if (from is { } f && to is { } t && t >= f) return (f, t);
+        }
+        return null;
+    }
+
+    private static DateOnly? ParseDate(string? iso) =>
+        DateOnly.TryParse(iso, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None, out var d) ? d : null;
+
     public Task<XDocument> PostAsync(string envelope, CancellationToken ct = default) =>
         PostAsync(envelope, null, null, ct);
 
@@ -297,6 +342,7 @@ public sealed class TallyClient : IDisposable
 
             HttpResponseMessage? resp = null;
             byte[] body;
+            string? httpCharset = null;
             try
             {
                 using var content = new ByteArrayContent(Encoding.UTF8.GetBytes(envelope));
@@ -307,6 +353,9 @@ public sealed class TallyClient : IDisposable
                 request.Headers.ConnectionClose = true;
                 resp = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token);
                 body = await ReadBoundedBodyAsync(resp, timeoutCts.Token);
+                // Last-resort encoding hint, below the BOM and the XML
+                // declaration (see TallyXml.Decode).
+                httpCharset = resp.Content.Headers.ContentType?.CharSet;
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
@@ -346,9 +395,10 @@ public sealed class TallyClient : IDisposable
                 }
             }
 
+            XDocument parsed;
             try
             {
-                return TallyXml.Parse(body);
+                parsed = TallyXml.Parse(body, httpCharset);
             }
             catch (Exception ex)
             {
@@ -356,6 +406,22 @@ public sealed class TallyClient : IDisposable
                 throw new TallyException(ErrorCategory.TallyInvalidXml,
                     $"Tally response is not valid XML: {ex.Message}. Response starts with: {preview}", ex);
             }
+
+            // A REFUSAL is not an empty result. "<RESPONSE>Unknown Request,
+            // cannot be processed</RESPONSE>" arrives as HTTP 200, parses
+            // cleanly and contains zero rows — so without this check every
+            // extractor with an `if (rows.Count == 0) → fall back` branch treats
+            // a rejected request as an empty report, silently switches code path
+            // and returns a plausible number. Caught once here for every caller
+            // rather than per dataset. Not retried (the refusal is
+            // deterministic) and NOT run-ending: one dataset fails loudly, the
+            // rest of the cycle continues.
+            if (TallyXml.FindRequestError(parsed) is { } refusal)
+                throw new TallyException(ErrorCategory.TallyRequestRejected,
+                    $"Tally refused the request: {refusal}")
+                { ResponseText = parsed.ToString(SaveOptions.None) };
+
+            return parsed;
         }
         finally
         {

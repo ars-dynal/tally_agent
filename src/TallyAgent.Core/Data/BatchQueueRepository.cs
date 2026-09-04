@@ -144,21 +144,36 @@ public sealed class BatchQueueRepository(AgentDatabase db)
         return batch;
     }
 
-    /// <summary>Successful (or duplicate) ack: move to history, delete payload file.</summary>
+    /// <summary>Successful (or duplicate) ack: move to history, delete payload file.
+    ///
+    /// Also promotes the master content hash this batch belongs to (v2.2.0) —
+    /// in THIS transaction, so a hash can never be marked confirmed for an
+    /// upload that was not acknowledged.</summary>
     public void Ack(string batchId)
     {
         using var conn = db.Open();
         // Ack always mutates history + queue, so acquire write intent up front.
         using var tx = conn.BeginTransaction(deferred: false);
         string? payloadPath = null;
+        string? dataset = null, company = null;
 
         using (var sel = conn.CreateCommand())
         {
             sel.Transaction = tx;
-            sel.CommandText = "SELECT payload_path FROM upload_batches WHERE batch_id=$id";
+            sel.CommandText =
+                "SELECT payload_path, dataset, company FROM upload_batches WHERE batch_id=$id";
             sel.Parameters.AddWithValue("$id", batchId);
-            payloadPath = sel.ExecuteScalar() as string;
+            using var r = sel.ExecuteReader();
+            if (r.Read())
+            {
+                payloadPath = r.GetString(0);
+                dataset = r.GetString(1);
+                company = r.GetString(2);
+            }
         }
+
+        if (dataset is not null && company is not null)
+            MasterContentHashRepository.ConfirmBatchWithin(conn, tx, dataset, company, batchId);
 
         using (var hist = conn.CreateCommand())
         {

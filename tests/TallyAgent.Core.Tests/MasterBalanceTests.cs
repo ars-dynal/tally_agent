@@ -55,7 +55,7 @@ public sealed class MasterBalanceTests : IDisposable
     {
         var (ex, h) = Build(fetchBalances: true);
         var rows = await ex.Ledgers(CancellationToken.None);
-        Assert.Contains("CLOSINGBALANCE", h.Requests[0]);
+        Assert.Contains("<FETCH>CLOSINGBALANCE</FETCH>", h.Requests[0]);
         var cash = rows.Single(r => (string)r["ledger_name"]! == "Cash");
         Assert.Equal(-250.5, (double)cash["closing_balance"]!);
         Assert.Equal(-100.0, (double)cash["opening_balance"]!);
@@ -66,8 +66,11 @@ public sealed class MasterBalanceTests : IDisposable
         // emits the last captured values (HDFC had no balance tag → captured 0).
         var (ex2, h2) = Build(fetchBalances: false);
         var rows2 = await ex2.Ledgers(CancellationToken.None);
-        Assert.DoesNotContain("CLOSINGBALANCE", h2.Requests[0]);
-        Assert.DoesNotContain("OPENINGBALANCE", h2.Requests[0]);
+        // Match the whole FETCH entry: the ledger's own balance fields must be
+        // absent, while BILLALLOCATIONS.OPENINGBALANCE/CLOSINGBALANCE (opening
+        // bill detail, not a computed valuation) are always requested.
+        Assert.DoesNotContain("<FETCH>CLOSINGBALANCE</FETCH>", h2.Requests[0]);
+        Assert.DoesNotContain("<FETCH>OPENINGBALANCE</FETCH>", h2.Requests[0]);
         var cash2 = rows2.Single(r => (string)r["ledger_name"]! == "Cash");
         Assert.Equal(-250.5, (double)cash2["closing_balance"]!);
         Assert.Equal(0.0, (double)rows2.Single(r => (string)r["ledger_name"]! == "HDFC")["closing_balance"]!);

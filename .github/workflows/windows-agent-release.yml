@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - "v*.*.*"
+      # Prerelease tags (v2.2.0-rc1, ...) are verification builds published by
+      # hand; they are not MAJOR.MINOR.PATCH, so this workflow used to trigger
+      # and then fail on its own version check. Excluding them here rather than
+      # branching inside the job keeps the real release path untouched.
+      - "!v*.*.*-*"
   workflow_dispatch:
     inputs:
       version:

@@ -252,7 +252,10 @@ public class BatchQueueTests : IDisposable
         using var cmd2 = conn.CreateCommand();
         cmd2.CommandText = "SELECT content_checksum FROM upload_batches LIMIT 0";
         cmd2.ExecuteReader();                                                // v3 column present
-        Assert.Equal(5, AgentDatabase.CurrentSchemaVersion);
+        using var cmd3 = conn.CreateCommand();
+        cmd3.CommandText = "SELECT confirmed_hash, pending_batches FROM master_content_hashes LIMIT 0";
+        cmd3.ExecuteReader();                                                // v6 table present
+        Assert.Equal(6, AgentDatabase.CurrentSchemaVersion);
     }
 }
 

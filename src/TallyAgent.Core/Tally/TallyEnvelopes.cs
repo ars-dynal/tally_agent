@@ -124,6 +124,56 @@ public static class TallyEnvelopes
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Bills Outstanding report export ("Bills Payable" / "Bills Receivable").
+    ///
+    /// This is the ONLY place Tally hands over per-bill detail — bill date,
+    /// reference number, party, pending amount, due date and Tally's OWN
+    /// overdue-day count. The outstanding_payables / outstanding_receivables
+    /// datasets are built from ledger CLOSINGBALANCE instead
+    /// (<see cref="Collection"/> of Ledger), which is why they reconcile exactly
+    /// to the trial balance and carry no bill detail at all. The two are
+    /// complementary, not alternatives: nothing here replaces them.
+    ///
+    /// SVFROMDATE/SVTODATE bound the ageing computation, so the report is
+    /// "as of" SVTODATE. Remember the active period still governs
+    /// (see CLAUDE.md) — a range outside it returns a valid, EMPTY response.
+    /// </summary>
+    public static string BillsReport(string reportName, DateOnly from, DateOnly to, string? company)
+    {
+        var sb = new StringBuilder(768);
+        sb.Append("<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER>")
+          .Append("<BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>")
+          .Append(TallyXml.XmlEscape(reportName))
+          .Append("</REPORTNAME><STATICVARIABLES>");
+        if (!string.IsNullOrEmpty(company))
+            sb.Append("<SVCURRENTCOMPANY>").Append(TallyXml.XmlEscape(company)).Append("</SVCURRENTCOMPANY>");
+        sb.Append("<SVFROMDATE>").Append(from.ToString("yyyyMMdd")).Append("</SVFROMDATE>")
+          .Append("<SVTODATE>").Append(to.ToString("yyyyMMdd")).Append("</SVTODATE>")
+          // NO EXPLODEFLAG. v2.2.0 added one on the reasoning that the export
+          // would otherwise collapse to a party-level summary. Tally's own UI
+          // export disproves it: Bills.xml is bill-level (351 BILLFIXED records)
+          // and this envelope is otherwise identical to Report(), which the
+          // Trial Balance export shows working. It was the only thing separating
+          // the two, and it was never evidence.
+          .Append("<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>")
+          .Append("</STATICVARIABLES></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Fallback for an empty Bills Outstanding report export: the Bills
+    /// collection, which is period-bound and carries the same per-bill fields
+    /// EXCEPT Tally's computed overdue-day count (a report-only column). The
+    /// extractor leaves overdue_days null rather than computing its own, and
+    /// stamps the row source so the warehouse can tell the two paths apart.
+    /// </summary>
+    public static string BillsCollection(string? company, DateOnly from, DateOnly to) =>
+        Collection("Bills",
+            ["NAME", "PARENT", "BILLDATE", "BILLCREDITPERIOD", "CLOSINGBALANCE",
+             "OPENINGBALANCE", "BILLTYPE", "ISADVANCE"],
+            company, from, to);
+
     /// <summary>Company-wide AlterID watermarks: ALTMSTID (masters) and ALTVCHID
     /// (vouchers) change whenever ANY master/voucher is created, edited or
     /// deleted. One tiny request lets the agent skip whole extraction phases
@@ -143,6 +193,18 @@ public static class TallyEnvelopes
           .Append("</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>");
         return sb.ToString();
     }
+
+    /// <summary>
+    /// The open company's period. Tally bounds EVERY export by the active
+    /// period (Alt+F2) regardless of SVFROMDATE/SVTODATE: a request outside it
+    /// returns a valid, EMPTY response with no error — which is exactly how six
+    /// years once looked empty for three weeks (see CLAUDE.md). Anyone with the
+    /// Tally UI open can change it at any moment, so it is read at the start of
+    /// every run rather than assumed.
+    /// </summary>
+    public static string CompanyPeriod(string? company) =>
+        Collection("Company",
+            ["NAME", "STARTINGFROM", "ENDINGAT", "BOOKSFROM"], company);
 
     /// <summary>Lightweight company-list probe (also the connection test).</summary>
     public static string CompanyList() =>

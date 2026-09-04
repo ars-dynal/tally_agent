@@ -34,22 +34,108 @@ public static partial class TallyXml
     [GeneratedRegex(@"<[A-Za-z_][\w.\-]*(?:\s[^>]*)?>")]
     private static partial Regex RootStartTag();
 
-    /// <summary>Decode + scrub a raw Tally response into parseable XML text.</summary>
-    public static string Sanitize(byte[] raw)
+    /// <summary>The encoding named in an XML declaration, e.g. encoding="UTF-16".</summary>
+    [GeneratedRegex(@"encoding\s*=\s*[""']([A-Za-z0-9._\-]+)[""']", RegexOptions.IgnoreCase)]
+    private static partial Regex XmlDeclEncoding();
+
+    /// <summary>Decode + scrub a raw Tally response into parseable XML text.
+    /// <paramref name="httpCharset"/> is the HTTP Content-Type charset, when the
+    /// transport supplied one.</summary>
+    public static string Sanitize(byte[] raw, string? httpCharset = null)
     {
-        string text;
-        if (raw.Length >= 2 && raw[0] == 0xFF && raw[1] == 0xFE)
-            text = Encoding.Unicode.GetString(raw);           // UTF-16 LE
-        else if (raw.Length >= 2 && raw[0] == 0xFE && raw[1] == 0xFF)
-            text = Encoding.BigEndianUnicode.GetString(raw);  // UTF-16 BE
-        else
-            text = Encoding.UTF8.GetString(raw);
+        var text = Decode(raw, httpCharset);
+
+        // A decoded BOM survives as U+FEFF, and XDocument.Parse rejects it as
+        // "Data at the root level is invalid". Tally's UI exports are UTF-16LE
+        // WITH a BOM, so this is the difference between reading a real export
+        // and failing on byte one.
+        if (text.Length > 0 && text[0] == '﻿') text = text[1..];
 
         text = BadDecEntity().Replace(text, "");
         text = BadHexEntity().Replace(text, "");
         text = IllegalChars().Replace(text, "");
         text = DeclareUndeclaredPrefixes(text);
         return text;
+    }
+
+    /// <summary>
+    /// Decode the response bytes as the encoding the RESPONSE ITSELF declares,
+    /// in the order the declarations can be trusted:
+    ///
+    ///   1. a byte-order mark — unambiguous, and what Tally's UI exports carry;
+    ///   2. the XML declaration's encoding= attribute, sniffed from the ASCII-safe
+    ///      prefix (a UTF-16 declaration is readable either way once the nulls
+    ///      are stripped);
+    ///   3. the HTTP Content-Type charset, when the transport gave one;
+    ///   4. strict UTF-8 — and if the bytes are NOT valid UTF-8, Latin-1.
+    ///
+    /// Step 4 is the fix for mangled item names. Decoding single-byte text as
+    /// UTF-8 turns every byte above 0x7F into U+FFFD, so "SS M8×40MM" (× is
+    /// 0xD7) arrived as "SS M8�40MM" — silently, since U+FFFD is a
+    /// perfectly valid character and nothing downstream could tell it from real
+    /// data. Decoding strictly and falling back on failure keeps the byte.
+    /// </summary>
+    internal static string Decode(byte[] raw, string? httpCharset = null)
+    {
+        if (raw.Length >= 2 && raw[0] == 0xFF && raw[1] == 0xFE)
+            return Encoding.Unicode.GetString(raw);            // UTF-16 LE + BOM
+        if (raw.Length >= 2 && raw[0] == 0xFE && raw[1] == 0xFF)
+            return Encoding.BigEndianUnicode.GetString(raw);   // UTF-16 BE + BOM
+        if (raw.Length >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF)
+            return new UTF8Encoding(false).GetString(raw, 3, raw.Length - 3);
+
+        // BOM-less UTF-16 still declares itself: every other byte is 0x00.
+        if (raw.Length >= 4 && raw[1] == 0x00 && raw[3] == 0x00)
+            return Encoding.Unicode.GetString(raw);
+        if (raw.Length >= 4 && raw[0] == 0x00 && raw[2] == 0x00)
+            return Encoding.BigEndianUnicode.GetString(raw);
+
+        var declared = DeclaredEncodingName(raw) ?? httpCharset;
+        if (declared is not null && TryGetEncoding(declared) is { } enc)
+        {
+            try { return enc.GetString(raw); }
+            catch (DecoderFallbackException) { /* fall through to sniffing */ }
+        }
+
+        try
+        {
+            return new UTF8Encoding(false, throwOnInvalidBytes: true).GetString(raw);
+        }
+        catch (DecoderFallbackException)
+        {
+            // Not UTF-8. Latin-1 maps every byte to a character, so nothing is
+            // lost and 0xD7 becomes the multiplication sign it always was.
+            return Encoding.Latin1.GetString(raw);
+        }
+    }
+
+    /// <summary>encoding="..." from the XML declaration, read from the first
+    /// bytes with any UTF-16 padding nulls removed.</summary>
+    private static string? DeclaredEncodingName(byte[] raw)
+    {
+        var take = Math.Min(raw.Length, 200);
+        var sb = new StringBuilder(take);
+        for (var i = 0; i < take; i++)
+            if (raw[i] is not 0 and < 0x80) sb.Append((char)raw[i]);
+        var prefix = sb.ToString();
+        if (!prefix.Contains("<?xml", StringComparison.OrdinalIgnoreCase)) return null;
+        var m = XmlDeclEncoding().Match(prefix);
+        return m.Success ? m.Groups[1].Value : null;
+    }
+
+    private static Encoding? TryGetEncoding(string name)
+    {
+        try
+        {
+            // Throw on bad bytes so a wrong declaration falls through to
+            // sniffing rather than silently producing replacement characters.
+            var enc = Encoding.GetEncoding(name, EncoderFallback.ReplacementFallback,
+                DecoderFallback.ExceptionFallback);
+            // A declared UTF-16 with no BOM was already handled above; treating
+            // it as 8-bit here would corrupt the whole document.
+            return enc;
+        }
+        catch (ArgumentException) { return null; }
     }
 
     /// <summary>
@@ -87,10 +173,57 @@ public static partial class TallyXml
         return text.Insert(root.Index + root.Length - closing, declarations.ToString());
     }
 
-    public static XDocument Parse(byte[] raw)
+    public static XDocument Parse(byte[] raw, string? httpCharset = null)
     {
-        var text = Sanitize(raw);
+        var text = Sanitize(raw, httpCharset);
         return XDocument.Parse(text, LoadOptions.None);
+    }
+
+    /// <summary>
+    /// The error text when Tally REFUSED the request, or null when it answered.
+    ///
+    /// This is the most dangerous shape Tally produces, because it is not an
+    /// error by any mechanism the agent was watching:
+    ///
+    ///     &lt;RESPONSE&gt;Unknown Request, cannot be processed&lt;/RESPONSE&gt;
+    ///
+    /// HTTP 200. Well-formed XML. Parses cleanly. Contains zero data rows. Every
+    /// extractor that says <c>if (rows.Count == 0) → fall back</c> therefore
+    /// treats a REFUSAL as an EMPTY REPORT, quietly runs a different code path,
+    /// and returns a plausible number that nothing marks as suspect. The
+    /// zero-row guard does not fire either, because the fallback produced rows.
+    ///
+    /// Same disease as the silently-ignored FETCH entry in CLAUDE.md: a valid
+    /// response that means "no" and reads as "nothing". Detected HERE, once, for
+    /// every caller — never special-cased per dataset.
+    ///
+    /// Deliberately conservative, so a real data response can never be mistaken
+    /// for a refusal:
+    ///   • any LINEERROR element — Tally's TDL error channel;
+    ///   • a root RESPONSE element carrying text and NO child elements.
+    /// A RESPONSE element with children is left alone: import acknowledgements
+    /// use that shape and are not errors.
+    /// </summary>
+    public static string? FindRequestError(XDocument doc)
+    {
+        var lineError = doc.Descendants()
+            .FirstOrDefault(e => e.Name.LocalName.Equals("LINEERROR", StringComparison.OrdinalIgnoreCase));
+        if (lineError is not null)
+        {
+            var text = lineError.Value.Trim();
+            if (text.Length > 0) return text;
+        }
+
+        var root = doc.Root;
+        if (root is not null &&
+            root.Name.LocalName.Equals("RESPONSE", StringComparison.OrdinalIgnoreCase) &&
+            !root.Elements().Any())
+        {
+            var text = root.Value.Trim();
+            if (text.Length > 0) return text;
+        }
+
+        return null;
     }
 
     // ── field readers (direct children first; attributes as a Tally master fallback) ──
@@ -131,7 +264,14 @@ public static partial class TallyXml
         return v is "YES" or "TRUE" or "1";
     }
 
-    private static readonly string[] DateFormats = ["yyyyMMdd", "yyyy-MM-dd", "d-MMM-yyyy", "dd-MMM-yyyy", "dd/MM/yyyy"];
+    // "d-MMM-yy" and "dd-MMM-yy" are what Tally's REPORT exports use ("1-Nov-21",
+    // "29-May-22"). Without them every bill date parsed to null while the rest of
+    // the record looked perfectly fine.
+    private static readonly string[] DateFormats =
+    [
+        "yyyyMMdd", "yyyy-MM-dd", "d-MMM-yyyy", "dd-MMM-yyyy", "dd/MM/yyyy",
+        "d-MMM-yy", "dd-MMM-yy", "d/M/yyyy",
+    ];
 
     /// <summary>ISO yyyy-MM-dd or null.</summary>
     public static string? Date(XElement el, string tag)

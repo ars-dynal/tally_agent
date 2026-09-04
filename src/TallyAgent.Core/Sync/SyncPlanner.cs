@@ -39,6 +39,19 @@ public static class SyncPlanner
     /// are ignored, restarting the walk (batch dedup makes that cheap).</summary>
     public const long NewestFirstCheckpointMarker = 2;
 
+    /// <summary>
+    /// True when <c>extractionStartDate</c> currently has NO effect.
+    ///
+    /// It is only ever read inside the <c>!FullSyncDone</c> branch below, so once
+    /// the full-history walk has completed and the checkpoint has latched, the
+    /// setting is inert: editing it changes nothing at all until the checkpoint
+    /// is reset (Force Full Sync / <c>ResetVoucherCheckpoint</c>). A silently
+    /// ignored setting is a trap, so both the Manager and the service say so
+    /// out loud rather than letting someone believe they have changed the range.
+    /// </summary>
+    public static bool ExtractionStartDateIsInert(SyncCheckpoint? voucherCheckpoint) =>
+        voucherCheckpoint is { FullSyncDone: true };
+
     public static VoucherPlan PlanVoucherWindows(
         TallySettings settings, SyncCheckpoint? checkpoint, DateOnly today)
     {

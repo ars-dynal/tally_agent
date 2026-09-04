@@ -30,9 +30,22 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
         /// vouchers DELETED in Tally (they simply vanish from extraction and can
         /// only be found by comparison). See ARCHITECTURE §8.2.</summary>
         public List<Row> Manifest { get; } = [];
-        /// <summary>Actual voucher-date extent seen in this window (coverage evidence).</summary>
+        /// <summary>Actual voucher-date extent ACCEPTED in this window (coverage evidence).</summary>
         public string? MinVoucherDate { get; set; }
         public string? MaxVoucherDate { get; set; }
+
+        /// <summary>Vouchers Tally returned whose date is outside the window we
+        /// asked for. Tally bounds exports by the ACTIVE period (Alt+F2) and
+        /// ignores SVFROMDATE/SVTODATE when they fall outside it, so a non-zero
+        /// count here is direct evidence of what period Tally is really serving.</summary>
+        public int OutOfWindowCount { get; set; }
+
+        /// <summary>Date extent of EVERY voucher Tally returned, accepted or
+        /// not. When it does not line up with the requested window, this is the
+        /// range Tally actually served — the only observable signal for the
+        /// active period, which Tally does not expose over XML.</summary>
+        public string? ServedMinDate { get; set; }
+        public string? ServedMaxDate { get; set; }
     }
 
     /// <summary>Fetch vouchers for a window and fan out to all voucher datasets.
@@ -67,6 +80,15 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                     Text(v, "VOUCHERNUMBER"), Text(v, "DATE"), from, to);
                 continue;
             }
+
+            // Record the served extent BEFORE the window test: a voucher we are
+            // about to reject is exactly the evidence we need.
+            if (result.ServedMinDate is null ||
+                string.CompareOrdinal(voucherDateText, result.ServedMinDate) < 0)
+                result.ServedMinDate = voucherDateText;
+            if (result.ServedMaxDate is null ||
+                string.CompareOrdinal(voucherDateText, result.ServedMaxDate) > 0)
+                result.ServedMaxDate = voucherDateText;
 
             if (voucherDate < from || voucherDate > to)
             {
@@ -218,6 +240,12 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                     });
                 }
 
+                // These rows ARE the outstandings. Matching New Ref / Advance
+                // against Agst Ref by bill_ref within a party reproduces Bills
+                // Payable and Bills Receivable in SQL, which is why the agent no
+                // longer asks Tally to compute those reports at all.
+                // ledger_name is the PARTY ledger: bill allocations hang off the
+                // party's ledger entry, never off the expense or stock lines.
                 foreach (var ba in entry.Descendants("BILLALLOCATIONS.LIST"))
                 {
                     result.BillAllocations.Add(new Row
@@ -227,6 +255,10 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                         ["line_index"] = billIndex++,
                         ["voucher_date"] = voucherDateText,
                         ["voucher_number"] = voucherNumber,
+                        // Was missing until v2.3.0 while every other allocation
+                        // row carried it. Without it the SQL cannot tell a
+                        // purchase from a payment.
+                        ["voucher_type"] = vchType,
                         ["ledger_name"] = ledgerName,
                         ["bill_ref"] = Text(ba, "NAME"),
                         ["bill_type"] = Text(ba, "BILLTYPE"),
@@ -358,6 +390,7 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
             from, to, result.VoucherHeaders.Count, result.VoucherLines.Count,
             result.BillAllocations.Count, result.BankAllocations.Count,
             result.CostCentreAllocations.Count, result.InventoryEntries.Count);
+        result.OutOfWindowCount = outOfWindow;
         return result;
     }
 

@@ -26,7 +26,6 @@ public static class DatasetRegistry
         new("currencies",             DatasetKind.Master,   "tally_currencies"),
         new("uom",                    DatasetKind.Master,   "tally_uom"),
         new("gst_rates",              DatasetKind.Master,   "tally_gst_rates"),
-        new("opening_bills",          DatasetKind.Master,   "tally_opening_bills"),
         // Inventory masters
         new("stock_groups",           DatasetKind.Master,   "tally_stock_groups"),
         new("stock_items",            DatasetKind.Master,   "tally_stock_items"),
@@ -78,12 +77,61 @@ public static class DatasetRegistry
 
     /// <summary>Datasets where zero rows is a suspicious result rather than a
     /// legitimately empty table. Every Snapshot already qualifies by kind; this
-    /// set adds the Masters for which silence has hidden a real problem.
-    /// opening_bills is the reason it exists: it is a Master, so the snapshot
-    /// zero-row guard never fired, and it has been checkpointing successfully
-    /// on nothing (bill-wise details are most likely not enabled in Tally).</summary>
+    /// set adds the Masters for which silence would hide a real problem.
+    ///
+    /// EMPTY since v2.3.0. It existed for opening_bills, which is now retired
+    /// (see below) rather than left checkpointing on nothing.</summary>
     public static readonly IReadOnlySet<string> ExpectedNonEmptyMasters =
-        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "opening_bills" };
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// RETIRED in v2.3.0: opening_bills.
+    ///
+    /// It produced zero rows for its entire history. The cause was diagnosed as
+    /// the FETCH list asking for "BILLALLOCATIONS.LIST" — a serialisation name,
+    /// not a fetchable member, which Tally ignores silently — but the fix was
+    /// never confirmed against a live Tally, and shipping an unverified fix for
+    /// a dataset that has never produced a row is how it stayed broken for
+    /// months in the first place.
+    ///
+    /// It is removed rather than left in place because a registered dataset that
+    /// checkpoints successfully on nothing is worse than no dataset at all: it
+    /// reports health it does not have. Nothing is lost — it has never carried a
+    /// single row — and the outstanding bill detail it was meant to provide is
+    /// now covered by bills_payable / bills_receivable.
+    ///
+    /// MasterExtractor.OpeningBills and `TallyAgent.Cli diagnose-opening-bills`
+    /// are both still present, so it can be revived the moment there is evidence
+    /// that the request returns data.
+    /// </summary>
+    public const string RetiredOpeningBills = "opening_bills";
+
+    /// <summary>
+    /// RETIRED in v2.3.0: bills_payable, bills_receivable.
+    ///
+    /// They asked Tally to COMPUTE something the agent already has the inputs
+    /// for. bill_allocations carries, per allocation row: bill_ref, bill_type
+    /// (New Ref / Agst Ref / Advance / On Account), amount, ledger_name (the
+    /// party — allocations hang off the party's ledger entry), voucher_guid,
+    /// voucher_date and voucher_type. Matching New Ref and Advance against
+    /// Agst Ref by bill_ref within a party reproduces both reports in SQL, which
+    /// is the approach tally-database-loader takes; it never requests a Bills
+    /// Payable report either. 7,559 allocation rows were flowing on the day this
+    /// was decided.
+    ///
+    /// So the report route was pure cost: a heavy computation on Tally's single
+    /// application thread, an envelope shape that took three attempts to pin
+    /// down, and a parser that could only ever be as right as the guess behind
+    /// it. Deriving downstream is cheaper, verifiable in SQL, and cannot hang
+    /// tally.exe.
+    ///
+    /// ReportExtractor.Bills and ParseBillsReport remain — `TallyAgent.Cli
+    /// verify` still parses a Tally bills export with them, which is how the
+    /// derivation gets checked against Tally's own numbers.
+    /// </summary>
+    public static readonly IReadOnlySet<string> RetiredBillsReports =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "bills_payable", "bills_receivable" };
 
     /// <summary>Should a zero-row result from this dataset be reported rather
     /// than checkpointed as a success?</summary>

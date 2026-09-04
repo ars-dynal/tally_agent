@@ -21,8 +21,17 @@
                 <TextBlock Grid.Row="2" Text="Company name" VerticalAlignment="Center"/>
                 <TextBox Grid.Row="2" Grid.Column="1" x:Name="CompanyBox" Margin="0,2"/>
                 <TextBlock Grid.Row="3" Text="Extraction start date" VerticalAlignment="Center"/>
-                <TextBox Grid.Row="3" Grid.Column="1" x:Name="StartDateBox" Margin="0,2"
-                         ToolTip="yyyy-MM-dd"/>
+                <StackPanel Grid.Row="3" Grid.Column="1">
+                    <TextBox x:Name="StartDateBox" Margin="0,2"
+                             ToolTip="yyyy-MM-dd"/>
+                    <!-- Shown only when the full-history walk has already
+                         completed, which is exactly when this field stops doing
+                         anything. Hidden otherwise so it never becomes noise. -->
+                    <TextBlock x:Name="StartDateInertText" Visibility="Collapsed"
+                               TextWrapping="Wrap" FontSize="11" Foreground="#A4262C"
+                               Margin="0,2,0,4"
+                               Text="Has no effect right now — the full history sync has already finished, and this date is only read while it is still running. Change it and Save, and you will be asked whether to re-extract all history."/>
+                </StackPanel>
                 <TextBlock Grid.Row="4" Text="Extraction end date" VerticalAlignment="Center"/>
                 <TextBox Grid.Row="4" Grid.Column="1" x:Name="EndDateBox" Margin="0,2"
                          ToolTip="yyyy-MM-dd. Leave BLANK on the machine that tracks live data.&#x0a;Set it with the start date to back-fill one financial year at a time,&#x0a;e.g. start 2019-04-01 and end 2020-03-31."/>
@@ -61,8 +70,11 @@
                            Margin="34,0,0,4" Foreground="Gray" FontSize="11"/>
 
                 <CheckBox x:Name="OutstandingReceivablesCheck" Content="Outstanding Receivables" Margin="16,3,0,0"/>
-                <TextBlock Text="What customers owe us, bill by bill."
-                           Margin="34,0,0,8" Foreground="Gray" FontSize="11"/>
+                <TextBlock Text="What customers owe us, as a balance per party."
+                           Margin="34,0,0,4" Foreground="Gray" FontSize="11"/>
+
+                <TextBlock TextWrapping="Wrap" Margin="34,0,0,8" Foreground="Gray" FontSize="11"
+                           Text="Bill-by-bill outstandings are no longer requested from Tally. They are derived downstream from the bill allocations already extracted with every voucher, which is cheaper and cannot stall Tally."/>
 
                 <CheckBox x:Name="BalanceSheetCheck" Content="Balance Sheet  — known to freeze Tally"
                           Foreground="#A4262C" Margin="16,3,0,0"/>

@@ -1,6 +1,403 @@
 # Changelog
 
-## 2.1.0 (in progress) - Snapshot reports one at a time; day_book stops being uploaded twice
+## 2.3.0 - Verified against Tally's own export
+
+The final agent release for this phase. Everything in it was checked against
+export files Tally produced from its own UI (TrialBal.xml, Bills.xml), not
+against a number anyone remembered. Those files are live accounting data and are
+deliberately not committed; `TallyAgent.Cli verify` runs them through the exact
+parsers the agent uses.
+
+### A refused report falls back again (regression fixed before release)
+
+Caught on the Tally server: `trial_balance` uploaded **ZERO batches**.
+`ReportExtractor.TrialBalance` -> `PostAsync` -> `TallyException "Tally refused
+the request: Unknown Request"`. The v2.2.0 refusal detection threw straight past
+the `if (rows.Count == 0)` fallback, so a dataset that had been producing 1,038
+reconciling rows produced nothing at all.
+
+Detecting a refusal and deciding what to do about it are different decisions.
+The refusal is still detected, named and surfaced; then the extractor takes the
+route it already had.
+
+* `PostReportAllowingRefusal` returns null on a refusal instead of throwing.
+  Every report WITH a fallback uses it - trial_balance, balance_sheet,
+  profit_loss, stock_summary, bills.
+* Loud, not fatal: the refusal is logged, collected in
+  `ReportExtractor.RefusalsThisCycle`, and reported by the engine as a Warning
+  against `extract:reports`. The rows carry `source='ledger_collection'`, so the
+  route is visible in the data as well as the log.
+* A refusal with NO fallback still fails hard. There is nothing else to try, and
+  pretending otherwise would be the original bug.
+
+### The period guard was reading the BOOKS range
+
+Proven on the server: the agent logged `2019-04-01..2026-09-04` from
+`STARTINGFROM`/`ENDINGAT` while Tally's Gateway showed **1-Apr-26 to 31-Mar-27**.
+Those fields are the data range, not the active period, and Tally does not appear
+to expose Alt+F2 over XML at all.
+
+So it is **inferred from what Tally actually serves**. Asked for
+`2026-08-05..2026-09-04`, Tally returned vouchers dated `2026-04-01` - it ignores
+the requested window and serves from the active-period start, which the agent
+was silently skipping client-side. That earliest volunteered date IS the start.
+
+* `DayBookResult` now reports `ServedMinDate`/`ServedMaxDate` (every voucher
+  returned, accepted or not) and `OutOfWindowCount`.
+* When Tally serves earlier than asked, the engine records that date as the
+  active-period start for the rest of the run and fails any later window
+  beginning before it - **before** spending a request on it.
+* A window that returns nothing while Tally sent vouchers from elsewhere now
+  FAILS instead of checkpointing. That combination is precisely how a silent
+  multi-year backfill gap is created.
+* `GetActivePeriodAsync` is renamed `GetBooksPeriodAsync` and logged as
+  "books range ... this is NOT the active period". It remains a valid outer
+  bound - no data can exist outside it - just not the one that matters.
+
+### bills_payable / bills_receivable are retired
+
+We were asking Tally to compute something we already have the inputs for.
+`tally-database-loader` never requests a Bills Payable report either; it derives
+outstandings in SQL by matching New Ref and Advance against Agst Ref by bill
+name. `bill_allocations` was carrying 7,559 rows on the day this was decided.
+
+Audit of what the extractor carries per allocation row:
+
+| Required | Present as | |
+|---|---|---|
+| bill name / reference | `bill_ref` (BILLALLOCATIONS.NAME) | yes |
+| bill type | `bill_type` (New Ref / Agst Ref / Advance / On Account) | yes |
+| amount | `amount` | yes |
+| party ledger | `ledger_name` - allocations hang off the party's entry | yes |
+| voucher guid | `voucher_guid` | yes |
+| voucher date | `voucher_date` | yes |
+| voucher type | **was missing** - now added | fixed |
+
+`voucher_type` was the one gap, while every other allocation row already carried
+it. Without it the SQL cannot tell a purchase from a payment. Added, and the two
+report datasets are retired the same way `opening_bills` was: removed from the
+registry and the Manager, with `ReportExtractor.Bills` and `ParseBillsReport`
+kept so `TallyAgent.Cli verify` can still check the derivation against Tally's
+own bills export.
+
+That also ends the envelope hunt. The report route was a heavy computation on
+Tally's single application thread, an envelope that took three attempts to pin
+down, and a parser that could only ever be as right as the guess behind it.
+
+### The bills envelope and parser were both wrong
+
+Tally's export puts the amount OUTSIDE the record container:
+
+```xml
+<BILLFIXED>
+  <BILLDATE>1-Nov-21</BILLDATE>
+  <BILLREF>PO/21-22/00172</BILLREF>
+  <BILLPARTY>Apar Industries Limited</BILLPARTY>
+</BILLFIXED>
+<BILLCL>-369.00</BILLCL>
+<BILLDUE>1-Nov-21</BILLDUE>
+<BILLOVERDUE>1768</BILLOVERDUE>
+```
+
+`BILLCL`, `BILLDUE` and `BILLOVERDUE` are FOLLOWING SIBLINGS of `BILLFIXED`.
+v2.2.0 searched inside the container, so it would have found the reference and
+the party but never the amount: **351 rows of 0.00 that look like a working
+extraction**. A record is now the container plus the siblings up to the next
+container.
+
+* Amount tag is `BILLCL`, not the guessed `BILLAMT`/`CLOSINGBALANCE`.
+* Amounts are **negative for credit** and are kept exactly as Tally reports them.
+* `EXPLODEFLAG` is **removed**. v2.2.0 added it reasoning the export would
+  otherwise collapse to a party summary; Tally's own bill-level export disproves
+  that, and it was the only thing separating this envelope from `Report()`.
+* An empty `BILLOVERDUE` stays null; `0` stays 0. 38 of the 351 records are
+  blank, and "not yet due" is not "due today".
+
+Offline gate result against Tally's own file: **351 records, total
+-139,723,340.43, 313 with overdue days, 38 blank, 351/351 dates parsed, 0 zero
+amounts, 123 parties.**
+
+### Trial Balance: it has always been the ledger fallback
+
+Tally's export uses `DSPCLDRAMTA` / `DSPCLCRAMTA` inside `DSPCLDRAMT` /
+`DSPCLCRAMT`, with **debits negative**. The parser read `DSPCLDR` / `DSPCLCR` /
+`BSMAINAMT` - none of which exist in that shape.
+
+That settles the open question. The report route could only ever have produced
+11 rows of zeros. `trial_balance` returns 1,038 rows and reconciles, so it has
+**never** come from the report - it has been `TrialBalanceFromLedgers` the whole
+time. The figures were right; nothing said which route produced them.
+
+Offline gate result: **11 primary groups, debit 756,250,338.64, credit
+756,250,338.64.**
+
+`source` is on every dataset with a fallback (`trial_balance`, `balance_sheet`,
+`profit_loss`, `stock_summary`, both bills datasets) - `report` or the specific
+fallback. `net_amount` is debit-positive on both routes so they cannot disagree
+on sign.
+
+### Encoding: read what the response declares
+
+Tally's exports are UTF-16LE with a BOM, and item names contain the
+multiplication sign. `TallyXml.Decode` now resolves the encoding in the order it
+can be trusted: BOM, then the XML declaration's `encoding=`, then the HTTP
+`Content-Type` charset, then strict UTF-8 falling back to Latin-1.
+
+* `SS M8×40MM` no longer arrives as `SS M8<U+FFFD>40MM`. Decoding single-byte
+  text as UTF-8 turned every byte above 0x7F into U+FFFD - silently, because
+  U+FFFD is a valid character nothing downstream could distinguish from data.
+* A decoded BOM survives as U+FEFF and `XDocument.Parse` rejects it outright
+  ("Data at the root level is invalid"). It is stripped after decoding. Reading
+  a real Tally UI export failed on byte one before this.
+* `d-MMM-yy` and `dd-MMM-yy` added to the date formats. Report exports use
+  `1-Nov-21`; without them every bill date and due date parsed to null while the
+  row still looked complete.
+
+### Active period guard
+
+Tally bounds every export by the company's active period (Alt+F2) regardless of
+`SVFROMDATE`/`SVTODATE`, and a request outside it returns a valid, EMPTY response
+with no error. That is how six years once looked empty for three weeks.
+
+The period is read at the start of every run and any dataset whose range falls
+outside it now **fails with the actual period in the message** rather than
+checkpointing on nothing. It is an error, not a log line, precisely because the
+symptom is silence.
+
+Not yet confirmed: which Company field carries the ACTIVE period rather than the
+books period. `STARTINGFROM`/`ENDINGAT` is used and the values are printed
+wherever the guard fires. If `STARTINGFROM` turns out to be the books beginning,
+the computed period is WIDER than the real one - the guard under-fires and
+nothing breaks, which is the safe direction to be wrong in.
+
+### Heavy reports off permanently
+
+`balance_sheet`, `profit_loss` and `stock_summary` now default to **false** with
+no config entry at all. They hang tally.exe and all three are derived downstream
+from ledgers plus the group hierarchy. This deliberately breaks v2.1.0's promise
+that an absent entry falls back to `enableSnapshots` - for these three only. An
+explicit entry still wins, so a deliberate override is still possible.
+
+### opening_bills is retired
+
+Zero rows for its entire history. The diagnosis (a `.LIST` FETCH that Tally
+ignores silently) was reasoned from the code and never confirmed against a live
+Tally, and shipping an unverified fix for a dataset that has never produced a row
+is how it stayed broken for months. It is removed from the registry rather than
+left checkpointing successfully on nothing - a dataset that reports health it
+does not have is worse than no dataset.
+
+Nothing is lost: it never carried a row, and outstanding bill detail is now
+covered by `bills_payable` / `bills_receivable`. `MasterExtractor.OpeningBills`
+and `diagnose-opening-bills` remain so it can be revived with evidence. The
+ledger export no longer fetches bill allocations no dataset consumes.
+
+### The gate
+
+`TallyAgent.Cli verify --bills <Bills.xml> --trial-balance <TrialBal.xml>`
+runs Tally's own exports through the agent's parsers. With `--live` it also asks
+Tally for the same reports and diffs the response against the reference **record
+for record**, reports the active period, and lists every dataset with its row
+count - including `voucher_lines`, so the effect of
+`emitLegacyVouchersDataset: false` is shown rather than asserted. Exit 1 on any
+mismatch.
+
+The 251 / 26,351,475.28 and 358 / 152,110,022.43 targets are retired: they could
+not be sourced to any report. Tally's own export is the reference now.
+
+## 2.2.0 - Bill-level outstandings; masters stop re-uploading unchanged
+
+The last planned agent release. Everything still outstanding is in it.
+
+### A refused request is no longer read as an empty one
+
+The most important change here, and it was not on the original list.
+
+```xml
+<RESPONSE>Unknown Request, cannot be processed</RESPONSE>
+```
+
+HTTP 200. Well-formed XML. Parses cleanly. Zero rows. Every extractor that says
+`if (rows.Count == 0) → fall back` therefore treated a REFUSED request as an
+EMPTY report: it silently ran a different code path and returned a plausible
+number. The zero-row guard never fired either, because the fallback produced
+rows. That is `TrialBalance`, `BalanceSheet`, `ProfitLoss`, `StockSummary` and
+the new `Bills` - five datasets.
+
+This is the same disease as the silently-ignored FETCH entry above: a valid
+response that means "no" and reads as "nothing".
+
+* `TallyXml.FindRequestError` detects a refusal; `TallyClient` raises
+  `TallyRequestRejected` at the single point every response is parsed. Not
+  special-cased for bills, not repeated per dataset.
+* Conservative by design, so a real response is never mistaken for a refusal:
+  any `LINEERROR` element, or a root `RESPONSE` carrying text and no child
+  elements. A `RESPONSE` **with** children is an import acknowledgement and is
+  left alone. A genuinely empty export is still empty, and its fallback still
+  runs.
+* Not retried - the refusal is deterministic - and **not** run-ending: the one
+  dataset fails loudly and the rest of the cycle continues.
+* The response body travels on the exception, so a diagnostic can show the
+  refusal it tripped on without asking Tally a second time.
+
+**Expect this to surface failures that were previously invisible.** A dataset
+whose report has been refused all along will now error instead of quietly
+serving its fallback. That is the point.
+
+### `source` - which route actually produced these rows
+
+Every dataset with a fallback now records the route on each row:
+`trial_balance`, `balance_sheet`, `profit_loss`, `stock_summary`,
+`bills_payable`, `bills_receivable`. Values are `report` or the specific
+fallback (`ledger_collection`, `group_collection`, `stockitem_collection`,
+`bills_collection`).
+
+`trial_balance` is why this matters. It returns 1,038 rows and reconciles
+exactly to Tally's own screen - but `TrialBalanceFromLedgers` would do that too,
+because both routes derive from the same ledger balances. Nothing in the data
+distinguishes them, so we do not currently know whether `trial_balance` has ever
+come from the report route. If it has been the fallback for weeks, the figures
+are still right; we simply would not have known. **A number that is right by
+accident should still say which route it came by.**
+
+`outstanding_payables` / `outstanding_receivables` are deliberately NOT given
+this column - they have no fallback, and they are not being touched.
+
+### Envelope probing
+
+`capture-xml --envelope-file <path>` / `--envelope-dir <dir>` posts raw envelope
+files to Tally verbatim and prints ACCEPTED/REFUSED with Tally's own words, an
+element histogram and the response head. No parsing, no dataset, no rebuild
+between attempts. Placeholders `{{COMPANY}}`, `{{FROM}}`, `{{TO}}`.
+
+`diagnostics/envelopes/` holds the candidate set, **control first**:
+`00-control-trial-balance` is the report shape that demonstrably works. If it is
+also refused, the problem is the session or the company rather than the report
+name, and every other variant is wasted effort. See that folder's README.
+
+### bills_payable / bills_receivable - NEW, and the reason this release exists
+
+`outstanding_payables` and `outstanding_receivables` are built from
+`LedgerBalancesDocument` - a Collection of Ledger with CLOSINGBALANCE. That is
+why they reconcile exactly to the trial balance, and equally why they carry no
+bill detail: a ledger balance is one number per party. The question "which bills
+make up that number, and how late are they" was never asked of Tally.
+
+Tally's own **Bills Payable** and **Bills Receivable** reports hold it: bill
+date, reference number, party, pending amount, due date and overdue days.
+
+* Two new Snapshot datasets, `bills_payable` and `bills_receivable`, with their
+  own checkboxes in the Manager's Reports section.
+* **Additive.** `outstanding_payables` / `outstanding_receivables` are not
+  touched - not their envelope, not their parsing, not their columns. They are
+  correct, they reconcile, and staging views are deployed against them.
+* **Tally's overdue-days figure is kept, never recomputed.** The due date
+  depends on the credit period and the bill type and Tally is the authority on
+  both. A bill with no overdue column stays null rather than becoming 0, which
+  would read downstream as "due today".
+* Falls back to the dated `Bills` collection if the report export comes back
+  empty, the same pattern the other reports here use. That path cannot carry an
+  overdue-day count, so it leaves the column null; every row records which path
+  produced it in `source`.
+* Business key for the staging view: `_company` + `party_name` + `bill_ref` +
+  `bill_date` + `as_of_date`. The same reference can repeat across parties, and
+  the dataset is a snapshot as of a date - see the inventory unit-of-measure
+  incident in CLAUDE.md for what a short key costs.
+
+**Not yet verified against live Tally.** The exact element names TallyPrime uses
+in these report exports were not confirmed while this was written (the Tally
+server was unreachable from the build machine), so the parser accepts several
+candidate shapes and the tests pin its behaviour rather than the tag names.
+Run this on the Tally server before trusting a load:
+
+```powershell
+TallyAgent.Cli verify-bills --from 2026-04-01 --to 2026-09-03 `
+  --expect-rows-payable 251    --expect-total-payable 2,63,51,475.28 `
+  --expect-rows-receivable 358 --expect-total-receivable 15,21,10,022.43
+```
+
+It exits non-zero on a mismatch and, when nothing parses, prints the element
+histogram of the actual response - which is what the parser needs to be fixed
+from. `--dump` saves the raw XML.
+
+### opening_bills - diagnosed, not yet confirmed fixed
+
+`opening_bills` has checkpointed on zero rows for its entire history while
+bill-wise details are enabled in Tally.
+
+The ledger FETCH list asked for one field, `BILLALLOCATIONS.LIST`. `.LIST` is
+how Tally *serialises* a list-valued member, not a member that can be fetched -
+and Tally ignores an unknown FETCH entry **silently**, returning a valid
+response with the sub-object simply absent. Zero rows, no error, forever. The
+dotted sub-field form is the technique `VoucherCollection` already uses for
+`ALLLEDGERENTRIES.BILLALLOCATIONS.*`, which does produce rows.
+
+* The request now asks for `BILLALLOCATIONS.NAME`, `.BILLDATE`,
+  `.BILLCREDITPERIOD`, `.OPENINGBALANCE`, `.CLOSINGBALANCE`, `.BILLTYPE` and
+  `.ISADVANCE`, and keeps the old entry - over-fetching is harmless.
+* The parser reads either serialisation (`<BILLALLOCATIONS.LIST>` or bare
+  `<BILLALLOCATIONS>`), matched case-insensitively.
+* New columns: `bill_date`, `bill_credit_period`, `is_advance`.
+
+This hypothesis is **not confirmed** - it was reasoned from the code, not
+observed. `TallyAgent.Cli diagnose-opening-bills` sends the old and new field
+lists and reports how many bill elements each returns, alongside how many
+ledgers have bill-wise tracking on. Three outcomes, three different conclusions,
+printed with the result. Run it before believing this is fixed.
+
+### Masters stop being re-uploaded unchanged
+
+Masters are re-extracted every cycle by design - they are cheap collections -
+but they were also re-*uploaded* every cycle unchanged: ~10,757 rows an hour,
+~247,000 redundant rows across the back-fill. `FindEquivalentActiveBatch`
+already suppressed a duplicate while the earlier batch was still queued, but an
+acked batch leaves `upload_batches`, so the next cycle minted a fresh one.
+
+* New `master_content_hashes` table (schema v6) holding, per (dataset, company),
+  the content hash of the last master extraction the cloud **acknowledged**.
+* A hash is recorded as *pending* at enqueue and promoted to *confirmed* only
+  when every batch it produced has been acked - inside the ack transaction. Only
+  a confirmed hash can suppress an upload.
+* `_sync_id` and `_sync_timestamp` are excluded from the hash. They are stamped
+  on every row at enqueue and differ on every upload by construction; including
+  them would make the hash never match and turn the whole optimisation into a
+  silent no-op that still looked like it was working. `_company` is excluded for
+  the same reason - the upload path writes it, so it is not what Tally said.
+  `balance_as_of` is deliberately **not** excluded: it marks which daily balance
+  capture the row carries, so it changes exactly when the balances do.
+* Snapshots are never skipped - they are dated as-of values.
+* Force Full Sync clears the hashes, so a re-walk always re-uploads.
+* Expect hourly master uploads to become roughly daily (balances move once a
+  day), not to stop - a ~24x reduction.
+
+The failure mode this guards against is masters silently not uploading, which
+nothing would notice. Eight tests pin it: first run uploads, changed content
+uploads, unchanged content skips only after an ack, a failed upload records
+nothing and recovers on retry, a partially acked upload does not confirm, an
+unrelated dataset's ack does not confirm this one, and the hash survives being
+enqueued.
+
+### extractionStartDate no longer lies
+
+It is only read inside the `!FullSyncDone` branch, so once the full-history walk
+latches, editing it does nothing at all. Silently ignored settings are traps.
+
+* The Manager shows a red note under the field, but only while it is actually
+  inert.
+* Changing it in that state now offers the one action that applies it -
+  re-extract all history - and says what declining means. The value is saved
+  either way.
+* The service logs a warning every cycle the setting is present and inert.
+
+### Release tooling
+
+* `build.ps1` no longer defaults `-Version` to the four-versions-stale
+  "1.0.0". It reads `<Version>` from `Directory.Build.props`, and now **fails
+  the build** if `AgentInfo.Version` disagrees - the mismatch that ships a
+  stale installer under a new tag.
+* `.gitignore`: `__pycache__/`, `*.patch`.
+
+## 2.1.0 - Snapshot reports one at a time; day_book stops being uploaded twice
 
 ### Per-dataset snapshot control
 

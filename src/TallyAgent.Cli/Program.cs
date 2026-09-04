@@ -8,6 +8,7 @@ using TallyAgent.Core.Data;
 using TallyAgent.Core.Diagnostics;
 using TallyAgent.Core.Security;
 using TallyAgent.Core.Tally;
+using TallyAgent.Core.Tally.Extractors;
 
 // ─────────────────────────────────────────────────────────────────
 // TallyAgent.Cli — admin & installer verbs.
@@ -29,6 +30,9 @@ try
         "sync-now" => WriteTrigger("sync-now"),
         "force-full-sync" => WriteTrigger("force-full"),
         "capture-xml" => await CaptureXml(argv.Skip(1).ToList()),
+        "verify" => await Verify(argv.Skip(1).ToList(), json),
+        "verify-bills" => await VerifyBills(argv.Skip(1).ToList(), json),
+        "diagnose-opening-bills" => await DiagnoseOpeningBills(argv.Skip(1).ToList(), json),
         "retry-failed" => RetryFailed(json),
         "export-diag" => ExportDiag(json),
         "status" => Status(json),
@@ -172,7 +176,9 @@ static async Task<int> CaptureXml(List<string> a)
     var cfg = new ConfigStore().Load();
     var client = new TallyClient(cfg.Tally, NullLogger<TallyClient>.Instance);
 
+    var dump = a.Remove("--dump");
     string kind = "vouchers", collection = "Ledger";
+    string? envelopeFile = null, envelopeDir = null;
     DateOnly from = DateOnly.FromDateTime(DateTime.Today).AddDays(-7);
     DateOnly to = DateOnly.FromDateTime(DateTime.Today);
     for (var i = 0; i < a.Count - 1; i++)
@@ -183,8 +189,13 @@ static async Task<int> CaptureXml(List<string> a)
             case "--collection": collection = a[++i]; break;
             case "--from": from = DateOnly.Parse(a[++i]); break;
             case "--to": to = DateOnly.Parse(a[++i]); break;
+            case "--envelope-file": envelopeFile = a[++i]; break;
+            case "--envelope-dir": envelopeDir = a[++i]; break;
         }
     }
+
+    if (envelopeFile is not null || envelopeDir is not null)
+        return await PostEnvelopes(client, cfg, envelopeFile, envelopeDir, from, to, dump);
 
     var envelope = kind switch
     {
@@ -202,6 +213,590 @@ static async Task<int> CaptureXml(List<string> a)
         $"{kind}-{(kind == "masters" ? collection + "-" : "")}{DateTime.Now:yyyyMMdd-HHmmss}.xml");
     File.WriteAllText(file, xml);
     Console.WriteLine($"Captured {xml.Length:N0} chars of sanitized Tally XML to:\n  {file}");
+    return 0;
+}
+
+/// <summary>
+/// Post raw envelope files to Tally verbatim and report what came back. No
+/// parsing, no dataset, no rebuild between attempts — the point is to find out
+/// which envelope SHAPE Tally accepts before any extractor is written against
+/// it.
+///
+/// usage: capture-xml --envelope-file  <path> [--from d] [--to d] [--dump]
+///        capture-xml --envelope-dir   <dir>  [--from d] [--to d] [--dump]
+///
+/// Files may use the placeholders {{COMPANY}}, {{FROM}} and {{TO}}; FROM/TO are
+/// substituted in Tally's yyyyMMdd form. A directory is processed in filename
+/// order and does NOT stop on a refusal — the ordering is the experiment, and a
+/// refusal is a result.
+/// </summary>
+static async Task<int> PostEnvelopes(TallyClient client, AgentConfig cfg,
+    string? file, string? dir, DateOnly from, DateOnly to, bool dump)
+{
+    if (await FailFastIfTallyUnreachable(client, cfg, json: false) is { } unreachable)
+        return unreachable;
+
+    var files = new List<string>();
+    if (file is not null) files.Add(file);
+    if (dir is not null)
+        files.AddRange(Directory.EnumerateFiles(dir, "*.xml").OrderBy(f => f, StringComparer.Ordinal));
+    if (files.Count == 0) { Console.Error.WriteLine("No envelope files found."); return 2; }
+
+    var fixtures = Path.Combine(AgentInfo.DataDir, "fixtures");
+    if (dump) Directory.CreateDirectory(fixtures);
+    var accepted = 0;
+
+    foreach (var path in files)
+    {
+        var name = Path.GetFileNameWithoutExtension(path);
+        var envelope = (await File.ReadAllTextAsync(path))
+            .Replace("{{COMPANY}}", TallyXml.XmlEscape(cfg.Tally.Company))
+            .Replace("{{FROM}}", from.ToString("yyyyMMdd"))
+            .Replace("{{TO}}", to.ToString("yyyyMMdd"));
+
+        Console.WriteLine(new string('─', 72));
+        Console.WriteLine($"▶ {name}");
+
+        string? body = null, refusal = null;
+        try
+        {
+            body = await client.PostRawAsync(envelope);
+        }
+        catch (TallyException tex)
+        {
+            refusal = tex.Message;
+            // The rejection check attaches the body, so a refusal is inspected
+            // from the same bytes the extractor saw — no second request.
+            body = tex.ResponseText;
+        }
+        catch (Exception ex) { refusal = ex.Message; }
+
+        if (refusal is not null) Console.WriteLine($"  REFUSED: {refusal}");
+        else { accepted++; Console.WriteLine("  ACCEPTED"); }
+
+        if (body is null) { Console.WriteLine("  (no response body)"); continue; }
+
+        Console.WriteLine($"  {body.Length:N0} chars");
+        try
+        {
+            var doc = System.Xml.Linq.XDocument.Parse(body);
+            var hist = ElementHistogram(doc);
+            Console.WriteLine("  elements: " +
+                (hist.Count == 0 ? "(none)" : string.Join(", ", hist.Select(kv => $"{kv.Key}×{kv.Value}"))));
+        }
+        catch (Exception ex) { Console.WriteLine($"  (not parseable: {ex.Message})"); }
+
+        Console.WriteLine("  head: " + Truncate(body, 1200).ReplaceLineEndings(" "));
+
+        if (dump)
+        {
+            var outPath = Path.Combine(fixtures, $"{name}-{DateTime.Now:yyyyMMdd-HHmmss}.xml");
+            await File.WriteAllTextAsync(outPath, body);
+            Console.WriteLine($"  saved: {outPath}");
+        }
+    }
+
+    Console.WriteLine(new string('─', 72));
+    Console.WriteLine($"{accepted} of {files.Count} envelope(s) accepted " +
+                      $"({from:yyyy-MM-dd}..{to:yyyy-MM-dd}, company '{cfg.Tally.Company}').");
+    return accepted > 0 ? 0 : 1;
+}
+
+static string Truncate(string s, int max) => s.Length <= max ? s : s[..max] + "…";
+
+
+// ── the v2.3.0 gate ────────────────────────────────────────────────
+//
+// The reference is TALLY'S OWN EXPORT, not a number someone remembers. Every
+// comparison below is record-for-record against a file Tally produced from its
+// own UI, so "it reconciles" is never accepted as evidence on its own.
+
+/// <summary>
+/// verify — prove the agent's extraction against Tally's own export files.
+///
+/// usage: verify --bills &lt;Bills.xml&gt; --trial-balance &lt;TrialBal.xml&gt;
+///               [--live] [--from d] [--to d] [--json]
+///
+/// Without --live this runs the REFERENCE FILES through the exact parsers the
+/// agent uses and reports what they yield. That proves the parser against real
+/// Tally output and needs no Tally connection.
+///
+/// With --live it additionally asks Tally for the same reports and diffs the
+/// agent's response against the reference RECORD FOR RECORD.
+///
+/// Exit code 1 on any mismatch, so this can gate a release.
+/// </summary>
+static async Task<int> Verify(List<string> a, bool json)
+{
+    var live = a.Remove("--live");
+    string? billsRef = null, tbRef = null;
+    var today = DateOnly.FromDateTime(DateTime.Today);
+    var from = new DateOnly(today.Month >= 4 ? today.Year : today.Year - 1, 4, 1);
+    var to = today;
+    for (var i = 0; i < a.Count - 1; i++)
+    {
+        switch (a[i])
+        {
+            case "--bills": billsRef = a[++i]; break;
+            case "--trial-balance": tbRef = a[++i]; break;
+            case "--from": from = DateOnly.Parse(a[++i]); break;
+            case "--to": to = DateOnly.Parse(a[++i]); break;
+        }
+    }
+
+    var results = new List<object>();
+    var ok = true;
+
+    // ── reference files, through the agent's own parsers ──────────
+    List<Dictionary<string, object?>>? refBills = null, refTb = null;
+    if (billsRef is not null)
+    {
+        refBills = ReportExtractor.ParseBillsReport(LoadReference(billsRef), to);
+        results.Add(new
+        {
+            check = "reference:bills",
+            file = billsRef,
+            rows = refBills.Count,
+            total = Math.Round(refBills.Sum(r => Convert.ToDouble(r["pending_amount"] ?? 0d)), 2),
+            with_overdue_days = refBills.Count(r => r["overdue_days"] is not null),
+            blank_overdue_days = refBills.Count(r => r["overdue_days"] is null),
+            parsed_bill_dates = refBills.Count(r => r["bill_date"] is not null),
+            parsed_due_dates = refBills.Count(r => r["due_date"] is not null),
+            distinct_parties = refBills.Select(r => (string?)r["party_name"] ?? "").Distinct().Count(),
+            zero_amounts = refBills.Count(r => Convert.ToDouble(r["pending_amount"] ?? 0d) == 0),
+            sample = refBills.Take(3).ToList(),
+        });
+    }
+    if (tbRef is not null)
+    {
+        refTb = ReportExtractor.ParseTrialBalanceReport(LoadReference(tbRef));
+        results.Add(new
+        {
+            check = "reference:trial_balance",
+            file = tbRef,
+            rows = refTb.Count,
+            debit_total = Math.Round(refTb.Sum(r => Convert.ToDouble(r["closing_debit"] ?? 0d)), 2),
+            credit_total = Math.Round(refTb.Sum(r => Convert.ToDouble(r["closing_credit"] ?? 0d)), 2),
+            groups = refTb.Select(r => (string?)r["ledger_name"]).ToList(),
+        });
+    }
+
+    // ── live Tally, diffed against the reference ──────────────────
+    if (live)
+    {
+        var cfg = new ConfigStore().Load();
+        using var client = new TallyClient(cfg.Tally, NullLogger<TallyClient>.Instance);
+        if (await FailFastIfTallyUnreachable(client, cfg, json) is { } unreachable) return unreachable;
+
+        var period = await client.GetBooksPeriodAsync();
+        results.Add(new
+        {
+            check = "books_range",
+            note = "NOT the active period - Tally does not expose Alt+F2 over XML; " +
+                   "the active period is inferred from the dates it actually serves.",
+            books_range = period is null ? "unknown"
+                : $"{period.Value.From:yyyy-MM-dd}..{period.Value.To:yyyy-MM-dd}",
+            requested = $"{from:yyyy-MM-dd}..{to:yyyy-MM-dd}",
+            books_covers_request = period is null ? (bool?)null
+                : period.Value.From <= from && period.Value.To >= to,
+        });
+
+        var reports = new ReportExtractor(client, NullLogger<ReportExtractor>.Instance);
+        reports.BeginCycle();
+
+        if (tbRef is not null)
+        {
+            var liveTb = await reports.TrialBalance(from, to, CancellationToken.None);
+            var diff = DiffRows(refTb!, liveTb, ["ledger_name"],
+                ["closing_debit", "closing_credit"]);
+            if (diff.Count > 0) ok = false;
+            results.Add(new
+            {
+                check = "live:trial_balance",
+                rows = liveTb.Count,
+                source = liveTb.Count > 0 ? liveTb[0]["source"] : null,
+                mismatches = diff.Count,
+                first_mismatches = diff.Take(10).ToList(),
+            });
+        }
+
+        if (billsRef is not null)
+        {
+            var liveBills = await reports.Bills("Bills Payable", "Sundry Creditors",
+                from, to, CancellationToken.None);
+            var diff = DiffRows(refBills!, liveBills, ["bill_ref", "party_name"],
+                ["pending_amount", "bill_date", "due_date", "overdue_days"]);
+            if (diff.Count > 0) ok = false;
+            results.Add(new
+            {
+                check = "live:bills_payable",
+                rows = liveBills.Count,
+                source = liveBills.Count > 0 ? liveBills[0]["source"] : null,
+                total = Math.Round(liveBills.Sum(r => Convert.ToDouble(r["pending_amount"] ?? 0d)), 2),
+                mismatches = diff.Count,
+                first_mismatches = diff.Take(10).ToList(),
+            });
+        }
+
+        // ── the dataset list, with ROW COUNTS rather than assertions ──
+        //
+        // voucher_lines in particular: emitLegacyVouchersDataset going false
+        // removed only the `vouchers` copy of day_book, and this is where that
+        // is demonstrated rather than claimed.
+        var db = new AgentDatabase(NullLogger<AgentDatabase>.Instance);
+        var masters = new MasterExtractor(client, new MasterBalanceRepository(db),
+            NullLogger<MasterExtractor>.Instance);
+        masters.BeginCycle(cfg.Tally.Company, fetchBalances: false);
+        var voucherExtractor = new VoucherExtractor(client, NullLogger<VoucherExtractor>.Instance);
+
+        var counts = new List<object>();
+        foreach (var ds in DatasetRegistry.Enabled(cfg.Tally).Where(d => d.Kind == DatasetKind.Master))
+        {
+            try
+            {
+                var rows = await ExtractMasterByName(masters, ds.Name);
+                counts.Add(new { dataset = ds.Name, kind = "master", rows = rows?.Count, error = (string?)null });
+            }
+            catch (Exception ex)
+            {
+                ok = false;
+                counts.Add(new { dataset = ds.Name, kind = "master", rows = (int?)null, error = (string?)ex.Message });
+            }
+        }
+
+        // One voucher window (the incremental lookback) fans out to every
+        // voucher-derived dataset in a single Tally request.
+        var vFrom = to.AddDays(-Math.Max(1, cfg.Tally.IncrementalLookbackDays));
+        try
+        {
+            var banks = await masters.BankLedgerNames(CancellationToken.None);
+            var fan = await voucherExtractor.ExtractWindow(vFrom, to, banks, CancellationToken.None);
+            foreach (var (name, rows) in new (string, int)[]
+            {
+                ("voucher_headers", fan.VoucherHeaders.Count),
+                ("voucher_lines", fan.VoucherLines.Count),
+                ("bill_allocations", fan.BillAllocations.Count),
+                ("bank_allocations", fan.BankAllocations.Count),
+                ("cost_centre_allocations", fan.CostCentreAllocations.Count),
+                ("inventory_entries", fan.InventoryEntries.Count),
+                ("day_book", fan.DayBook.Count),
+                ("bank_book", fan.BankBook.Count),
+                ("sales_register", fan.SalesRegister.Count),
+                ("purchase_register", fan.PurchaseRegister.Count),
+                ("sales_invoice_lines", fan.SalesInvoiceLines.Count),
+                ("voucher_guid_manifest", fan.Manifest.Count),
+                ("vouchers (legacy copy of day_book)", fan.Vouchers.Count),
+            })
+                counts.Add(new { dataset = name, kind = "voucher", rows = (int?)rows, error = (string?)null });
+        }
+        catch (Exception ex)
+        {
+            ok = false;
+            counts.Add(new { dataset = "vouchers[window]", kind = "voucher", rows = (int?)null, error = (string?)ex.Message });
+        }
+
+        results.Add(new
+        {
+            check = "dataset_row_counts",
+            voucher_window = $"{vFrom:yyyy-MM-dd}..{to:yyyy-MM-dd}",
+            emit_legacy_vouchers_dataset = cfg.Tally.EmitLegacyVouchersDataset,
+            datasets = counts,
+        });
+    }
+
+    Console.WriteLine(JsonSerializer.Serialize(new { ok, live, results },
+        new JsonSerializerOptions { WriteIndented = true }));
+    return ok ? 0 : 1;
+}
+
+/// <summary>Master datasets by name, matching SyncEngine's dispatch.</summary>
+static async Task<List<Dictionary<string, object?>>?> ExtractMasterByName(
+    MasterExtractor m, string dataset) => dataset switch
+{
+    "companies" => await m.Companies(CancellationToken.None),
+    "groups" => await m.Groups(CancellationToken.None),
+    "ledgers" => await m.Ledgers(CancellationToken.None),
+    "voucher_types" => await m.VoucherTypes(CancellationToken.None),
+    "cost_centres" => await m.CostCentres(CancellationToken.None),
+    "cost_categories" => await m.CostCategories(CancellationToken.None),
+    "currencies" => await m.Currencies(CancellationToken.None),
+    "uom" => await m.Units(CancellationToken.None),
+    "gst_rates" => await m.GstRates(CancellationToken.None),
+    "stock_groups" => await m.StockGroups(CancellationToken.None),
+    "stock_items" => await m.StockItems(CancellationToken.None),
+    "godowns" => await m.Godowns(CancellationToken.None),
+    "stock_standard_costs" => await m.StockStandardCosts(CancellationToken.None),
+    "stock_standard_prices" => await m.StockStandardPrices(CancellationToken.None),
+    _ => null,
+};
+
+/// <summary>Load a Tally export file through the SAME decode path the agent
+/// uses for a live response — UTF-16LE with a BOM included.</summary>
+static System.Xml.Linq.XDocument LoadReference(string path) =>
+    TallyXml.Parse(File.ReadAllBytes(path));
+
+/// <summary>Record-for-record diff, keyed on <paramref name="keyFields"/> and
+/// compared on <paramref name="compareFields"/>. Reports records missing from
+/// either side as well as value differences.</summary>
+static List<string> DiffRows(
+    List<Dictionary<string, object?>> reference,
+    List<Dictionary<string, object?>> actual,
+    string[] keyFields, string[] compareFields)
+{
+    static string Key(Dictionary<string, object?> r, string[] fields) =>
+        string.Join("", fields.Select(f => r.TryGetValue(f, out var v) ? V(v) : ""));
+    static string V(object? v) => v switch
+    {
+        null => "",
+        double d => d.ToString("F2", System.Globalization.CultureInfo.InvariantCulture),
+        _ => v.ToString() ?? "",
+    };
+
+    var diffs = new List<string>();
+    var refByKey = new Dictionary<string, Dictionary<string, object?>>();
+    foreach (var r in reference) refByKey[Key(r, keyFields)] = r;
+    var actByKey = new Dictionary<string, Dictionary<string, object?>>();
+    foreach (var r in actual) actByKey[Key(r, keyFields)] = r;
+
+    foreach (var (k, r) in refByKey)
+    {
+        if (!actByKey.TryGetValue(k, out var b)) { diffs.Add($"MISSING from agent: {k}"); continue; }
+        foreach (var f in compareFields)
+        {
+            var rv = r.TryGetValue(f, out var x) ? V(x) : "";
+            var bv = b.TryGetValue(f, out var y) ? V(y) : "";
+            if (rv != bv) diffs.Add($"{k} :: {f}: reference={rv} agent={bv}");
+        }
+    }
+    foreach (var k in actByKey.Keys)
+        if (!refByKey.ContainsKey(k)) diffs.Add($"EXTRA in agent (not in reference): {k}");
+
+    return diffs;
+}
+
+/// <summary>verify-bills — run the two NEW bill-level datasets against a live
+/// Tally and report exactly what came back, so the extraction envelope can be
+/// proven right (or wrong) before anything is shipped or loaded.
+///
+/// usage: verify-bills [--from 2026-04-01] [--to 2026-09-03]
+///                     [--expect-rows-payable N] [--expect-total-payable X]
+///                     [--expect-rows-receivable N] [--expect-total-receivable X]
+///                     [--dump] [--json]
+///
+/// Exit code 1 when an --expect value is supplied and does not match, so this
+/// can gate a release.</summary>
+static async Task<int> VerifyBills(List<string> a, bool json)
+{
+    var cfg = new ConfigStore().Load();
+    var today = DateOnly.FromDateTime(DateTime.Today);
+    var from = new DateOnly(today.Month >= 4 ? today.Year : today.Year - 1, 4, 1);
+    var to = today;
+    var dump = a.Remove("--dump");
+    var expect = new Dictionary<string, (int? Rows, double? Total)>
+    {
+        ["bills_payable"] = (null, null),
+        ["bills_receivable"] = (null, null),
+    };
+    for (var i = 0; i < a.Count - 1; i++)
+    {
+        switch (a[i])
+        {
+            case "--from": from = DateOnly.Parse(a[++i]); break;
+            case "--to": to = DateOnly.Parse(a[++i]); break;
+            case "--expect-rows-payable":
+                expect["bills_payable"] = (int.Parse(a[++i]), expect["bills_payable"].Total); break;
+            case "--expect-total-payable":
+                expect["bills_payable"] = (expect["bills_payable"].Rows, ParseAmount(a[++i])); break;
+            case "--expect-rows-receivable":
+                expect["bills_receivable"] = (int.Parse(a[++i]), expect["bills_receivable"].Total); break;
+            case "--expect-total-receivable":
+                expect["bills_receivable"] = (expect["bills_receivable"].Rows, ParseAmount(a[++i])); break;
+        }
+    }
+
+    using var client = new TallyClient(cfg.Tally, NullLogger<TallyClient>.Instance);
+    if (await FailFastIfTallyUnreachable(client, cfg, json) is { } unreachable) return unreachable;
+
+    var results = new List<object>();
+    var ok = true;
+
+    foreach (var (dataset, report) in new[]
+             { ("bills_payable", "Bills Payable"), ("bills_receivable", "Bills Receivable") })
+    {
+        // ONE request per report: the row parse and the diagnostic histogram are
+        // both taken from the same response, because these reports are not cheap
+        // and Tally serves them on the thread operators are using.
+        var doc = await client.PostAsync(
+            TallyEnvelopes.BillsReport(report, from, to, cfg.Tally.Company),
+            client.SnapshotRequestTimeout, maxTimeoutRetries: 0, CancellationToken.None);
+
+        var rows = ReportExtractor.ParseBillsReport(doc, to);
+        var total = rows.Sum(r => Convert.ToDouble(r["pending_amount"] ?? 0d));
+        var (expRows, expTotal) = expect[dataset];
+        var rowsOk = expRows is null || expRows == rows.Count;
+        // Money compared to the paisa, not by eye.
+        var totalOk = expTotal is null || Math.Abs(expTotal.Value - total) < 0.005;
+        if (!rowsOk || !totalOk) ok = false;
+
+        if (dump)
+        {
+            var dir = Path.Combine(AgentInfo.DataDir, "fixtures");
+            Directory.CreateDirectory(dir);
+            var file = Path.Combine(dir, $"{dataset}-{DateTime.Now:yyyyMMdd-HHmmss}.xml");
+            File.WriteAllText(file, doc.ToString());
+            Console.WriteLine($"  raw response saved: {file}");
+        }
+
+        results.Add(new
+        {
+            dataset,
+            report,
+            rows = rows.Count,
+            total = Math.Round(total, 2),
+            source = rows.Count > 0 ? rows[0]["source"] : null,
+            with_overdue_days = rows.Count(r => r["overdue_days"] is not null),
+            with_due_date = rows.Count(r => r["due_date"] is not null),
+            distinct_parties = rows.Select(r => (string?)r["party_name"] ?? "").Distinct().Count(),
+            expected_rows = expRows,
+            expected_total = expTotal,
+            rows_match = rowsOk,
+            total_match = totalOk,
+            // When nothing parsed, the element names in the response are the
+            // whole diagnosis — the report layout differs from what was expected.
+            element_histogram = rows.Count > 0 ? null : ElementHistogram(doc),
+            sample = rows.Take(3).ToList(),
+        });
+    }
+
+    if (json)
+    {
+        Console.WriteLine(JsonSerializer.Serialize(new { ok, from = from.ToString("yyyy-MM-dd"),
+            to = to.ToString("yyyy-MM-dd"), datasets = results },
+            new JsonSerializerOptions { WriteIndented = true }));
+    }
+    else
+    {
+        Console.WriteLine($"Bills verification for {from:yyyy-MM-dd} .. {to:yyyy-MM-dd}");
+        Console.WriteLine($"Company: {cfg.Tally.Company}\n");
+        Console.WriteLine(JsonSerializer.Serialize(results,
+            new JsonSerializerOptions { WriteIndented = true }));
+        Console.WriteLine(ok
+            ? "\nOK — every supplied expectation matched."
+            : "\nMISMATCH — the extraction envelope or the parser needs fixing. " +
+              "Re-run with --dump and send the saved XML.");
+    }
+    return ok ? 0 : 1;
+}
+
+/// <summary>
+/// Probe Tally once before a diagnostic starts, and give up immediately if it
+/// does not answer. Without this the first real request enters the normal
+/// auto-reconnect loop and a diagnostic run against the wrong network sits there
+/// for reconnectMaxMinutes (default 30) saying nothing. That loop is right for
+/// the service, which must survive Tally restarting; it is wrong for a command a
+/// person is watching. Returns null when Tally answered.
+/// </summary>
+static async Task<int?> FailFastIfTallyUnreachable(TallyClient client, AgentConfig cfg, bool json)
+{
+    var probe = await client.ProbeAsync();
+    if (probe.Ok) return null;
+    Emit(json,
+        new { ok = false, error = probe.Error, host = cfg.Tally.Host, port = cfg.Tally.Port },
+        $"FAILED — Tally did not answer on {cfg.Tally.Host}:{cfg.Tally.Port}: {probe.Error}\n" +
+        "Run this from a machine that can reach the Tally server, with Tally open " +
+        "and the company loaded.");
+    return 1;
+}
+
+/// <summary>Accepts 26351475.28 and Indian-grouped 2,63,51,475.28 alike.</summary>
+static double ParseAmount(string s) =>
+    double.Parse(s.Replace(",", "").Trim(), System.Globalization.CultureInfo.InvariantCulture);
+
+static Dictionary<string, int> ElementHistogram(System.Xml.Linq.XDocument doc) =>
+    doc.Descendants()
+       .GroupBy(e => e.Name.LocalName)
+       .OrderByDescending(g => g.Count())
+       .Take(25)
+       .ToDictionary(g => g.Key, g => g.Count());
+
+/// <summary>diagnose-opening-bills — answer, from live Tally, WHY opening_bills
+/// returns zero rows. Sends the Ledger collection twice: once with the field
+/// list v2.1.0 used ("BILLALLOCATIONS.LIST", a serialisation name rather than a
+/// fetchable member) and once with the dotted sub-field list, and reports how
+/// many bill elements each actually returns alongside how many ledgers have
+/// bill-wise tracking switched on.
+///
+/// usage: diagnose-opening-bills [--dump] [--json]</summary>
+static async Task<int> DiagnoseOpeningBills(List<string> a, bool json)
+{
+    var cfg = new ConfigStore().Load();
+    var dump = a.Remove("--dump");
+    using var client = new TallyClient(cfg.Tally, NullLogger<TallyClient>.Instance);
+    if (await FailFastIfTallyUnreachable(client, cfg, json) is { } unreachable) return unreachable;
+
+    string[] baseFields = ["GUID", "NAME", "PARENT", "ISBILLWISEON"];
+    var variants = new (string Name, string[] Fields)[]
+    {
+        ("v2.1.0 (BILLALLOCATIONS.LIST only)", [.. baseFields, "BILLALLOCATIONS.LIST"]),
+        ("v2.2.0 (dotted sub-fields)", [.. baseFields,
+            "BILLALLOCATIONS.NAME", "BILLALLOCATIONS.BILLDATE", "BILLALLOCATIONS.BILLCREDITPERIOD",
+            "BILLALLOCATIONS.OPENINGBALANCE", "BILLALLOCATIONS.CLOSINGBALANCE",
+            "BILLALLOCATIONS.BILLTYPE", "BILLALLOCATIONS.ISADVANCE"]),
+        ("both (what v2.2.0 actually sends)", [.. baseFields,
+            "BILLALLOCATIONS.NAME", "BILLALLOCATIONS.BILLDATE", "BILLALLOCATIONS.BILLCREDITPERIOD",
+            "BILLALLOCATIONS.OPENINGBALANCE", "BILLALLOCATIONS.CLOSINGBALANCE",
+            "BILLALLOCATIONS.BILLTYPE", "BILLALLOCATIONS.ISADVANCE", "BILLALLOCATIONS.LIST"]),
+    };
+
+    var findings = new List<object>();
+    foreach (var (name, fields) in variants)
+    {
+        var doc = await client.PostAsync(
+            TallyEnvelopes.Collection("Ledger", fields, cfg.Tally.Company),
+            client.SnapshotRequestTimeout, maxTimeoutRetries: 0, CancellationToken.None);
+
+        var ledgers = doc.Descendants("LEDGER").ToList();
+        var billElements = ledgers.Sum(l => MasterExtractor.BillAllocationElements(l).Count());
+        var named = ledgers.Sum(l => MasterExtractor.BillAllocationElements(l)
+            .Count(b => TallyXml.Text(b, "NAME").Length > 0));
+
+        if (dump)
+        {
+            var dir = Path.Combine(AgentInfo.DataDir, "fixtures");
+            Directory.CreateDirectory(dir);
+            var file = Path.Combine(dir,
+                $"opening-bills-{variants.ToList().FindIndex(v => v.Name == name)}-{DateTime.Now:yyyyMMdd-HHmmss}.xml");
+            File.WriteAllText(file, doc.ToString());
+            Console.WriteLine($"  raw response saved: {file}");
+        }
+
+        findings.Add(new
+        {
+            variant = name,
+            ledgers = ledgers.Count,
+            ledgers_with_billwise_on = ledgers.Count(l => TallyXml.Bool(l, "ISBILLWISEON")),
+            bill_elements = billElements,
+            // What OpeningBills would actually emit: a bill needs a reference.
+            rows_opening_bills_would_emit = named,
+        });
+    }
+
+    var payload = new { ok = true, company = cfg.Tally.Company, variants = findings };
+    if (json) Console.WriteLine(JsonSerializer.Serialize(payload,
+        new JsonSerializerOptions { WriteIndented = true }));
+    else
+    {
+        Console.WriteLine($"opening_bills diagnosis for '{cfg.Tally.Company}'\n");
+        Console.WriteLine(JsonSerializer.Serialize(findings,
+            new JsonSerializerOptions { WriteIndented = true }));
+        Console.WriteLine(
+            "\nHow to read this:\n" +
+            "  • ledgers_with_billwise_on = 0  ⇒ bill-wise tracking is off in Tally; not a code bug.\n" +
+            "  • v2.1.0 returns 0 bill_elements and v2.2.0 returns some ⇒ the old FETCH was the bug.\n" +
+            "  • BOTH return 0 while bill-wise is on ⇒ the Ledger collection does not carry opening\n" +
+            "    bills on this build; opening bills must come from a different request. Send this\n" +
+            "    output (and --dump XML) rather than guessing.");
+    }
     return 0;
 }
 
@@ -281,6 +876,23 @@ static int Usage()
           force-full-sync          (reset checkpoints; re-extract full history)
           capture-xml --kind vouchers|masters|alterids [--from d] [--to d]
                       [--collection Ledger]   (save raw Tally XML fixtures)
+          capture-xml --envelope-file <path> | --envelope-dir <dir>
+                      [--from d] [--to d] [--dump]
+                      (post raw envelopes verbatim; print refusal, element
+                       histogram and response head. Placeholders: {{COMPANY}},
+                       {{FROM}}, {{TO}}. See diagnostics/envelopes/)
+          verify --bills <Bills.xml> --trial-balance <TrialBal.xml>
+                      [--live] [--from d] [--to d] [--json]
+                      (THE GATE: run Tally's own export through the agent's
+                       parsers; with --live also diff the agent's response
+                       against it record for record. Exit 1 on any mismatch.)
+          verify-bills [--from d] [--to d] [--dump] [--json]
+                      [--expect-rows-payable N]    [--expect-total-payable X]
+                      [--expect-rows-receivable N] [--expect-total-receivable X]
+                      (prove bills_payable/bills_receivable against live Tally;
+                       exit 1 on a mismatch)
+          diagnose-opening-bills [--dump] [--json]
+                      (why opening_bills returns zero rows)
           retry-failed [--json]
           export-diag  [--json]
           status       [--json]

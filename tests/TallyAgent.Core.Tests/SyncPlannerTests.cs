@@ -19,6 +19,38 @@ public class SyncPlannerTests
         new("_vouchers_window", "Co", lastFrom, lastTo,
             SyncPlanner.NewestFirstCheckpointMarker, null, false);
 
+    // ── extractionStartDate: inert once the checkpoint latches (v2.2.0) ──
+
+    /// <summary>The setting is only read inside the !FullSyncDone branch, so
+    /// after a completed history walk it does nothing at all. That is fine as
+    /// behaviour and unacceptable as SILENT behaviour — the Manager and the
+    /// service both say so, and this is the predicate they share.</summary>
+    [Fact]
+    public void ExtractionStartDate_IsInert_OnlyAfterTheFullSyncCompletes()
+    {
+        Assert.False(SyncPlanner.ExtractionStartDateIsInert(null));
+        Assert.False(SyncPlanner.ExtractionStartDateIsInert(Cp("2026-07-29", fullDone: false)));
+        Assert.True(SyncPlanner.ExtractionStartDateIsInert(Cp("2026-07-29", fullDone: true)));
+    }
+
+    [Fact]
+    public void OnceLatched_ChangingTheStartDateChangesNothing()
+    {
+        var latched = Cp("2026-07-29", fullDone: true);
+        var asConfigured = SyncPlanner.PlanVoucherWindows(Settings(start: "2026-04-01"), latched, Today);
+        var movedBackSixYears = SyncPlanner.PlanVoucherWindows(Settings(start: "2020-04-01"), latched, Today);
+
+        // Identical plans: the only thing that re-reads the start date is a
+        // checkpoint reset (Force Full Sync).
+        Assert.Equal(asConfigured.Windows, movedBackSixYears.Windows);
+        Assert.False(movedBackSixYears.IsFullSync);
+
+        // ...and after a reset it takes effect.
+        var afterReset = SyncPlanner.PlanVoucherWindows(Settings(start: "2020-04-01"), null, Today);
+        Assert.True(afterReset.IsFullSync);
+        Assert.Equal(new DateOnly(2020, 4, 1), afterReset.TargetStart);
+    }
+
     // ── full sync: newest-first ───────────────────────────────────
 
     [Fact]
