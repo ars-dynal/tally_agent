@@ -58,7 +58,19 @@ public static class TallyEnvelopes
     /// ignore SVFROMDATE and serve from the financial-year start), which is the
     /// whole reason windowing stopped working.
     /// </summary>
-    public static string Report(string reportName, DateOnly? from = null, DateOnly? to = null, string? company = null)
+    /// <param name="currentDate">
+    /// SVCURRENTDATE. For the DAY BOOK this is the ONLY control that works:
+    /// measured 2026-09-04, SVCURRENTDATE=7-Apr-2026 with SVFROMDATE=5-Apr and
+    /// SVTODATE=7-Apr returned 85 vouchers, every one dated 7-Apr. FROM and TO
+    /// are ignored by that report entirely.
+    ///
+    /// Period reports are different — Trial Balance honours FROM/TO (probe 18
+    /// returned the 11 primary groups for 1-Apr..1-Sep) — so this is opt-in and
+    /// only the Day Book passes it. Sending it where it is not wanted would
+    /// collapse a period report to a single day.
+    /// </param>
+    public static string Report(string reportName, DateOnly? from = null, DateOnly? to = null,
+        string? company = null, DateOnly? currentDate = null)
     {
         var sb = new StringBuilder(512);
         sb.Append("<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>")
@@ -67,6 +79,8 @@ public static class TallyEnvelopes
           .Append("<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>");
         if (!string.IsNullOrEmpty(company))
             sb.Append("<SVCURRENTCOMPANY>").Append(TallyXml.XmlEscape(company)).Append("</SVCURRENTCOMPANY>");
+        if (currentDate is { } cd)
+            sb.Append("<SVCURRENTDATE>").Append(cd.ToString("yyyyMMdd")).Append("</SVCURRENTDATE>");
         if (from is { } f)
             sb.Append("<SVFROMDATE>").Append(f.ToString("yyyyMMdd")).Append("</SVFROMDATE>");
         if (to is { } t)

@@ -681,11 +681,12 @@ public sealed class SyncEngine(
         throw new TallyException(ErrorCategory.TallyWindowNotHonoured,
             $"Window {from:dd-MMM-yyyy}..{to:dd-MMM-yyyy} was not honoured: Tally returned " +
             $"{result.OutOfWindowCount} voucher(s) dated {result.ServedMinDate}..{result.ServedMaxDate}, " +
-            "outside the requested range. Under the Day Book report this cannot happen unless the " +
-            "date scoping has regressed — check that TallyEnvelopes.Report() still sends " +
-            "TALLYREQUEST=Export with TYPE=Data and ID=<report>, and that the request has not " +
-            "reverted to a Voucher collection (collections ignore SVFROMDATE and serve from the " +
-            "financial-year start). NOT checkpointed.");
+            "outside the requested range. Each request asks for exactly ONE day via SVCURRENTDATE, " +
+            "so any other date means the mechanism has regressed — check that the Day Book request " +
+            "still sends SVCURRENTDATE (the Day Book ignores SVFROMDATE/SVTODATE entirely), that " +
+            "TallyEnvelopes.Report() still sends TALLYREQUEST=Export with TYPE=Data and ID=<report>, " +
+            "and that no diagnostic probe has injected TDL into the live Tally session without a " +
+            "restart afterwards. NOT checkpointed.");
     }
 
     private static List<string> ValidateExtractionCounts(IReadOnlyDictionary<string, int> counts)

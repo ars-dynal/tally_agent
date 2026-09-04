@@ -48,39 +48,44 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
         public string? ServedMaxDate { get; set; }
     }
 
-    /// <summary>Fetch vouchers for a window and fan out to all voucher datasets.
-    /// The explicit collection-level date filter avoids dependence on the period
-    /// selected in the interactive Tally UI.</summary>
+    /// <summary>
+    /// Fetch vouchers for a window and fan out to all voucher datasets.
+    ///
+    /// ONE REQUEST PER DAY, driven by SVCURRENTDATE.
+    ///
+    /// Measured 2026-09-04: the Day Book report ignores SVFROMDATE and SVTODATE
+    /// completely and reports whatever day SVCURRENTDATE names. Asked for
+    /// 5-Apr..7-Apr with SVCURRENTDATE=7-Apr it returned 85 vouchers, all dated
+    /// 7-Apr. A range request is therefore not a smaller request — it is the
+    /// wrong request, and the earlier stall was the agent believing otherwise.
+    ///
+    /// So the window is walked a day at a time. Each request is tiny and bounded
+    /// (12.6 MB for the heaviest day observed, ~148 KB per voucher, against a
+    /// 256 MB cap), empty days come back empty and cost nothing, and nothing is
+    /// discarded client-side. About 2,900 requests cover 2019-2027.
+    ///
+    /// The window still exists as the CHECKPOINT unit: a 7-day window is 7
+    /// requests and one enqueue, so a resumed walk restarts at most a week of
+    /// cheap requests rather than re-running a month.
+    /// </summary>
     public async Task<DayBookResult> ExtractWindow(DateOnly from, DateOnly to,
         ISet<string> bankLedgerNames, CancellationToken ct)
     {
-        // Multi-day windows do NOT retry a timeout at the same size — the
-        // SyncEngine splits the window instead (retrying an identical heavy
-        // request is deterministic waste). Single-day windows can't be split,
-        // so they keep the full retry ladder.
-        var days = to.DayNumber - from.DayNumber + 1;
-        var doc = await client.PostAsync(
-            // THE DAY BOOK REPORT, not a Voucher collection.
-            //
-            // Reports honour SVFROMDATE/SVTODATE; Voucher collections ignore
-            // SVFROMDATE and serve from the financial-year start, so every
-            // window asked Tally to serialise a whole year and the agent threw
-            // ~99% of it away. Eighty-five windows, eighty-five years' worth of
-            // serialisation, on a single-threaded Tally.
-            //
-            // This is a straight revert of aeb6dca, which changed ONLY the
-            // envelope — this parser was written against the Day Book report
-            // and never stopped being a Day Book parser. The report path looked
-            // broken at the time because TallyEnvelopes.Report() was sending a
-            // shape Tally refuses outright; that is fixed in the same release.
-            TallyEnvelopes.Report("Day Book", from, to, client.Company),
-            requestTimeout: client.VoucherRequestTimeout,
-            maxTimeoutRetries: days > 1 ? 0 : null, ct);
         var result = new DayBookResult();
         var seenVoucherKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var outOfWindow = 0;
         var invalidDates = 0;
         var duplicateVouchers = 0;
+
+        for (var day = from; day <= to; day = day.AddDays(1))
+        {
+        ct.ThrowIfCancellationRequested();
+        // Single-day requests cannot be split, so they keep the full retry
+        // ladder; there is no larger size left to fall back to.
+        var doc = await client.PostAsync(
+            TallyEnvelopes.Report("Day Book", day, day, client.Company, currentDate: day),
+            requestTimeout: client.VoucherRequestTimeout,
+            maxTimeoutRetries: null, ct);
 
         foreach (var v in doc.Descendants("VOUCHER"))
         {
@@ -103,12 +108,16 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                 string.CompareOrdinal(voucherDateText, result.ServedMaxDate) > 0)
                 result.ServedMaxDate = voucherDateText;
 
-            if (voucherDate < from || voucherDate > to)
+            // EQUALITY, not a range. One request asks for one day, so every
+            // voucher in the response must carry that date. This is a stronger
+            // check than the range test it replaces: each of the ~2,900 requests
+            // is individually verifiable instead of a month being spot-checked.
+            if (voucherDate != day)
             {
                 outOfWindow++;
                 log.LogWarning(
-                    "Skipping out-of-window voucher {VoucherNumber} dated {VoucherDate}; requested {From}..{To}",
-                    Text(v, "VOUCHERNUMBER"), voucherDate, from, to);
+                    "Skipping voucher {VoucherNumber} dated {VoucherDate}; requested exactly {Day}",
+                    Text(v, "VOUCHERNUMBER"), voucherDate, day);
                 continue;
             }
 
@@ -394,17 +403,19 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
             else if (IsPurchaseType(vchType))
                 result.PurchaseRegister.Add(RegisterRow(header, vchType, cgst, sgst, igst));
         }
+        }   // day
 
         if (outOfWindow > 0 || invalidDates > 0 || duplicateVouchers > 0)
         {
             log.LogWarning(
-                "Voucher window {From}..{To} rejected {OutOfWindow} out-of-window, {InvalidDates} invalid-date and {Duplicates} duplicate vouchers",
+                "Voucher window {From}..{To} rejected {OutOfWindow} wrong-date, {InvalidDates} invalid-date and {Duplicates} duplicate vouchers",
                 from, to, outOfWindow, invalidDates, duplicateVouchers);
         }
 
         log.LogInformation(
-            "Voucher window {From}..{To}: {V} vouchers, {L} lines, {B} bills, {BA} bank, {CC} cost-centre, {I} inventory",
-            from, to, result.VoucherHeaders.Count, result.VoucherLines.Count,
+            "Voucher window {From}..{To} ({Days} daily requests): {V} vouchers, {L} lines, {B} bills, {BA} bank, {CC} cost-centre, {I} inventory",
+            from, to, to.DayNumber - from.DayNumber + 1,
+            result.VoucherHeaders.Count, result.VoucherLines.Count,
             result.BillAllocations.Count, result.BankAllocations.Count,
             result.CostCentreAllocations.Count, result.InventoryEntries.Count);
         result.OutOfWindowCount = outOfWindow;

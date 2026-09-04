@@ -117,24 +117,21 @@ public sealed class TallySettings
     [JsonPropertyName("enableGst")] public bool EnableGst { get; set; } = true;
     [JsonPropertyName("enableCostCentres")] public bool EnableCostCentres { get; set; } = true;
     [JsonPropertyName("incrementalLookbackDays")] public int IncrementalLookbackDays { get; set; } = 7;
-    /// <summary>Initial voucher window size for a history walk. The engine
-    /// shrinks windows adaptively (never grows them within a run) when a window
-    /// times out or takes more than 60% of voucherTimeoutSeconds.
+    /// <summary>Voucher window size for a history walk — a CHECKPOINT unit, not
+    /// a request. Since v2.4.0 the Day Book is fetched one day at a time
+    /// (SVCURRENTDATE is its only date control), so a 7-day window is 7 small
+    /// requests and one enqueue.
     ///
-    /// SIZE THIS FROM MEASURED BYTES. Measured 2026-09-04 against the live
-    /// server: one day of the Day Book report is 424,860 bytes for 3 vouchers
-    /// (~142 KB per voucher - Tally serialises full detail including GST duty
-    /// heads, address lists and invoice lines), against an observed ~28
-    /// vouchers a day. So:
+    /// Measured 2026-09-04: the heaviest day observed was 12.6 MB for 85
+    /// vouchers (~148 KB each), against maxResponseMb 256 — roughly 20x
+    /// headroom on a single day, and the per-request size no longer grows with
+    /// the window at all. The window now only decides how much cheap work a
+    /// resumed walk repeats.
     ///
-    ///     7 days   ~28 MB    ~9x headroom under maxResponseMb 256   (default)
-    ///    30 days  ~119 MB    ~2x headroom - too little for a busy month-end
-    ///
-    /// The stalled 2026-09-04 full sync used ~34-day windows. That was survivable
-    /// on size and fatal for a different reason (the request was a Voucher
-    /// collection, which ignores SVFROMDATE), but 7 days is the value the
-    /// arithmetic supports and it is the default for that reason, not by
-    /// habit.</summary>
+    /// Full 2019-2027 walk: ~2,922 daily requests. With the default 2s
+    /// requestPauseSeconds and 5s windowPauseSeconds that is ~2.2 hours of
+    /// deliberate pausing plus request time — comfortably an overnight job.
+    /// Set both pauses to 0 for a backfill run when nobody is using Tally.</summary>
     [JsonPropertyName("fullSyncChunkDays")] public int FullSyncChunkDays { get; set; } = 7;
 
     /// <summary>Is this snapshot report enabled? A per-dataset entry wins over

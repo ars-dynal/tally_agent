@@ -78,6 +78,19 @@ After building, check the installer's timestamp and size actually changed.
   route, why the bills envelope hunt never converged, and why the Day Book
   voucher path was abandoned in `aeb6dca`. One wrong element name, three
   separate investigations, several weeks.
+- **The Day Book report ignores `SVFROMDATE`/`SVTODATE` and obeys
+  `SVCURRENTDATE` — one day per request.** Measured 2026-09-04:
+  `SVCURRENTDATE=7-Apr-2026` with `SVFROMDATE=5-Apr`/`SVTODATE=7-Apr` returned
+  85 vouchers, all dated 7-Apr, 12.6 MB (~148 KB per voucher). Walk the history
+  a day at a time; ~2,922 requests cover 2019-2027 and each is bounded. Do NOT
+  send `SVCURRENTDATE` to a period report like Trial Balance, which honours
+  FROM/TO — it would collapse to a single day.
+- **A diagnostic probe that injects TDL is NOT read-only.** Probes carrying
+  `<SYSTEM TYPE="Formulae">` with a literal date set session state that outlived
+  the request: a later Day Book request for 04-May..03-Jun returned 4 vouchers
+  dated 01-Sep, exactly the probe's own result set. Run TDL-injecting probes
+  LAST and restart Tally before any real extraction. An entire gate run was
+  spent measuring this rather than the agent.
 - **Voucher COLLECTIONS ignore `SVFROMDATE`.** They serve from the
   financial-year start regardless, so a windowed walk asks Tally to serialise a
   whole year per window and throws ~99% away. Measured: a one-day collection

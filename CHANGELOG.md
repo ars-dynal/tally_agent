@@ -21,6 +21,46 @@ looking.
 
 Day Book shows 3 vouchers on that day.
 
+### The Day Book is driven by SVCURRENTDATE, one day per request
+
+`Report()` sending the accepted shape was necessary but not sufficient. The
+Day Book **ignores SVFROMDATE and SVTODATE entirely** and reports whatever day
+`SVCURRENTDATE` names.
+
+Measured 2026-09-04: `SVCURRENTDATE=7-Apr-2026` with `SVFROMDATE=5-Apr` and
+`SVTODATE=7-Apr` returned 85 vouchers, every one dated 7-Apr — 12.6 MB, ~148 KB
+per voucher. A range request was never a bigger request; it was the wrong
+request.
+
+* The window is now walked a **day at a time**. Each request is tiny and bounded
+  (12.6 MB on the heaviest day observed, against a 256 MB cap — ~20x headroom
+  that no longer grows with the window). Empty days return empty and cost
+  nothing. Nothing is discarded client-side.
+* ~2,922 requests cover 2019-2027. With the default 2s/5s pauses that is ~2.2
+  hours of deliberate pausing plus request time; set both to 0 for a backfill
+  when nobody is using Tally.
+* The window survives as the **checkpoint unit**: 7 days is 7 requests and one
+  enqueue, so a resumed walk repeats at most a week of cheap requests.
+* `SVCURRENTDATE` is opt-in per report. Trial Balance honours FROM/TO (probe 18
+  returned the 11 primary groups for 1-Apr..1-Sep), and pinning a current date
+  there would collapse a period report to a single day.
+
+### The guard got stronger
+
+One request asks for exactly one day, so the check is now **equality, not
+range**: every voucher in a response must carry the date asked for. Each of the
+~2,900 requests is individually verifiable, where before a month was
+spot-checked. The rc1 failure — asked 04-May..03-Jun, served 4 vouchers dated
+01-Sep — is pinned as a test.
+
+### A diagnostic probe is not read-only
+
+The rc1 gate run was measuring contamination, not a defect. Probes carrying
+`<SYSTEM TYPE="Formulae">` and a literal date set session state that outlived
+the request, and the next real extraction inherited it. A probe that injects TDL
+definitions into the production Tally must be run last and followed by a restart
+before any real extraction. Recorded in CLAUDE.md.
+
 ### The report envelope
 
 The agent has sent the refused shape since its first commit. Every report
