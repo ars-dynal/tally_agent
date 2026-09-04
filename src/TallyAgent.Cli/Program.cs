@@ -31,6 +31,7 @@ try
         "force-full-sync" => WriteTrigger("force-full"),
         "capture-xml" => await CaptureXml(argv.Skip(1).ToList()),
         "verify" => await Verify(argv.Skip(1).ToList(), json),
+        "master-balances" => await MasterBalances(argv.Skip(1).ToList(), json),
         "verify-bills" => await VerifyBills(argv.Skip(1).ToList(), json),
         "diagnose-opening-bills" => await DiagnoseOpeningBills(argv.Skip(1).ToList(), json),
         "retry-failed" => RetryFailed(json),
@@ -310,6 +311,89 @@ static string Truncate(string s, int max) => s.Length <= max ? s : s[..max] + "�
 // The reference is TALLY'S OWN EXPORT, not a number someone remembers. Every
 // comparison below is record-for-record against a file Tally produced from its
 // own UI, so "it reconciles" is never accepted as evidence on its own.
+
+/// <summary>
+/// master-balances — refresh the balance-bearing master collections ONLY and
+/// report the two figures the balance sheet turns on.
+///
+/// No voucher walk, no upload, no queue: two Tally requests (Ledger and
+/// StockItem), both with SVTODATE pinned. Without that pin Tally evaluates
+/// $ClosingBalance against whatever period is loaded, so the as-of date of
+/// every master balance was set by whoever last pressed Alt+F2.
+///
+/// usage: master-balances [--as-of yyyy-MM-dd] [--ledger "Salary and Wages"] [--json]
+/// </summary>
+static async Task<int> MasterBalances(List<string> a, bool json)
+{
+    var cfg = new ConfigStore().Load();
+    var asOf = DateOnly.FromDateTime(DateTime.Today);
+    var ledgerName = "Salary and Wages";
+    for (var i = 0; i < a.Count - 1; i++)
+    {
+        switch (a[i])
+        {
+            case "--as-of": asOf = DateOnly.Parse(a[++i]); break;
+            case "--ledger": ledgerName = a[++i]; break;
+        }
+    }
+
+    using var client = new TallyClient(cfg.Tally, NullLogger<TallyClient>.Instance);
+    if (await FailFastIfTallyUnreachable(client, cfg, json) is { } unreachable) return unreachable;
+
+    var books = await client.GetBooksPeriodAsync();
+    var db = new AgentDatabase(NullLogger<AgentDatabase>.Instance);
+    var masters = new MasterExtractor(client, new MasterBalanceRepository(db),
+        NullLogger<MasterExtractor>.Instance);
+    masters.BeginCycle(cfg.Tally.Company, fetchBalances: true, asOf: asOf);
+
+    var stock = await masters.StockItems(CancellationToken.None);
+    var ledgers = await masters.Ledgers(CancellationToken.None);
+
+    static double D(object? v) => v is null ? 0d : Convert.ToDouble(v);
+
+    var stockValue = stock.Sum(r => D(r["closing_value"]));
+    var target = ledgers.FirstOrDefault(r =>
+        string.Equals((string?)r["ledger_name"], ledgerName, StringComparison.OrdinalIgnoreCase));
+
+    var payload = new
+    {
+        ok = true,
+        as_of = asOf.ToString("yyyy-MM-dd"),
+        books_range = books is null ? "unknown"
+            : $"{books.Value.From:yyyy-MM-dd}..{books.Value.To:yyyy-MM-dd}",
+        stock_items = stock.Count,
+        total_closing_stock_value = Math.Round(stockValue, 2),
+        ledgers = ledgers.Count,
+        ledger = ledgerName,
+        ledger_closing_balance = target is null ? (double?)null : Math.Round(D(target["closing_balance"]), 2),
+        balance_as_of = target?["balance_as_of"],
+    };
+
+    if (json) Console.WriteLine(JsonSerializer.Serialize(payload,
+        new JsonSerializerOptions { WriteIndented = true }));
+    else
+    {
+        Console.WriteLine($"as of        : {payload.as_of}   (SVTODATE pinned on both collections)");
+        Console.WriteLine($"books range  : {payload.books_range}");
+        Console.WriteLine();
+        Console.WriteLine($"stock items                : {stock.Count:N0}");
+        Console.WriteLine($"TOTAL CLOSING STOCK VALUE  : {stockValue,20:N2}");
+        Console.WriteLine();
+        Console.WriteLine($"ledgers                    : {ledgers.Count:N0}");
+        Console.WriteLine(target is null
+            ? $"'{ledgerName}' NOT FOUND"
+            : $"{ledgerName,-26} : {D(target["closing_balance"]),20:N2}");
+        Console.WriteLine();
+        Console.WriteLine("Tally's own figures for comparison:");
+        Console.WriteLine("  total closing stock value  :       18,70,08,352.35  (187,008,352.35)");
+        Console.WriteLine("  Salary and Wages           :         1,23,36,779.00  (12,336,779.00)");
+        Console.WriteLine();
+        Console.WriteLine("If these still land on a PERIOD END rather than the as-of date, the");
+        Console.WriteLine("active period (Alt+F2) is bounding them and that is a Tally setting,");
+        Console.WriteLine("not a code change.");
+    }
+    return 0;
+}
 
 /// <summary>
 /// verify — prove the agent's extraction against Tally's own export files.
@@ -911,6 +995,10 @@ static int Usage()
                       (post raw envelopes verbatim; print refusal, element
                        histogram and response head. Placeholders: {{COMPANY}},
                        {{FROM}}, {{TO}}. See diagnostics/envelopes/)
+          master-balances [--as-of yyyy-MM-dd] [--ledger NAME] [--json]
+                      (refresh ledger + stock_items ONLY, with SVTODATE pinned,
+                       and print total closing stock value and one ledger's
+                       closing balance. No voucher walk, no upload.)
           verify [--bills <Bills.xml>] [--trial-balance <TrialBal.xml>]
                       [--fy-counts] [--live] [--from d] [--to d] [--json]
                       (--fy-counts asks Tally how many vouchers it holds per

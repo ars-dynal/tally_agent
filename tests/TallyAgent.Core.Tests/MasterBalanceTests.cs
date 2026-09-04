@@ -92,6 +92,30 @@ public sealed class MasterBalanceTests : IDisposable
     }
 
     [Fact]
+    public async Task BalanceBearingCollections_PinSvToDate()
+    {
+        // Without SVTODATE, Tally evaluates $ClosingBalance against whatever
+        // period is loaded, so the as-of date of every master balance was set
+        // by whoever last pressed Alt+F2. Observed 2026-09: Salary and Wages
+        // tying exactly at 31-Jul, a period end rather than a drift.
+        var db = new AgentDatabase(NullLogger<AgentDatabase>.Instance, Path.Combine(_dir, "asof.db"));
+        var handler = new Handler(_ => LedgerXml);
+        var client = new TallyClient(new TallySettings { Company = "Co", RequestPauseSeconds = 0 },
+            NullLogger<TallyClient>.Instance, new HttpClient(handler), _dir)
+        { DelayAsync = (_, _) => Task.CompletedTask };
+        var ex = new MasterExtractor(client, new MasterBalanceRepository(db),
+            NullLogger<MasterExtractor>.Instance);
+        ex.BeginCycle("Co", fetchBalances: true, asOf: new DateOnly(2026, 9, 5));
+
+        var rows = await ex.Ledgers(CancellationToken.None);
+
+        Assert.Contains("<SVTODATE>20260905</SVTODATE>", handler.Requests[0]);
+        Assert.NotEmpty(rows);
+        // balance_as_of is deliberately unchanged - still the capture instant.
+        Assert.All(rows, r => Assert.EndsWith("Z", (string)r["balance_as_of"]!));
+    }
+
+    [Fact]
     public async Task LedgerCollection_IsFetchedOncePerCycle_ForAllDerivedDatasets()
     {
         var (ex, h) = Build(fetchBalances: false);

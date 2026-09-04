@@ -190,7 +190,8 @@ public sealed class SyncEngine(
             // rate) are asked from Tally on the same daily slot as the snapshots
             // and cached per GUID; other cycles fill them from the cache.
             var balancesDue = ShouldRunSnapshot(MasterBalancesCheckpoint, company, mode, out var balWhy);
-            masters.BeginCycle(company, fetchBalances: balancesDue);
+            masters.BeginCycle(company, fetchBalances: balancesDue,
+                asOf: DateOnly.FromDateTime(DateTime.Today));
             var runMasters = !mastersUnchanged;
             if (!runMasters)
                 log.LogInformation("AlterID gate: no master changes — skipping master collections" +
