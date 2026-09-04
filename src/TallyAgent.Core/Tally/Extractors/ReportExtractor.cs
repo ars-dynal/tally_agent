@@ -1,5 +1,6 @@
 using System.Xml.Linq;
 using Microsoft.Extensions.Logging;
+using TallyAgent.Core.Notifications;
 using static TallyAgent.Core.Tally.TallyXml;
 
 namespace TallyAgent.Core.Tally.Extractors;
@@ -18,6 +19,44 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
     private Task<XDocument> PostReport(string envelope, CancellationToken ct) =>
         client.PostAsync(envelope, client.SnapshotRequestTimeout, maxTimeoutRetries: 0, ct);
 
+    /// <summary>Refusals seen this cycle, for the engine to report as warnings.
+    /// A refused report that has a working fallback must be LOUD but not fatal:
+    /// the dataset still produces rows, and the reason it took the long way
+    /// round has to reach a human.</summary>
+    private readonly List<string> _refusals = [];
+    public IReadOnlyList<string> RefusalsThisCycle => _refusals;
+
+    /// <summary>
+    /// POST a report, returning null when Tally REFUSED it.
+    ///
+    /// v2.2.0 made a refusal throw centrally, which was right — a refusal must
+    /// never be mistaken for an empty report. But it threw straight past the
+    /// fallback, so trial_balance went from 1,038 reconciling rows to ZERO
+    /// batches the moment Tally started refusing the report. Detection and
+    /// fallback are different decisions: the refusal is still detected, named
+    /// and surfaced, and then the extractor takes the route it already had.
+    ///
+    /// Reports with NO fallback keep using <see cref="PostReport"/> and still
+    /// fail hard, which is correct — there is nothing else to try.
+    /// </summary>
+    private async Task<XDocument?> PostReportAllowingRefusal(string envelope, string reportName,
+        CancellationToken ct)
+    {
+        try
+        {
+            return await PostReport(envelope, ct);
+        }
+        catch (TallyException ex) when (ex.Category == ErrorCategory.TallyRequestRejected)
+        {
+            var message = $"Tally refused the '{reportName}' report ({ex.Message}) — " +
+                          "falling back to the collection route. The rows are derived, not " +
+                          "reported: check the source column.";
+            log.LogWarning("{Message}", message);
+            _refusals.Add(message);
+            return null;
+        }
+    }
+
     // Ledger closing balances as-of a date: shared by the two outstanding
     // datasets and the trial-balance fallback (one Tally request per cycle
     // instead of three).
@@ -28,7 +67,7 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
     /// as the Ledger/StockItem caches: never ask Tally the same thing twice).</summary>
     private (DateOnly From, DateOnly To, XDocument Doc)? _billsCollection;
 
-    public void BeginCycle() => EndCycle();
+    public void BeginCycle() { EndCycle(); _refusals.Clear(); }
     public void EndCycle() { _ledgerBalances = null; _billsCollection = null; }
 
     private async Task<XDocument> LedgerBalancesDocument(DateOnly to, CancellationToken ct)
@@ -61,9 +100,9 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
 
     public async Task<List<Row>> TrialBalance(DateOnly from, DateOnly to, CancellationToken ct)
     {
-        var doc = await PostReport(
-            TallyEnvelopes.Report("Trial Balance", from, to, client.Company), ct);
-        var rows = ParseTrialBalanceReport(doc);
+        var doc = await PostReportAllowingRefusal(
+            TallyEnvelopes.Report("Trial Balance", from, to, client.Company), "Trial Balance", ct);
+        var rows = doc is null ? [] : ParseTrialBalanceReport(doc);
         if (rows.Count == 0)
             rows = await TrialBalanceFromLedgers(from, to, ct);
         log.LogInformation("Trial balance: {N} rows from {Source}", rows.Count, SourceOf(rows));
@@ -153,9 +192,9 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
 
     public async Task<List<Row>> BalanceSheet(DateOnly from, DateOnly to, CancellationToken ct)
     {
-        var doc = await PostReport(
-            TallyEnvelopes.Report("Balance Sheet", from, to, client.Company), ct);
-        var rows = WalkNameAmountPairs(doc, (name, amtEl) =>
+        var doc = await PostReportAllowingRefusal(
+            TallyEnvelopes.Report("Balance Sheet", from, to, client.Company), "Balance Sheet", ct);
+        var rows = doc is null ? [] : WalkNameAmountPairs(doc, (name, amtEl) =>
         {
             var amount = NumByLocalName(amtEl, "BSMAINAMT");
             if (amount == 0) amount = NumByLocalName(amtEl, "BSSUBAMT");
@@ -176,9 +215,10 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
 
     public async Task<List<Row>> ProfitLoss(DateOnly from, DateOnly to, CancellationToken ct)
     {
-        var doc = await PostReport(
-            TallyEnvelopes.Report("Profit and Loss A/c", from, to, client.Company), ct);
-        var rows = WalkNameAmountPairs(doc, (name, amtEl) =>
+        var doc = await PostReportAllowingRefusal(
+            TallyEnvelopes.Report("Profit and Loss A/c", from, to, client.Company),
+            "Profit and Loss A/c", ct);
+        var rows = doc is null ? [] : WalkNameAmountPairs(doc, (name, amtEl) =>
         {
             var amount = NumByLocalName(amtEl, "PLAMT");
             if (amount == 0) amount = NumByLocalName(amtEl, "BSMAINAMT");
@@ -230,12 +270,12 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
 
     public async Task<List<Row>> StockSummary(DateOnly from, DateOnly to, CancellationToken ct)
     {
-        var doc = await PostReport(
-            TallyEnvelopes.Report("Stock Summary", from, to, client.Company), ct);
+        var doc = await PostReportAllowingRefusal(
+            TallyEnvelopes.Report("Stock Summary", from, to, client.Company), "Stock Summary", ct);
         var rows = new List<Row>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var nameEl in doc.Descendants().Where(e => Is(e, "DSPACCNAME")))
+        foreach (var nameEl in (doc?.Descendants() ?? []).Where(e => Is(e, "DSPACCNAME")))
         {
             var name = DspName(nameEl);
             if (name.Length == 0 || !seen.Add(name)) continue;
@@ -378,8 +418,9 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
     public async Task<List<Row>> Bills(string reportName, string parentGroupContains,
         DateOnly from, DateOnly to, CancellationToken ct)
     {
-        var doc = await PostReport(TallyEnvelopes.BillsReport(reportName, from, to, client.Company), ct);
-        var rows = ParseBillsReport(doc, to);
+        var doc = await PostReportAllowingRefusal(
+            TallyEnvelopes.BillsReport(reportName, from, to, client.Company), reportName, ct);
+        var rows = doc is null ? [] : ParseBillsReport(doc, to);
         if (rows.Count == 0)
             rows = await BillsFromCollection(parentGroupContains, from, to, ct);
         log.LogInformation("{Report}: {N} rows from {Source}", reportName, rows.Count, SourceOf(rows));

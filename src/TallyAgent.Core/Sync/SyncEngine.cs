@@ -56,9 +56,25 @@ public sealed class SyncEngine(
     /// <summary>Checkpoint row that records the last daily master-balance capture.</summary>
     private const string MasterBalancesCheckpoint = "_master_balances";
 
-    /// <summary>The company's active period, read fresh at the start of every
-    /// run. Null when Tally did not report one (the guard is then inactive).</summary>
-    private (DateOnly From, DateOnly To)? _activePeriod;
+    /// <summary>The company's BOOKS range (outer bound of what data can exist).
+    /// Not the active period — see <see cref="_inferredActiveStart"/>.</summary>
+    private (DateOnly From, DateOnly To)? _booksPeriod;
+
+    /// <summary>
+    /// The active-period start, INFERRED from what Tally actually serves.
+    ///
+    /// Tally bounds every export by the active period (Alt+F2) and does not
+    /// expose it over XML — STARTINGFROM/ENDINGAT is the books range and read
+    /// 2019-04-01 while the real period began 2026-04-01. But Tally gives itself
+    /// away: asked for 2026-08-05..2026-09-04 it returned vouchers dated
+    /// 2026-04-01, i.e. it ignores the requested window and serves from the
+    /// period start. The earliest date it volunteers IS that start.
+    ///
+    /// Once known, any window beginning before it is unreachable without someone
+    /// changing the period in Tally, and is failed rather than checkpointed on
+    /// nothing.
+    /// </summary>
+    private DateOnly? _inferredActiveStart;
 
     public Task<SyncResult> RunCycleAsync(string mode, CancellationToken ct) =>
         RunCycleAsync(mode, null, ct);
@@ -143,13 +159,16 @@ public sealed class SyncEngine(
             // vouchers once looked empty for three weeks because of exactly
             // this. Anyone with the Tally UI open can change it mid-run, so it
             // is read at the start of every run rather than configured.
-            _activePeriod = await tally.GetActivePeriodAsync(ct);
-            if (_activePeriod is { } ap)
-                log.LogInformation("Tally active period: {From:yyyy-MM-dd}..{To:yyyy-MM-dd}",
-                    ap.From, ap.To);
+            _booksPeriod = await tally.GetBooksPeriodAsync(ct);
+            _inferredActiveStart = null;
+            if (_booksPeriod is { } bp)
+                log.LogInformation(
+                    "Tally books range: {From:yyyy-MM-dd}..{To:yyyy-MM-dd}. This is NOT the active " +
+                    "period (Alt+F2), which Tally does not expose over XML and which is inferred " +
+                    "from the dates it actually serves.", bp.From, bp.To);
             else
-                log.LogWarning("Tally did not report an active period — the period guard is " +
-                    "INACTIVE this run, so an out-of-period range would extract as empty.");
+                log.LogWarning("Tally did not report a books range — the outer-bound guard is " +
+                    "inactive this run.");
 
             var enabled = DatasetRegistry.Enabled(config.Tally);
             log.LogInformation("Sync {SyncId} ({Mode}) starting: company='{Company}', {N} datasets",
@@ -259,6 +278,14 @@ public sealed class SyncEngine(
                 checkpoints.Upsert(new SyncCheckpoint(MasterBalancesCheckpoint, company,
                     null, null, null, DateTime.UtcNow.ToString("O"), true));
 
+            // A refused report that fell back still produced rows, so the cycle
+            // succeeds — but the reason it took the long way round must reach a
+            // human rather than living only in the source column.
+            foreach (var refusal in reports.RefusalsThisCycle)
+                await reporter.ReportAsync(ErrorCategory.TallyRequestRejected,
+                    ErrorSeverity.Warning, refusal,
+                    operation: "extract:reports", ct: CancellationToken.None);
+
             // Do not silently certify a full baseline when strongly related
             // datasets contradict each other. These checks are deliberately
             // conservative and only flag impossible/suspicious combinations.
@@ -344,6 +371,20 @@ public sealed class SyncEngine(
                             var sw = System.Diagnostics.Stopwatch.StartNew();
                             var result = await vouchers.ExtractWindow(from, to, bankLedgers, ct);
                             sw.Stop();
+                            NoteServedVoucherRange(result, from, to);
+
+                            // Nothing in the window, yet Tally sent vouchers from
+                            // elsewhere: the window is outside the active period.
+                            // Checkpointing this as a completed empty window is
+                            // exactly how a silent multi-year gap is created.
+                            if (result.VoucherHeaders.Count == 0 && result.OutOfWindowCount > 0)
+                                throw new TallyException(ErrorCategory.TallyActivePeriodTooNarrow,
+                                    $"Window {from:dd-MMM-yyyy}..{to:dd-MMM-yyyy} returned no vouchers, " +
+                                    $"but Tally sent {result.OutOfWindowCount} dated " +
+                                    $"{result.ServedMinDate}..{result.ServedMaxDate} instead. Tally is " +
+                                    "bounding the export by its ACTIVE period (Alt+F2) and ignoring the " +
+                                    "requested dates, so this range cannot be extracted until the period " +
+                                    "is widened in Tally. NOT checkpointed — it would have been a silent gap.");
                             var wf = from.ToString("yyyy-MM-dd");
                             var wt = to.ToString("yyyy-MM-dd");
 
@@ -618,8 +659,6 @@ public sealed class SyncEngine(
             "stock_summary" => await reports.StockSummary(fyStart, today, ct),
             "outstanding_payables" => await reports.Outstanding("Sundry Creditors", today, ct),
             "outstanding_receivables" => await reports.Outstanding("Sundry Debtors", today, ct),
-            "bills_payable" => await reports.Bills("Bills Payable", "Sundry Creditors", fyStart, today, ct),
-            "bills_receivable" => await reports.Bills("Bills Receivable", "Sundry Debtors", fyStart, today, ct),
             _ => throw new InvalidOperationException($"Unknown dataset '{dataset}'"),
         };
     }
@@ -635,15 +674,50 @@ public sealed class SyncEngine(
     /// </summary>
     private void GuardActivePeriod(DateOnly from, DateOnly to, string what)
     {
-        if (_activePeriod is not { } p) return;          // unknown ⇒ cannot judge
-        if (p.From <= from && p.To >= to) return;        // covered
+        // Inferred active period start wins: it is measured, not declared.
+        if (_inferredActiveStart is { } start && from < start)
+            throw new TallyException(ErrorCategory.TallyActivePeriodTooNarrow,
+                $"Tally is serving from {start:dd-MMM-yyyy} — it ignored an earlier requested " +
+                $"window and returned data from there instead, which is how its ACTIVE period " +
+                $"(Alt+F2) shows itself. {what} ({from:dd-MMM-yyyy} to {to:dd-MMM-yyyy}) begins " +
+                "before that, so Tally cannot serve it: the request would come back holding data " +
+                "from outside the window, every row would be skipped, and the range would " +
+                "checkpoint as complete on nothing. Widen the period in Tally (Alt+F2) and re-run.");
+
+        if (_booksPeriod is not { } p) return;           // unknown ⇒ cannot judge
+        if (p.From <= from && p.To >= to) return;        // within the books range
 
         throw new TallyException(ErrorCategory.TallyActivePeriodTooNarrow,
-            $"Tally's active period is {p.From:dd-MMM-yyyy} to {p.To:dd-MMM-yyyy}, which does not " +
-            $"cover {what} ({from:dd-MMM-yyyy} to {to:dd-MMM-yyyy}). Tally bounds every export by " +
-            "the active period regardless of the requested dates and returns an EMPTY response " +
-            "outside it, so this would have extracted nothing and reported success. " +
-            "Widen the period in Tally (Alt+F2) and re-run.");
+            $"Tally's books run {p.From:dd-MMM-yyyy} to {p.To:dd-MMM-yyyy}, which does not cover " +
+            $"{what} ({from:dd-MMM-yyyy} to {to:dd-MMM-yyyy}). No data can exist outside the books " +
+            "range, so this would have extracted nothing and reported success.");
+    }
+
+    /// <summary>
+    /// Learn the active-period start from a window Tally over-served.
+    ///
+    /// If Tally hands back vouchers dated EARLIER than the window we asked for,
+    /// it has ignored the window and served from its active-period start — so
+    /// that earliest date is the start. Recording it lets every later window in
+    /// the run be judged before a request is spent on it.
+    /// </summary>
+    private void NoteServedVoucherRange(VoucherExtractor.DayBookResult result,
+        DateOnly requestedFrom, DateOnly requestedTo)
+    {
+        if (result.ServedMinDate is null) return;
+        if (SyncPlanner.TryParseIsoDate(result.ServedMinDate) is not { } servedMin) return;
+        if (servedMin >= requestedFrom) return;          // window respected
+
+        if (_inferredActiveStart is null || servedMin < _inferredActiveStart)
+        {
+            _inferredActiveStart = servedMin;
+            log.LogWarning(
+                "Tally ignored the requested window {From:yyyy-MM-dd}..{To:yyyy-MM-dd} and served " +
+                "from {Served:yyyy-MM-dd} ({N} out-of-window vouchers skipped). Treating " +
+                "{Served:yyyy-MM-dd} as the active-period start for the rest of this run — " +
+                "anything earlier is unreachable until the period is widened in Tally (Alt+F2).",
+                requestedFrom, requestedTo, servedMin, result.OutOfWindowCount);
+        }
     }
 
     private static List<string> ValidateExtractionCounts(IReadOnlyDictionary<string, int> counts)

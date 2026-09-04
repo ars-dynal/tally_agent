@@ -388,14 +388,16 @@ static async Task<int> Verify(List<string> a, bool json)
         using var client = new TallyClient(cfg.Tally, NullLogger<TallyClient>.Instance);
         if (await FailFastIfTallyUnreachable(client, cfg, json) is { } unreachable) return unreachable;
 
-        var period = await client.GetActivePeriodAsync();
+        var period = await client.GetBooksPeriodAsync();
         results.Add(new
         {
-            check = "active_period",
-            period = period is null ? "unknown"
+            check = "books_range",
+            note = "NOT the active period - Tally does not expose Alt+F2 over XML; " +
+                   "the active period is inferred from the dates it actually serves.",
+            books_range = period is null ? "unknown"
                 : $"{period.Value.From:yyyy-MM-dd}..{period.Value.To:yyyy-MM-dd}",
             requested = $"{from:yyyy-MM-dd}..{to:yyyy-MM-dd}",
-            covers_request = period is null ? (bool?)null
+            books_covers_request = period is null ? (bool?)null
                 : period.Value.From <= from && period.Value.To >= to,
         });
 

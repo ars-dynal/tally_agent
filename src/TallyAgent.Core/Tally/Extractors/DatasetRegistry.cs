@@ -53,10 +53,6 @@ public static class DatasetRegistry
         new("stock_summary",          DatasetKind.Snapshot, "tally_stock_summary"),
         new("outstanding_payables",   DatasetKind.Snapshot, "tally_outstanding_payables"),
         new("outstanding_receivables",DatasetKind.Snapshot, "tally_outstanding_receivables"),
-        // Bill-level detail behind those two balances (v2.2.0). Additive: the
-        // outstanding_* datasets keep their exact meaning and their staging views.
-        new("bills_payable",          DatasetKind.Snapshot, "tally_bills_payable"),
-        new("bills_receivable",       DatasetKind.Snapshot, "tally_bills_receivable"),
     ];
 
     private static readonly HashSet<string> InventoryDatasets =
@@ -109,6 +105,33 @@ public static class DatasetRegistry
     /// that the request returns data.
     /// </summary>
     public const string RetiredOpeningBills = "opening_bills";
+
+    /// <summary>
+    /// RETIRED in v2.3.0: bills_payable, bills_receivable.
+    ///
+    /// They asked Tally to COMPUTE something the agent already has the inputs
+    /// for. bill_allocations carries, per allocation row: bill_ref, bill_type
+    /// (New Ref / Agst Ref / Advance / On Account), amount, ledger_name (the
+    /// party — allocations hang off the party's ledger entry), voucher_guid,
+    /// voucher_date and voucher_type. Matching New Ref and Advance against
+    /// Agst Ref by bill_ref within a party reproduces both reports in SQL, which
+    /// is the approach tally-database-loader takes; it never requests a Bills
+    /// Payable report either. 7,559 allocation rows were flowing on the day this
+    /// was decided.
+    ///
+    /// So the report route was pure cost: a heavy computation on Tally's single
+    /// application thread, an envelope shape that took three attempts to pin
+    /// down, and a parser that could only ever be as right as the guess behind
+    /// it. Deriving downstream is cheaper, verifiable in SQL, and cannot hang
+    /// tally.exe.
+    ///
+    /// ReportExtractor.Bills and ParseBillsReport remain — `TallyAgent.Cli
+    /// verify` still parses a Tally bills export with them, which is how the
+    /// derivation gets checked against Tally's own numbers.
+    /// </summary>
+    public static readonly IReadOnlySet<string> RetiredBillsReports =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "bills_payable", "bills_receivable" };
 
     /// <summary>Should a zero-row result from this dataset be reported rather
     /// than checkpointed as a success?</summary>

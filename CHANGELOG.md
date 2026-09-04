@@ -8,6 +8,82 @@ against a number anyone remembered. Those files are live accounting data and are
 deliberately not committed; `TallyAgent.Cli verify` runs them through the exact
 parsers the agent uses.
 
+### A refused report falls back again (regression fixed before release)
+
+Caught on the Tally server: `trial_balance` uploaded **ZERO batches**.
+`ReportExtractor.TrialBalance` -> `PostAsync` -> `TallyException "Tally refused
+the request: Unknown Request"`. The v2.2.0 refusal detection threw straight past
+the `if (rows.Count == 0)` fallback, so a dataset that had been producing 1,038
+reconciling rows produced nothing at all.
+
+Detecting a refusal and deciding what to do about it are different decisions.
+The refusal is still detected, named and surfaced; then the extractor takes the
+route it already had.
+
+* `PostReportAllowingRefusal` returns null on a refusal instead of throwing.
+  Every report WITH a fallback uses it - trial_balance, balance_sheet,
+  profit_loss, stock_summary, bills.
+* Loud, not fatal: the refusal is logged, collected in
+  `ReportExtractor.RefusalsThisCycle`, and reported by the engine as a Warning
+  against `extract:reports`. The rows carry `source='ledger_collection'`, so the
+  route is visible in the data as well as the log.
+* A refusal with NO fallback still fails hard. There is nothing else to try, and
+  pretending otherwise would be the original bug.
+
+### The period guard was reading the BOOKS range
+
+Proven on the server: the agent logged `2019-04-01..2026-09-04` from
+`STARTINGFROM`/`ENDINGAT` while Tally's Gateway showed **1-Apr-26 to 31-Mar-27**.
+Those fields are the data range, not the active period, and Tally does not appear
+to expose Alt+F2 over XML at all.
+
+So it is **inferred from what Tally actually serves**. Asked for
+`2026-08-05..2026-09-04`, Tally returned vouchers dated `2026-04-01` - it ignores
+the requested window and serves from the active-period start, which the agent
+was silently skipping client-side. That earliest volunteered date IS the start.
+
+* `DayBookResult` now reports `ServedMinDate`/`ServedMaxDate` (every voucher
+  returned, accepted or not) and `OutOfWindowCount`.
+* When Tally serves earlier than asked, the engine records that date as the
+  active-period start for the rest of the run and fails any later window
+  beginning before it - **before** spending a request on it.
+* A window that returns nothing while Tally sent vouchers from elsewhere now
+  FAILS instead of checkpointing. That combination is precisely how a silent
+  multi-year backfill gap is created.
+* `GetActivePeriodAsync` is renamed `GetBooksPeriodAsync` and logged as
+  "books range ... this is NOT the active period". It remains a valid outer
+  bound - no data can exist outside it - just not the one that matters.
+
+### bills_payable / bills_receivable are retired
+
+We were asking Tally to compute something we already have the inputs for.
+`tally-database-loader` never requests a Bills Payable report either; it derives
+outstandings in SQL by matching New Ref and Advance against Agst Ref by bill
+name. `bill_allocations` was carrying 7,559 rows on the day this was decided.
+
+Audit of what the extractor carries per allocation row:
+
+| Required | Present as | |
+|---|---|---|
+| bill name / reference | `bill_ref` (BILLALLOCATIONS.NAME) | yes |
+| bill type | `bill_type` (New Ref / Agst Ref / Advance / On Account) | yes |
+| amount | `amount` | yes |
+| party ledger | `ledger_name` - allocations hang off the party's entry | yes |
+| voucher guid | `voucher_guid` | yes |
+| voucher date | `voucher_date` | yes |
+| voucher type | **was missing** - now added | fixed |
+
+`voucher_type` was the one gap, while every other allocation row already carried
+it. Without it the SQL cannot tell a purchase from a payment. Added, and the two
+report datasets are retired the same way `opening_bills` was: removed from the
+registry and the Manager, with `ReportExtractor.Bills` and `ParseBillsReport`
+kept so `TallyAgent.Cli verify` can still check the derivation against Tally's
+own bills export.
+
+That also ends the envelope hunt. The report route was a heavy computation on
+Tally's single application thread, an envelope that took three attempts to pin
+down, and a parser that could only ever be as right as the guess behind it.
+
 ### The bills envelope and parser were both wrong
 
 Tally's export puts the amount OUTSIDE the record container:

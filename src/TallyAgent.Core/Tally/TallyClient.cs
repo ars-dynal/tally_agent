@@ -186,22 +186,19 @@ public sealed class TallyClient : IDisposable
     }
 
     /// <summary>
-    /// The open company's period, or null when Tally does not report one.
+    /// The company's BOOKS range — the outer bound of what data can exist.
     ///
-    /// Tally bounds every voucher and report export by this period no matter
-    /// what SVFROMDATE/SVTODATE say, and a request outside it comes back valid
-    /// and EMPTY. Callers use it to fail loudly instead of checkpointing a
-    /// silent nothing.
+    /// This is NOT the active period. Measured on the Tally server: the agent
+    /// read 2019-04-01..2026-09-04 from STARTINGFROM/ENDINGAT while Tally's own
+    /// Gateway showed an active period of 1-Apr-26 to 31-Mar-27. Tally does not
+    /// appear to expose the Alt+F2 period over XML at all, so it is INFERRED
+    /// from what Tally actually serves — see
+    /// <c>SyncEngine.NoteServedVoucherRange</c>.
     ///
-    /// NOT YET CONFIRMED against a live Tally: which Company field carries the
-    /// ACTIVE (Alt+F2) period as opposed to the books period. STARTINGFROM /
-    /// ENDINGAT is the pair used here, and the raw values are reported wherever
-    /// the guard fires so a wrong assumption is visible on the first run rather
-    /// than inferred. If STARTINGFROM turns out to be the books beginning, the
-    /// computed period is WIDER than the real one — the guard under-fires and
-    /// nothing breaks, which is the safe direction to be wrong in.
+    /// Still worth reading: nothing can exist outside the books range, so it is
+    /// a valid (if loose) outer guard, and it is useful context in the log.
     /// </summary>
-    public async Task<(DateOnly From, DateOnly To)?> GetActivePeriodAsync(CancellationToken ct = default)
+    public async Task<(DateOnly From, DateOnly To)?> GetBooksPeriodAsync(CancellationToken ct = default)
     {
         XDocument doc;
         try

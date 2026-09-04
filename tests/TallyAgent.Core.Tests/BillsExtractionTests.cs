@@ -158,45 +158,17 @@ public class BillsExtractionTests
         Assert.DoesNotContain("EXPLODEFLAG", xml);
     }
 
-    // ── registry: additive only ──────────────────────────────────────────
+    // ── retired, but the parser stays ────────────────────────────────────
 
     [Fact]
-    public void BillsDatasets_AreSnapshots_AndDoNotDisturbTheOutstandingOnes()
+    public void BillsDatasets_AreRetired_ButTheParserRemainsForVerification()
     {
-        var enabled = DatasetRegistry.Enabled(new TallySettings());
-
-        foreach (var name in new[] { "bills_payable", "bills_receivable" })
-        {
-            var ds = Assert.Single(enabled, d => d.Name == name);
-            Assert.Equal(DatasetKind.Snapshot, ds.Kind);
-            Assert.True(DatasetRegistry.ExpectsRows(ds));
-            // These are per-bill lists, not whole-company computations.
-            Assert.DoesNotContain(name, DatasetRegistry.HeavyReports);
-        }
-
-        // The datasets they sit beside are untouched — they reconcile to the
-        // trial balance and have staging views deployed against them.
-        Assert.Contains(enabled, d => d.Name == "outstanding_payables");
-        Assert.Contains(enabled, d => d.Name == "outstanding_receivables");
-    }
-
-    [Fact]
-    public void BillsDatasets_FollowTheSnapshotToggles()
-    {
-        Assert.DoesNotContain(DatasetRegistry.Enabled(new TallySettings { EnableSnapshots = false }),
-            d => d.Name is "bills_payable" or "bills_receivable");
-
-        var perDataset = new TallySettings
-        {
-            SnapshotDatasets = new Dictionary<string, bool>
-            {
-                ["bills_payable"] = true,
-                ["bills_receivable"] = false,
-                ["balance_sheet"] = false,
-            },
-        };
-        var enabled = DatasetRegistry.Enabled(perDataset);
-        Assert.Contains(enabled, d => d.Name == "bills_payable");
-        Assert.DoesNotContain(enabled, d => d.Name == "bills_receivable");
+        // The report route is gone: outstandings are derived from
+        // bill_allocations in SQL. ParseBillsReport survives so
+        // `TallyAgent.Cli verify` can still read a Tally bills export and check
+        // the derivation against Tally's own numbers.
+        Assert.DoesNotContain(DatasetRegistry.All, d => d.Name == "bills_payable");
+        Assert.DoesNotContain(DatasetRegistry.All, d => d.Name == "bills_receivable");
+        Assert.NotEmpty(ReportExtractor.ParseBillsReport(Doc(TwoBills), AsOf));
     }
 }

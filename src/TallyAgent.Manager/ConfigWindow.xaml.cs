@@ -46,8 +46,6 @@ public partial class ConfigWindow : Window
         TrialBalanceCheck.IsChecked = _config.Tally.IsSnapshotEnabled("trial_balance");
         OutstandingPayablesCheck.IsChecked = _config.Tally.IsSnapshotEnabled("outstanding_payables");
         OutstandingReceivablesCheck.IsChecked = _config.Tally.IsSnapshotEnabled("outstanding_receivables");
-        BillsPayableCheck.IsChecked = _config.Tally.IsSnapshotEnabled("bills_payable");
-        BillsReceivableCheck.IsChecked = _config.Tally.IsSnapshotEnabled("bills_receivable");
         BalanceSheetCheck.IsChecked = _config.Tally.IsSnapshotEnabled("balance_sheet");
         ProfitLossCheck.IsChecked = _config.Tally.IsSnapshotEnabled("profit_loss");
         StockSummaryCheck.IsChecked = _config.Tally.IsSnapshotEnabled("stock_summary");
@@ -85,8 +83,6 @@ public partial class ConfigWindow : Window
                 ["trial_balance"] = TrialBalanceCheck.IsChecked == true,
                 ["outstanding_payables"] = OutstandingPayablesCheck.IsChecked == true,
                 ["outstanding_receivables"] = OutstandingReceivablesCheck.IsChecked == true,
-                ["bills_payable"] = BillsPayableCheck.IsChecked == true,
-                ["bills_receivable"] = BillsReceivableCheck.IsChecked == true,
                 ["balance_sheet"] = BalanceSheetCheck.IsChecked == true,
                 ["profit_loss"] = ProfitLossCheck.IsChecked == true,
                 ["stock_summary"] = StockSummaryCheck.IsChecked == true,

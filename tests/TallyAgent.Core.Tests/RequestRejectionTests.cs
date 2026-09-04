@@ -105,20 +105,65 @@ public sealed class RequestRejectionTests : IDisposable
         Assert.Equal(1, handler.Calls);   // deterministic refusal — retrying is waste
     }
 
-    /// <summary>The regression this whole change exists to prevent: a refused
-    /// report must NOT silently become a fallback result.</summary>
+    /// <summary>
+    /// A refused report FALLS BACK where a fallback exists — loud, not fatal.
+    ///
+    /// v2.2.0 threw straight past the fallback, and on the Tally server that
+    /// turned trial_balance from 1,038 reconciling rows into ZERO uploaded
+    /// batches the moment Tally began refusing the report. Detecting a refusal
+    /// and choosing what to do about it are different decisions: the refusal is
+    /// still named and surfaced, and then the extractor takes the route it
+    /// already had.
+    /// </summary>
     [Fact]
-    public async Task RefusedReport_DoesNotSilentlyRouteToTheFallback()
+    public async Task RefusedReport_FallsBackAndRecordsTheSource()
     {
-        using var client = Client("<RESPONSE>Unknown Request, cannot be processed</RESPONSE>", out var handler);
+        // Refuse the report; answer the Ledger collection normally.
+        var handler = new SwitchingHandler(
+            refuse: "<RESPONSE>Unknown Request, cannot be processed</RESPONSE>",
+            ledgers: "<ENVELOPE><LEDGER><NAME>Cash</NAME><PARENT>Cash-in-Hand</PARENT>" +
+                     "<CLOSINGBALANCE>-250.50</CLOSINGBALANCE></LEDGER></ENVELOPE>");
+        using var client = new TallyClient(new TallySettings { Company = "Co", RequestPauseSeconds = 0 },
+            NullLogger<TallyClient>.Instance, new HttpClient(handler), _dir)
+        { DelayAsync = (_, _) => Task.CompletedTask };
+
         var reports = new ReportExtractor(client, NullLogger<ReportExtractor>.Instance);
+        reports.BeginCycle();
 
-        var ex = await Assert.ThrowsAsync<TallyException>(() =>
-            reports.TrialBalance(new DateOnly(2026, 4, 1), new DateOnly(2026, 9, 3), CancellationToken.None));
+        var rows = await reports.TrialBalance(
+            new DateOnly(2026, 4, 1), new DateOnly(2026, 9, 3), CancellationToken.None);
 
+        // Rows again, and the row says which route produced them.
+        Assert.Equal("ledger_collection", Assert.Single(rows)["source"]);
+        // Loud: the refusal is recorded for the engine to report as a warning.
+        Assert.Single(reports.RefusalsThisCycle);
+        Assert.Contains("refused", reports.RefusalsThisCycle[0], StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>A refusal with NO fallback still fails hard - there is nothing
+    /// else to try, and pretending otherwise would be the original bug.</summary>
+    [Fact]
+    public async Task RefusedRequest_WithNoFallback_StillThrows()
+    {
+        using var client = Client("<RESPONSE>Unknown Request, cannot be processed</RESPONSE>", out _);
+        var ex = await Assert.ThrowsAsync<TallyException>(
+            () => client.GetCompanyAlterIdsAsync());
         Assert.Equal(ErrorCategory.TallyRequestRejected, ex.Category);
-        // Exactly one request: it never reached TrialBalanceFromLedgers.
-        Assert.Equal(1, handler.Calls);
+    }
+
+    /// <summary>Answers the report request with a refusal and everything else
+    /// (the Ledger collection) normally.</summary>
+    private sealed class SwitchingHandler(string refuse, string ledgers) : HttpMessageHandler
+    {
+        public int Calls;
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage req, CancellationToken ct)
+        {
+            Calls++;
+            var body = await req.Content!.ReadAsStringAsync(ct);
+            var reply = body.Contains("REPORTNAME") ? refuse : ledgers;
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            { Content = new StringContent(reply, Encoding.UTF8, "text/xml") };
+        }
     }
 
     // ── source column ────────────────────────────────────────────────────

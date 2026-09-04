@@ -213,9 +213,8 @@ public class ReportShapeTests
 
         // Everything else a default install expects is still there.
         Assert.Contains(enabled, d => d.Name == "trial_balance");
-        Assert.Contains(enabled, d => d.Name == "bills_payable");
-        Assert.Contains(enabled, d => d.Name == "bills_receivable");
         Assert.Contains(enabled, d => d.Name == "outstanding_payables");
+        Assert.Contains(enabled, d => d.Name == "outstanding_receivables");
     }
 
     [Fact]

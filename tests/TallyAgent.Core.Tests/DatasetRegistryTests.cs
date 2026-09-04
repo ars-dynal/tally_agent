@@ -12,7 +12,6 @@ public class DatasetRegistryTests
     [
         "trial_balance", "balance_sheet", "profit_loss",
         "stock_summary", "outstanding_payables", "outstanding_receivables",
-        "bills_payable", "bills_receivable",
     ];
 
     /// <summary>The three that make Tally compute across the whole company and
@@ -143,6 +142,17 @@ public class DatasetRegistryTests
     {
         foreach (var name in SnapshotNames)
             Assert.True(DatasetRegistry.ExpectsRows(DatasetRegistry.All.Single(d => d.Name == name)));
+    }
+
+    [Fact]
+    public void BillsReports_AreRetired_BecauseTheDataIsDerivable()
+    {
+        // bill_allocations already carries bill_ref, bill_type, amount, the
+        // party ledger, voucher guid/date/type - everything needed to derive
+        // both reports in SQL. Asking Tally to compute them was pure cost.
+        Assert.DoesNotContain(DatasetRegistry.All, d => d.Name == "bills_payable");
+        Assert.DoesNotContain(DatasetRegistry.All, d => d.Name == "bills_receivable");
+        Assert.Contains(DatasetRegistry.Enabled(new TallySettings()), d => d.Name == "bill_allocations");
     }
 
     [Fact]

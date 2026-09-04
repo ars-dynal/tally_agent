@@ -89,10 +89,26 @@ After building, check the installer's timestamp and size actually changed.
   reconciled perfectly for weeks while coming entirely from the ledger fallback,
   because both routes derive from the same balances. A number that is right by
   accident should still say which route it came by.
-- **The active period is read every run, and an out-of-period range is an
-  ERROR.** Tally bounds every export by Alt+F2 regardless of the requested
-  dates and answers with a valid, EMPTY response outside it. Anyone with the UI
-  open can change it.
+- **Tally does not expose the active period (Alt+F2) over XML.**
+  `STARTINGFROM`/`ENDINGAT` on the Company object is the BOOKS range — measured
+  2019-04-01..2026-09-04 while the Gateway showed 1-Apr-26 to 31-Mar-27. The
+  active period is INFERRED instead: Tally ignores a requested voucher window
+  that starts before it and serves from the period start anyway, so the earliest
+  date it volunteers is that start. A window that returns nothing while Tally
+  sent vouchers from elsewhere is a FAILURE, not an empty window — that
+  combination is how a silent multi-year backfill gap is created.
+- **A refusal must fall back wherever a fallback exists.** v2.2.0 made a refusal
+  throw centrally, which was right, but it threw past the fallback and
+  `trial_balance` went from 1,038 rows to zero batches. Detecting a refusal and
+  deciding what to do about it are different decisions: surface it loudly, then
+  take the route you already had.
+- **Do not ask Tally to compute outstandings.** `bill_allocations` carries
+  bill_ref, bill_type (New Ref / Agst Ref / Advance / On Account), amount,
+  ledger_name (the party), voucher_guid, voucher_date and voucher_type. Matching
+  New Ref and Advance against Agst Ref by bill_ref within a party reproduces
+  Bills Payable and Bills Receivable in SQL — which is what tally-database-loader
+  does, and it never requests those reports either. `bills_payable` and
+  `bills_receivable` were retired for this reason.
 - **`balance_sheet`, `profit_loss` and `stock_summary` default to FALSE** from
   v2.3.0, with no config entry needed. Do not re-enable them.
 - **Verify against Tally's own UI export, not against remembered figures.**

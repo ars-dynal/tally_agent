@@ -73,13 +73,8 @@
                 <TextBlock Text="What customers owe us, as a balance per party."
                            Margin="34,0,0,4" Foreground="Gray" FontSize="11"/>
 
-                <CheckBox x:Name="BillsPayableCheck" Content="Bills Payable" Margin="16,3,0,0"/>
-                <TextBlock Text="Every unpaid supplier bill: date, reference, amount, due date and days overdue."
-                           Margin="34,0,0,4" Foreground="Gray" FontSize="11"/>
-
-                <CheckBox x:Name="BillsReceivableCheck" Content="Bills Receivable" Margin="16,3,0,0"/>
-                <TextBlock Text="Every unpaid customer bill, with Tally's own overdue days. Needed for AR ageing."
-                           Margin="34,0,0,8" Foreground="Gray" FontSize="11"/>
+                <TextBlock TextWrapping="Wrap" Margin="34,0,0,8" Foreground="Gray" FontSize="11"
+                           Text="Bill-by-bill outstandings are no longer requested from Tally. They are derived downstream from the bill allocations already extracted with every voucher, which is cheaper and cannot stall Tally."/>
 
                 <CheckBox x:Name="BalanceSheetCheck" Content="Balance Sheet  — known to freeze Tally"
                           Foreground="#A4262C" Margin="16,3,0,0"/>
