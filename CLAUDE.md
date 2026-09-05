@@ -142,6 +142,15 @@ After building, check the installer's timestamp and size actually changed.
   reconciled perfectly for weeks while coming entirely from the ledger fallback,
   because both routes derive from the same balances. A number that is right by
   accident should still say which route it came by.
+- **Never send SVFROMDATE on the Ledger or StockItem collection.** SVTODATE
+  alone is required (without it Alt+F2 decides the as-of date), but adding a
+  from-date WEDGES tally.exe on the ledgers-with-balances request - it never
+  returns and Tally has to be restarted. Raising requestTimeoutSeconds to 300
+  did not help, because it is not a timeout: asking Tally to compute period
+  movement for 2,507 ledgers in one request is work it does not come back from.
+  The consequence is that P&L ledgers in the master are an all-time
+  accumulation, which is fine - the statements read fact_gl, and the ledger
+  master is a cross-check.
 - **Tally does not expose the active period (Alt+F2) over XML.**
   `STARTINGFROM`/`ENDINGAT` on the Company object is the BOOKS range — measured
   2019-04-01..2026-09-04 while the Gateway showed 1-Apr-26 to 31-Mar-27. The

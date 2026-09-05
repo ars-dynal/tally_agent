@@ -92,18 +92,20 @@ public sealed class MasterBalanceTests : IDisposable
     }
 
     /// <summary>
-    /// The two balance-bearing collections are scoped DIFFERENTLY, and the
-    /// difference is the point.
+    /// NEITHER balance-bearing collection may carry a from-date.
     ///
-    /// Ledger is FY-scoped: with only a to-date Tally accumulates a P&amp;L ledger
-    /// from the start of the books, and Salary and Wages came back at
-    /// -6,83,59,693 (all time) rather than -1,23,36,779 (this year).
+    /// A from-date was added to Ledger so P&amp;L ledgers would scope to the
+    /// financial year. It WEDGES TALLY: the ledgers-with-balances request never
+    /// returns and tally.exe has to be restarted. Raising the request timeout to
+    /// 300s did not help, because it is not a timeout - asking Tally to compute
+    /// period movement for 2,507 ledgers in one request is work it does not come
+    /// back from.
     ///
-    /// StockItem gets NO from-date: closing stock is cumulative by nature, and
-    /// with SVTODATE alone it already ties to Tally exactly.
+    /// The scoping is not needed: the statements read fact_gl, not the ledger
+    /// master. The master is a cross-check.
     /// </summary>
     [Fact]
-    public async Task Ledger_IsFinancialYearScoped_StockItem_IsNot()
+    public async Task NeitherCollection_SendsAFromDate()
     {
         var db = new AgentDatabase(NullLogger<AgentDatabase>.Instance, Path.Combine(_dir, "fy.db"));
         var handler = new Handler(body => body.Contains("<TYPE>StockItem</TYPE>")
@@ -114,7 +116,6 @@ public sealed class MasterBalanceTests : IDisposable
         { DelayAsync = (_, _) => Task.CompletedTask };
         var ex = new MasterExtractor(client, new MasterBalanceRepository(db),
             NullLogger<MasterExtractor>.Instance);
-        // 5-Sep-2026 sits in FY 2026-27, which begins 1-Apr-2026.
         ex.BeginCycle("Co", fetchBalances: true, asOf: new DateOnly(2026, 9, 5));
 
         await ex.Ledgers(CancellationToken.None);
@@ -123,34 +124,13 @@ public sealed class MasterBalanceTests : IDisposable
         var ledgerReq = handler.Requests.Single(r => r.Contains("<TYPE>Ledger</TYPE>"));
         var stockReq = handler.Requests.Single(r => r.Contains("<TYPE>StockItem</TYPE>"));
 
-        Assert.Contains("<SVFROMDATE>20260401</SVFROMDATE>", ledgerReq);
+        // The to-date is required - without it Alt+F2 decides the as-of date.
         Assert.Contains("<SVTODATE>20260905</SVTODATE>", ledgerReq);
-
-        Assert.DoesNotContain("SVFROMDATE", stockReq);
         Assert.Contains("<SVTODATE>20260905</SVTODATE>", stockReq);
-    }
 
-    [Theory]
-    [InlineData(2026, 9, 5, 20260401)]    // September -> FY starts this April
-    [InlineData(2026, 4, 1, 20260401)]    // 1 April itself
-    [InlineData(2026, 3, 31, 20250401)]   // March -> FY started LAST April
-    [InlineData(2027, 1, 15, 20260401)]   // January -> still the prior April
-    public async Task FinancialYearStart_IsTheAprilOnOrBeforeTheAsOfDate(
-        int y, int m, int d, int expected)
-    {
-        var db = new AgentDatabase(NullLogger<AgentDatabase>.Instance,
-            Path.Combine(_dir, $"fy{y}{m}{d}.db"));
-        var handler = new Handler(_ => LedgerXml);
-        var client = new TallyClient(new TallySettings { Company = "Co", RequestPauseSeconds = 0 },
-            NullLogger<TallyClient>.Instance, new HttpClient(handler), _dir)
-        { DelayAsync = (_, _) => Task.CompletedTask };
-        var ex = new MasterExtractor(client, new MasterBalanceRepository(db),
-            NullLogger<MasterExtractor>.Instance);
-        ex.BeginCycle("Co", fetchBalances: true, asOf: new DateOnly(y, m, d));
-
-        await ex.Ledgers(CancellationToken.None);
-
-        Assert.Contains($"<SVFROMDATE>{expected}</SVFROMDATE>", handler.Requests[0]);
+        // The from-date is the one that hangs Tally. Neither request may carry it.
+        Assert.DoesNotContain("SVFROMDATE", ledgerReq);
+        Assert.DoesNotContain("SVFROMDATE", stockReq);
     }
 
     [Fact]
