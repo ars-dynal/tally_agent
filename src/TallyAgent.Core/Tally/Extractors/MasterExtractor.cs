@@ -62,26 +62,31 @@ public sealed class MasterExtractor(TallyClient client, MasterBalanceRepository 
         await client.PostAsync(TallyEnvelopes.Collection(type, fields, client.Company), ct);
 
     /// <summary>
-    /// A collection whose values are COMPUTED as of a date — Ledger
-    /// (OPENING/CLOSINGBALANCE) and StockItem (CLOSINGBALANCE/VALUE/RATE).
+    /// A collection whose values Tally COMPUTES over a date range.
     ///
-    /// SVTODATE is pinned. Without it Tally evaluates $ClosingBalance against
-    /// whatever period is currently loaded, so the as-of date of every master
-    /// balance was decided by whoever last pressed Alt+F2 rather than by the
-    /// agent. Observed 2026-09: 10 of 69 Indirect Expense ledgers stale, Salary
-    /// and Wages tying exactly at 31-Jul — a period end, not a drift, and only
-    /// the ledgers with August activity differed.
+    /// SVTODATE is always pinned. Without it Tally evaluates $ClosingBalance
+    /// against whatever period is currently loaded, so the as-of date of every
+    /// master balance was decided by whoever last pressed Alt+F2 rather than by
+    /// the agent. Observed 2026-09: 10 of 69 Indirect Expense ledgers stale,
+    /// Salary and Wages tying exactly at 31-Jul — a period end, not a drift.
     ///
-    /// ReportExtractor has always pinned it on this same Ledger collection for
-    /// the outstandings and the trial-balance fallback; this makes the master
-    /// export agree with it instead of contradicting it.
+    /// SVFROMDATE is passed ONLY where a range is meaningful. See
+    /// <see cref="LedgerDocument"/> and <see cref="StockItemDocument"/>: the two
+    /// collections want different things and pinning both dates on both is
+    /// wrong in one direction or the other.
     ///
-    /// Masters are not period-bound, so this changes WHEN the balances are
+    /// Masters are not period-bound, so this changes WHEN the values are
     /// measured, not WHICH masters come back.
     /// </summary>
-    private async Task<XDocument> BalanceBearingCollection(string type, string[] fields, CancellationToken ct) =>
+    private async Task<XDocument> BalanceBearingCollection(string type, string[] fields,
+        DateOnly? from, CancellationToken ct) =>
         await client.PostAsync(
-            TallyEnvelopes.Collection(type, fields, client.Company, from: null, to: _asOf), ct);
+            TallyEnvelopes.Collection(type, fields, client.Company, from: from, to: _asOf), ct);
+
+    /// <summary>Start of the financial year containing <see cref="AsOfDate"/>
+    /// (1 April, India).</summary>
+    private DateOnly FinancialYearStart =>
+        new(_asOf.Month >= 4 ? _asOf.Year : _asOf.Year - 1, 4, 1);
 
     private static readonly string[] LedgerBaseFields =
     [
@@ -119,7 +124,15 @@ public sealed class MasterExtractor(TallyClient client, MasterBalanceRepository 
             var fields = _fetchBalances
                 ? LedgerBaseFields.Concat(LedgerBalanceFields).ToArray()
                 : LedgerBaseFields;
-            _ledgerDoc = await BalanceBearingCollection("Ledger", fields, ct);
+            // FY-SCOPED. With only a to-date, Tally accumulates a P&L ledger
+            // from the start of the books: Salary and Wages came back at
+            // -6,83,59,693 (all time) instead of -1,23,36,779 (this year).
+            //
+            // Balance-sheet ledgers are unaffected, because Tally computes a
+            // closing balance as opening-at-from-date plus movement in the
+            // range. P&L ledgers open at zero on 1 April — measured, not
+            // assumed: all 156 of them carry a zero opening.
+            _ledgerDoc = await BalanceBearingCollection("Ledger", fields, FinancialYearStart, ct);
             return _ledgerDoc;
         }
         finally { _cacheLock.Release(); }
@@ -136,7 +149,12 @@ public sealed class MasterExtractor(TallyClient client, MasterBalanceRepository 
             var fields = _fetchBalances
                 ? StockItemBaseFields.Concat(StockItemBalanceFields).ToArray()
                 : StockItemBaseFields;
-            _stockItemDoc = await BalanceBearingCollection("StockItem", fields, ct);
+            // NO from-date. Stock valuation is cumulative by nature — closing
+            // stock is everything ever bought less everything ever sold — so
+            // scoping it to a period would be the opposite of correct. Measured
+            // with SVTODATE alone it already ties to Tally exactly
+            // (-18,70,08,352.35). Two collections, two requirements.
+            _stockItemDoc = await BalanceBearingCollection("StockItem", fields, from: null, ct);
             return _stockItemDoc;
         }
         finally { _cacheLock.Release(); }

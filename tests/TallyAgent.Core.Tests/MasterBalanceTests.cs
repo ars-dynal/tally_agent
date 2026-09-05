@@ -91,6 +91,68 @@ public sealed class MasterBalanceTests : IDisposable
         Assert.All(rows, r => Assert.Null(r["closing_balance"]));
     }
 
+    /// <summary>
+    /// The two balance-bearing collections are scoped DIFFERENTLY, and the
+    /// difference is the point.
+    ///
+    /// Ledger is FY-scoped: with only a to-date Tally accumulates a P&amp;L ledger
+    /// from the start of the books, and Salary and Wages came back at
+    /// -6,83,59,693 (all time) rather than -1,23,36,779 (this year).
+    ///
+    /// StockItem gets NO from-date: closing stock is cumulative by nature, and
+    /// with SVTODATE alone it already ties to Tally exactly.
+    /// </summary>
+    [Fact]
+    public async Task Ledger_IsFinancialYearScoped_StockItem_IsNot()
+    {
+        var db = new AgentDatabase(NullLogger<AgentDatabase>.Instance, Path.Combine(_dir, "fy.db"));
+        var handler = new Handler(body => body.Contains("<TYPE>StockItem</TYPE>")
+            ? "<ENVELOPE><STOCKITEM><NAME>Widget</NAME><CLOSINGVALUE>-100</CLOSINGVALUE></STOCKITEM></ENVELOPE>"
+            : LedgerXml);
+        var client = new TallyClient(new TallySettings { Company = "Co", RequestPauseSeconds = 0 },
+            NullLogger<TallyClient>.Instance, new HttpClient(handler), _dir)
+        { DelayAsync = (_, _) => Task.CompletedTask };
+        var ex = new MasterExtractor(client, new MasterBalanceRepository(db),
+            NullLogger<MasterExtractor>.Instance);
+        // 5-Sep-2026 sits in FY 2026-27, which begins 1-Apr-2026.
+        ex.BeginCycle("Co", fetchBalances: true, asOf: new DateOnly(2026, 9, 5));
+
+        await ex.Ledgers(CancellationToken.None);
+        await ex.StockItems(CancellationToken.None);
+
+        var ledgerReq = handler.Requests.Single(r => r.Contains("<TYPE>Ledger</TYPE>"));
+        var stockReq = handler.Requests.Single(r => r.Contains("<TYPE>StockItem</TYPE>"));
+
+        Assert.Contains("<SVFROMDATE>20260401</SVFROMDATE>", ledgerReq);
+        Assert.Contains("<SVTODATE>20260905</SVTODATE>", ledgerReq);
+
+        Assert.DoesNotContain("SVFROMDATE", stockReq);
+        Assert.Contains("<SVTODATE>20260905</SVTODATE>", stockReq);
+    }
+
+    [Theory]
+    [InlineData(2026, 9, 5, 20260401)]    // September -> FY starts this April
+    [InlineData(2026, 4, 1, 20260401)]    // 1 April itself
+    [InlineData(2026, 3, 31, 20250401)]   // March -> FY started LAST April
+    [InlineData(2027, 1, 15, 20260401)]   // January -> still the prior April
+    public async Task FinancialYearStart_IsTheAprilOnOrBeforeTheAsOfDate(
+        int y, int m, int d, int expected)
+    {
+        var db = new AgentDatabase(NullLogger<AgentDatabase>.Instance,
+            Path.Combine(_dir, $"fy{y}{m}{d}.db"));
+        var handler = new Handler(_ => LedgerXml);
+        var client = new TallyClient(new TallySettings { Company = "Co", RequestPauseSeconds = 0 },
+            NullLogger<TallyClient>.Instance, new HttpClient(handler), _dir)
+        { DelayAsync = (_, _) => Task.CompletedTask };
+        var ex = new MasterExtractor(client, new MasterBalanceRepository(db),
+            NullLogger<MasterExtractor>.Instance);
+        ex.BeginCycle("Co", fetchBalances: true, asOf: new DateOnly(y, m, d));
+
+        await ex.Ledgers(CancellationToken.None);
+
+        Assert.Contains($"<SVFROMDATE>{expected}</SVFROMDATE>", handler.Requests[0]);
+    }
+
     [Fact]
     public async Task BalanceBearingCollections_PinSvToDate()
     {
