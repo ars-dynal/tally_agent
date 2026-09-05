@@ -30,6 +30,10 @@ public enum ErrorCategory
     /// being extracted. Tally bounds every export by it regardless of
     /// SVFROMDATE/SVTODATE and returns a valid, EMPTY response outside it.</summary>
     TallyActivePeriodTooNarrow,
+    /// <summary>Tally returned rows OUTSIDE the window that was asked for. Under
+    /// a date-scoped mechanism that must never happen, so it means the scoping
+    /// mechanism has regressed - not that the data is odd.</summary>
+    TallyWindowNotHonoured,
 }
 
 public enum ErrorSeverity { Warning, Error, Critical }

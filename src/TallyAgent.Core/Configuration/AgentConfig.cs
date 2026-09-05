@@ -117,9 +117,21 @@ public sealed class TallySettings
     [JsonPropertyName("enableGst")] public bool EnableGst { get; set; } = true;
     [JsonPropertyName("enableCostCentres")] public bool EnableCostCentres { get; set; } = true;
     [JsonPropertyName("incrementalLookbackDays")] public int IncrementalLookbackDays { get; set; } = 7;
-    /// <summary>Initial voucher window size for a history walk. The engine
-    /// shrinks windows adaptively (never grows them within a run) when a window
-    /// times out or takes more than 60% of voucherTimeoutSeconds.</summary>
+    /// <summary>Voucher window size for a history walk — a CHECKPOINT unit, not
+    /// a request. Since v2.4.0 the Day Book is fetched one day at a time
+    /// (SVCURRENTDATE is its only date control), so a 7-day window is 7 small
+    /// requests and one enqueue.
+    ///
+    /// Measured 2026-09-04: the heaviest day observed was 12.6 MB for 85
+    /// vouchers (~148 KB each), against maxResponseMb 256 — roughly 20x
+    /// headroom on a single day, and the per-request size no longer grows with
+    /// the window at all. The window now only decides how much cheap work a
+    /// resumed walk repeats.
+    ///
+    /// Full 2019-2027 walk: ~2,922 daily requests. With the default 2s
+    /// requestPauseSeconds and 5s windowPauseSeconds that is ~2.2 hours of
+    /// deliberate pausing plus request time — comfortably an overnight job.
+    /// Set both pauses to 0 for a backfill run when nobody is using Tally.</summary>
     [JsonPropertyName("fullSyncChunkDays")] public int FullSyncChunkDays { get; set; } = 7;
 
     /// <summary>Is this snapshot report enabled? A per-dataset entry wins over
@@ -175,6 +187,20 @@ public sealed class NotificationSettings
     [JsonPropertyName("enableDailyHealthSummary")] public bool EnableDailyHealthSummary { get; set; } = true;
     /// <summary>Server-local hour (0-23) for the once-daily remote health summary.</summary>
     [JsonPropertyName("dailyHealthHourLocal")] public int DailyHealthHourLocal { get; set; } = 8;
+
+    // ── SMTP, so email alerting is real rather than implied ─────────────
+    // adminEmail and enableEmailAlerts existed long before any code could send
+    // mail, which meant the settings screen promised alerts nobody received.
+    [JsonPropertyName("smtpHost")] public string SmtpHost { get; set; } = "";
+    [JsonPropertyName("smtpPort")] public int SmtpPort { get; set; } = 587;
+    [JsonPropertyName("smtpUser")] public string SmtpUser { get; set; } = "";
+    /// <summary>DPAPI-protected at rest.</summary>
+    [JsonPropertyName("smtpPassword")] public string SmtpPassword { get; set; } = "";
+    [JsonPropertyName("smtpFrom")] public string SmtpFrom { get; set; } = "";
+    [JsonPropertyName("smtpUseTls")] public bool SmtpUseTls { get; set; } = true;
+    /// <summary>Minutes without progress before a running sync counts as
+    /// stalled. The 4-Sep stall sat frozen for far longer than this.</summary>
+    [JsonPropertyName("stalledAfterMinutes")] public int StalledAfterMinutes { get; set; } = 20;
 }
 
 public sealed class AdvancedSettings

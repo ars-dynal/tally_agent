@@ -51,6 +51,11 @@ public static class MasterContentHash
     /// already part of the key and of the preamble below.</summary>
     private const string EnqueueStampedCompanyField = "_company";
 
+    /// <summary>Also stamped at enqueue, and derived deterministically from the
+    /// very columns being hashed — so it adds nothing and would only make the
+    /// hash differ before and after a batch was built.</summary>
+    private const string EnqueueStampedRecordKeyField = DatasetRecordKey.KeyField;
+
     /// <summary>Row without audit or enqueue-stamped fields, keys in ordinal
     /// order. Hashing the same rows before and after an enqueue must give the
     /// same answer: anything the upload path writes onto a row is, by
@@ -60,7 +65,8 @@ public static class MasterContentHash
         var copy = new SortedDictionary<string, object?>(StringComparer.Ordinal);
         foreach (var (key, value) in row)
             if (Array.IndexOf(BatchBuilder.AuditFields, key) < 0 &&
-                key != EnqueueStampedCompanyField)
+                key != EnqueueStampedCompanyField &&
+                key != EnqueueStampedRecordKeyField)
                 copy[key] = value;
         return copy;
     }
