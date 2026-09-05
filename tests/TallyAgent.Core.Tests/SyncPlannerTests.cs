@@ -19,6 +19,55 @@ public class SyncPlannerTests
         new("_vouchers_window", "Co", lastFrom, lastTo,
             SyncPlanner.NewestFirstCheckpointMarker, null, false);
 
+    // ── the walk must be able to RECORD that it finished ─────────────────
+
+    /// <summary>
+    /// The dead-end: a finished walk that can never latch.
+    ///
+    /// Once the frontier reaches the target the planner returns ZERO windows.
+    /// FullSyncDone was only ever set inside the window loop, so the loop never
+    /// ran, the flag never latched, and every run replanned "full" for ever.
+    /// Observed on the server: 85/85 windows, 622,379 records, still full mode.
+    /// </summary>
+    [Fact]
+    public void AWalkThatHasReachedTheTarget_ReportsItselfComplete()
+    {
+        var reached = new SyncCheckpoint("_vouchers_window", "Co",
+            LastFromDate: "2019-04-01", LastToDate: "2026-09-04",
+            LastAlterId: SyncPlanner.NewestFirstCheckpointMarker,
+            LastSuccessUtc: null, FullSyncDone: false);
+
+        var plan = SyncPlanner.PlanVoucherWindows(Settings(start: "2019-04-01"), reached, Today);
+
+        Assert.True(plan.WalkComplete);      // the engine latches on this
+        Assert.Empty(plan.Windows);          // nothing left to extract
+        Assert.Equal(new DateOnly(2019, 4, 1), plan.TargetStart);
+    }
+
+    [Fact]
+    public void AWalkStillInProgress_IsNotReportedComplete_AndResumesFromTheFrontier()
+    {
+        var midway = new SyncCheckpoint("_vouchers_window", "Co",
+            LastFromDate: "2024-01-01", LastToDate: "2026-09-04",
+            LastAlterId: SyncPlanner.NewestFirstCheckpointMarker,
+            LastSuccessUtc: null, FullSyncDone: false);
+
+        var plan = SyncPlanner.PlanVoucherWindows(Settings(start: "2019-04-01"), midway, Today);
+
+        Assert.False(plan.WalkComplete);
+        Assert.NotEmpty(plan.Windows);
+        // Resumes BACKWARDS from the day before the frontier, not from today.
+        Assert.Equal(new DateOnly(2023, 12, 31), plan.Windows[0].To);
+    }
+
+    [Fact]
+    public void AFirstRun_IsNotReportedComplete()
+    {
+        var plan = SyncPlanner.PlanVoucherWindows(Settings(start: "2019-04-01"), null, Today);
+        Assert.False(plan.WalkComplete);
+        Assert.NotEmpty(plan.Windows);
+    }
+
     // ── clamping a window to Tally's books (v2.4.0) ──────────────────────
 
     /// <summary>

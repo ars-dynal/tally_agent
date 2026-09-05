@@ -52,10 +52,21 @@ public sealed class SyncWorker(
                         or Core.Notifications.ErrorCategory.TallyCompanyMismatch;
                     state.TallyCompanyOpen = probe.Ok;
 
+                    // Say WHY the mode was chosen. Without this line, a walk
+                    // that had completed 85/85 windows but never latched its
+                    // checkpoint looked identical to one that had never run,
+                    // and it took a code read to tell them apart.
+                    var company = ResolvedCompany(probe);
+                    var voucherCp = checkpoints.Get("_vouchers_window", company);
                     var mode = forceFull ? "full-forced"
                         : manual ? "manual"
-                        : checkpoints.Get("_vouchers_window", ResolvedCompany(probe)) is { FullSyncDone: true }
-                            ? "incremental" : "full";
+                        : voucherCp is { FullSyncDone: true } ? "incremental" : "full";
+                    log.LogInformation(
+                        "Sync mode '{Mode}' for company '{Company}': FullSyncDone={Done}, " +
+                        "frontier={Frontier}, covered-to={To}{Checkpoint}",
+                        mode, company, voucherCp?.FullSyncDone,
+                        voucherCp?.LastFromDate ?? "none", voucherCp?.LastToDate ?? "none",
+                        voucherCp is null ? " (NO CHECKPOINT ROW - first run, or the company key does not match)" : "");
 
                     // Phase C: THE authoritative exclusion. Zero-wait — a second
                     // request while a run is active never starts extraction; it

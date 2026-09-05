@@ -10,7 +10,7 @@ namespace TallyAgent.Core.Data;
 /// </summary>
 public sealed class AgentDatabase
 {
-    public const int CurrentSchemaVersion = 6;
+    public const int CurrentSchemaVersion = 7;
 
     private readonly string _connectionString;
     private readonly ILogger<AgentDatabase> _log;
@@ -60,6 +60,7 @@ public sealed class AgentDatabase
         if (version < 4) MigrateToV4(conn, tx);
         if (version < 5) MigrateToV5(conn, tx);
         if (version < 6) MigrateToV6(conn, tx);
+        if (version < 7) MigrateToV7(conn, tx);
         // future: additive only
 
         Exec(conn, tx, """
@@ -255,6 +256,27 @@ public sealed class AgentDatabase
               pending_utc     TEXT,
               PRIMARY KEY (dataset, company)
             );
+            """);
+    }
+
+    /// <summary>V7: normalise sync_checkpoints.company. Untrimmed or
+    /// differently-cased values orphan a history walk, because the reader and
+    /// the writer then disagree about the key. Duplicates that collide once
+    /// trimmed are collapsed, keeping the row that actually got furthest.</summary>
+    private static void MigrateToV7(SqliteConnection conn, SqliteTransaction tx)
+    {
+        Exec(conn, tx, """
+            DELETE FROM sync_checkpoints WHERE rowid NOT IN (
+              SELECT rowid FROM (
+                SELECT rowid, ROW_NUMBER() OVER (
+                  PARTITION BY dataset, TRIM(LOWER(company))
+                  ORDER BY full_sync_done DESC, last_success_utc DESC
+                ) AS rn
+                FROM sync_checkpoints
+              ) WHERE rn = 1
+            );
+            UPDATE sync_checkpoints SET company = TRIM(company)
+             WHERE company <> TRIM(company);
             """);
     }
 

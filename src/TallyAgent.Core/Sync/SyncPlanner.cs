@@ -14,7 +14,19 @@ public sealed record VoucherPlan(
     /// <summary>For a full sync: the oldest date the walk must reach. The
     /// engine marks the full sync done when a completed window's From reaches
     /// this date. Null for incremental plans.</summary>
-    DateOnly? TargetStart = null);
+    DateOnly? TargetStart = null,
+    /// <summary>
+    /// The newest-first walk has already reached <see cref="TargetStart"/>:
+    /// there is nothing left to extract and the checkpoint should be latched.
+    ///
+    /// This exists because the walk could otherwise finish and never be RECORDED
+    /// as finished. FullSyncDone was only ever set inside the window loop, and
+    /// once the frontier reaches the target the planner returns ZERO windows —
+    /// so the loop never runs, the flag never latches, and every subsequent run
+    /// replans "full" forever. Observed on the server: 85/85 windows and 622,379
+    /// records, still choosing full mode on every run.
+    /// </summary>
+    bool WalkComplete = false);
 
 /// <summary>
 /// Pure voucher-window planning (extracted from SyncEngine for testability).
@@ -108,7 +120,8 @@ public static class SyncPlanner
                 TryParseIsoDate(checkpoint.LastFromDate) is { } frontier)
             {
                 if (frontier <= target) // walk already reached the start
-                    return new VoucherPlan(windows, IsFullSync: true, 0, target);
+                    return new VoucherPlan(windows, IsFullSync: true, 0, target,
+                        WalkComplete: true);
                 top = frontier.AddDays(-1);
                 if (top > ceiling) top = ceiling;
             }

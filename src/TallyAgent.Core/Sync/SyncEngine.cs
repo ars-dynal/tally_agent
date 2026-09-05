@@ -303,6 +303,24 @@ public sealed class SyncEngine(
                         "while it is outstanding. Run Re-extract All History to apply it.",
                         config.Tally.ExtractionStartDate, company);
 
+                // The walk is finished but was never RECORDED as finished: the
+                // frontier reached the target, so the planner returns no windows,
+                // so the window loop - the only thing that sets FullSyncDone -
+                // never runs. Latch it here or the agent replans a full extract
+                // on every run for ever.
+                if (plan.WalkComplete)
+                {
+                    var done = checkpoints.Get("_vouchers_window", company);
+                    checkpoints.Upsert(new SyncCheckpoint("_vouchers_window", company,
+                        done?.LastFromDate, done?.LastToDate,
+                        SyncPlanner.NewestFirstCheckpointMarker,
+                        DateTime.UtcNow.ToString("O"), FullSyncDone: true));
+                    log.LogInformation(
+                        "Full history walk is complete (frontier {Frontier} reached target " +
+                        "{Target:yyyy-MM-dd}) — checkpoint latched; later runs will be incremental.",
+                        done?.LastFromDate ?? "?", plan.TargetStart);
+                }
+
                 var skipVouchers = vouchersUnchanged && !plan.IsFullSync;
                 if (skipVouchers)
                 {
