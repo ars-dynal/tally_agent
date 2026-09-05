@@ -258,7 +258,10 @@ public class BatchQueueTests : IDisposable
         using var cmd4 = conn.CreateCommand();
         cmd4.CommandText = "SELECT company FROM sync_checkpoints LIMIT 0";
         cmd4.ExecuteReader();                                                // v7 normalises this
-        Assert.Equal(7, AgentDatabase.CurrentSchemaVersion);
+        using var cmd5 = conn.CreateCommand();
+        cmd5.CommandText = "SELECT window_from, datasets_failed FROM sync_runs LIMIT 0";
+        cmd5.ExecuteReader();                                                // v8 run history
+        Assert.Equal(8, AgentDatabase.CurrentSchemaVersion);
     }
 }
 

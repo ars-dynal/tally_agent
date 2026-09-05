@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.IO;
-using System.ServiceProcess;
 using System.Windows;
+using System.Windows.Media;
 using System.Windows.Threading;
 using Microsoft.Extensions.Logging.Abstractions;
 using TallyAgent.Core;
@@ -9,11 +9,23 @@ using TallyAgent.Core.Cloud;
 using TallyAgent.Core.Configuration;
 using TallyAgent.Core.Data;
 using TallyAgent.Core.Diagnostics;
+using TallyAgent.Core.Notifications;
 using TallyAgent.Core.Sync;
 using TallyAgent.Core.Tally;
 
 namespace TallyAgent.Manager;
 
+/// <summary>
+/// The console answers four questions, in this order:
+///   1. Is it healthy?              — one colour, one sentence
+///   2. What did the last run do?   — including which datasets did NOT load
+///   3. What has been sent?         — "how do I know the data got there?"
+///   4. What happened before?       — successes included, not only errors
+///
+/// The version it replaces showed "datasets 14/30" without saying which 16
+/// failed, "Uploaded today: 9" without saying nine of what, and an activity id
+/// like 8dc3a1ee5328 that means nothing to a person.
+/// </summary>
 public partial class MainWindow : Window
 {
     private readonly DispatcherTimer _refreshTimer;
@@ -23,10 +35,9 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        VersionText.Text = $"v{AgentInfo.Version}";
         _refreshTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
-        _refreshTimer.Tick += (_, _) => RefreshStatus();
-        Loaded += (_, _) => { LoadBackend(); RefreshStatus(); _refreshTimer.Start(); };
+        _refreshTimer.Tick += (_, _) => Refresh();
+        Loaded += (_, _) => { LoadBackend(); Refresh(); _refreshTimer.Start(); };
         Closed += (_, _) => _refreshTimer.Stop();
     }
 
@@ -39,385 +50,313 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            _config = null;
-            FooterText.Text = $"Configuration problem: {ex.Message}";
+            SetHealth("Not configured", ex.Message, Warn);
         }
     }
 
-    // ── status refresh ────────────────────────────────────────────
+    private static readonly Brush Good = new SolidColorBrush(Color.FromRgb(0x10, 0x7C, 0x10));
+    private static readonly Brush Bad = new SolidColorBrush(Color.FromRgb(0xA4, 0x26, 0x2C));
+    private static readonly Brush Warn = new SolidColorBrush(Color.FromRgb(0xB7, 0x6E, 0x00));
+    private static readonly Brush Busy = new SolidColorBrush(Color.FromRgb(0x00, 0x5A, 0x9E));
 
-    /// <summary>Renders progress.json, written by the service as it works, so
-    /// this window can show what is happening right now instead of only a list
-    /// of past errors. A snapshot that still says "running" but has not been
-    /// touched for five minutes is shown as stalled, not as healthy progress.</summary>
-    private void RefreshProgress()
+    private void SetHealth(string headline, string detail, Brush colour)
     {
-        var p = SyncProgressStore.Read();
-        if (p is null)
-        {
-            RunStatusText.Text = "idle";
-            RunStatusText.Foreground = System.Windows.Media.Brushes.Gray;
-            RunOperationText.Text = "Nothing running";
-            RunProgressBar.IsIndeterminate = false;
-            RunProgressBar.Value = 0;
-            RunCountsText.Text = "";
-            RunRangeText.Text = "";
-            return;
-        }
-
-        var fresh = DateTime.TryParse(p.UpdatedUtc, null,
-            System.Globalization.DateTimeStyles.RoundtripKind, out var updated)
-            && (DateTime.UtcNow - updated.ToUniversalTime()) < TimeSpan.FromMinutes(5);
-        var isRunning = p.Status == "running" && fresh;
-        var stalled = p.Status == "running" && !fresh;
-
-        RunStatusText.Text = stalled ? "stalled (no update for 5 min)" : p.Status;
-        RunStatusText.Foreground = stalled
-            ? System.Windows.Media.Brushes.OrangeRed
-            : p.Status switch
-            {
-                "running" => System.Windows.Media.Brushes.DodgerBlue,
-                "success" => System.Windows.Media.Brushes.Green,
-                "partial" => System.Windows.Media.Brushes.DarkOrange,
-                "failed" or "cancelled" => System.Windows.Media.Brushes.Red,
-                _ => System.Windows.Media.Brushes.Gray,
-            };
-
-        RunOperationText.Text = isRunning || stalled
-            ? DescribeOperation(p.Operation)
-            : "Nothing running";
-
-        var pct = p.WindowsTotal > 0
-            ? 100.0 * p.WindowsDone / p.WindowsTotal
-            : p.DatasetsTotal > 0 ? 100.0 * p.DatasetsDone / p.DatasetsTotal
-            : 0.0;
-        RunProgressBar.IsIndeterminate =
-            isRunning && p.WindowsTotal == 0 && p.DatasetsTotal == 0;
-        RunProgressBar.Value = Math.Clamp(pct, 0, 100);
-
-        var parts = new List<string>();
-        if (p.DatasetsTotal > 0) parts.Add($"datasets {p.DatasetsDone}/{p.DatasetsTotal}");
-        if (p.WindowsTotal > 0) parts.Add($"date windows {p.WindowsDone}/{p.WindowsTotal}");
-        parts.Add($"{p.Rows:N0} records this run");
-        if (DateTime.TryParse(p.StartedUtc, null,
-                System.Globalization.DateTimeStyles.RoundtripKind, out var startedAt))
-        {
-            var elapsed = DateTime.UtcNow - startedAt.ToUniversalTime();
-            if (elapsed > TimeSpan.Zero)
-                parts.Add($"{elapsed:hh\\:mm\\:ss} elapsed");
-        }
-        RunCountsText.Text = string.Join("   \u00b7   ", parts);
-
-        var rangeFrom = string.IsNullOrWhiteSpace(p.RangeFrom)
-            ? "start of this financial year" : p.RangeFrom;
-        var range = $"Mode: {p.Mode}   \u00b7   Extracting {rangeFrom} to {p.RangeTo}";
-        if (!string.IsNullOrWhiteSpace(p.Message)) range += $"   \u00b7   {p.Message}";
-        RunRangeText.Text = range;
+        HealthText.Text = headline;
+        HealthText.Foreground = colour;
+        HealthDetail.Text = detail;
     }
 
-    /// <summary>Turns an internal operation string into something readable.</summary>
-    private static string DescribeOperation(string op)
-    {
-        if (op.StartsWith("extract:vouchers", StringComparison.Ordinal))
-        {
-            var w = op["extract:vouchers".Length..].Trim();
-            return w.Length == 0
-                ? "Reading vouchers from Tally"
-                : $"Reading vouchers from Tally for {w.Replace("..", " to ")}";
-        }
-        if (op.StartsWith("extract:", StringComparison.Ordinal))
-            return $"Reading {op["extract:".Length..].Replace('_', ' ')} from Tally";
-        return op switch
-        {
-            "preflight" => "Checking that Tally is reachable",
-            "idle" or "" => "Nothing running",
-            _ => op,
-        };
-    }
+    private static string Local(string? utc) =>
+        DateTime.TryParse(utc, null, System.Globalization.DateTimeStyles.RoundtripKind, out var t)
+            ? t.ToLocalTime().ToString("dd MMM HH:mm") : "—";
 
-    private void RefreshStatus()
-    {
-        RefreshProgress();
-        ServiceStatusText.Text = GetServiceStatus(out var running);
-        ServiceStatusText.Foreground = running
-            ? System.Windows.Media.Brushes.Green : System.Windows.Media.Brushes.Red;
-
-        if (_config is null || _db is null)
-        {
-            CompanyText.Text = "(not configured)";
-            return;
-        }
-
-        CompanyText.Text = string.IsNullOrWhiteSpace(_config.Tally.Company)
-            ? "(auto-discover)" : _config.Tally.Company;
-        EnvironmentText.Text = _config.Cloud.Environment;
-
-        try
-        {
-            var queue = new BatchQueueRepository(_db);
-            var stats = queue.GetStats();
-            PendingText.Text = stats.Pending.ToString();
-            FailedText.Text = stats.Failed.ToString();
-            AckedText.Text = stats.AckedToday.ToString();
-            RetryBtn.IsEnabled = stats.Failed > 0;
-
-            var checkpoints = new CheckpointRepository(_db);
-            var lastSync = checkpoints.GetLastSuccessfulSyncUtc();
-            LastSyncText.Text = lastSync is null ? "never"
-                : DateTime.TryParse(lastSync, null, System.Globalization.DateTimeStyles.RoundtripKind, out var dt)
-                    ? dt.ToLocalTime().ToString("dd MMM yyyy, h:mm tt") : lastSync;
-
-            var errors = new ErrorLogRepository(_db);
-            ErrorsGrid.ItemsSource = errors.Recent(30);
-
-            var runs = LatestRunOperation();
-            ActivityText.Text = runs ?? "idle";
-        }
-        catch (Exception ex)
-        {
-            FooterText.Text = $"Status read error: {ex.Message}";
-        }
-    }
-
-    private string? LatestRunOperation()
-    {
-        try
-        {
-            using var conn = _db!.Open();
-            using var cmd = conn.CreateCommand();
-            // mode + status + sync id, e.g. "incremental sync (success) · id a1b2c3d4e5f6"
-            cmd.CommandText = """
-                SELECT mode || ' sync (' || status || ') · id ' || sync_id
-                FROM sync_runs ORDER BY started_utc DESC LIMIT 1
-                """;
-            return cmd.ExecuteScalar() as string;
-        }
-        catch { return null; }
-    }
-
-    private static string GetServiceStatus(out bool running)
-    {
-        running = false;
-        try
-        {
-            using var sc = new ServiceController(AgentInfo.ServiceName);
-            running = sc.Status == ServiceControllerStatus.Running;
-            return sc.Status.ToString();
-        }
-        catch
-        {
-            return "Not installed";
-        }
-    }
-
-    // ── button handlers ───────────────────────────────────────────
-
-    private async void TestTally_Click(object sender, RoutedEventArgs e)
-    {
-        if (_config is null) { Warn("Configure the agent first."); return; }
-        TestTallyBtn.IsEnabled = false;
-        try
-        {
-            var client = new TallyClient(_config.Tally, NullLogger<TallyClient>.Instance);
-            var probe = await client.ProbeAsync();
-            TallyStatusText.Text = probe.Ok ? "Connected" : "Failed";
-            TallyStatusText.Foreground = probe.Ok
-                ? System.Windows.Media.Brushes.Green : System.Windows.Media.Brushes.Red;
-            MessageBox.Show(this,
-                probe.Ok
-                    ? $"Tally is reachable.\n\nOpen companies:\n• {string.Join("\n• ", probe.Companies)}"
-                    : $"Tally connection failed:\n\n{probe.Error}",
-                "Test Tally Connection",
-                MessageBoxButton.OK, probe.Ok ? MessageBoxImage.Information : MessageBoxImage.Warning);
-        }
-        finally { TestTallyBtn.IsEnabled = true; }
-    }
-
-    private async void TestCloud_Click(object sender, RoutedEventArgs e)
-    {
-        if (_config is null) { Warn("Configure the agent first."); return; }
-        TestCloudBtn.IsEnabled = false;
-        try
-        {
-            var api = new IngestionApiClient(_config, NullLogger<IngestionApiClient>.Instance);
-            var ping = await api.PingAsync();
-            CloudStatusText.Text = ping.Ok ? "Connected" : "Failed";
-            CloudStatusText.Foreground = ping.Ok
-                ? System.Windows.Media.Brushes.Green : System.Windows.Media.Brushes.Red;
-            MessageBox.Show(this,
-                ping.Ok ? $"Cloud ingestion API is reachable.\nServer time: {ping.ServerTime}"
-                        : "Cloud API responded but reported not-OK.",
-                "Test Cloud Connection",
-                MessageBoxButton.OK, ping.Ok ? MessageBoxImage.Information : MessageBoxImage.Warning);
-        }
-        catch (Exception ex)
-        {
-            CloudStatusText.Text = "Failed";
-            CloudStatusText.Foreground = System.Windows.Media.Brushes.Red;
-            MessageBox.Show(this, $"Cloud connection failed:\n\n{ex.Message}",
-                "Test Cloud Connection", MessageBoxButton.OK, MessageBoxImage.Warning);
-        }
-        finally { TestCloudBtn.IsEnabled = true; }
-    }
-
-    private void StartService_Click(object sender, RoutedEventArgs e) =>
-        ControlService(sc => { sc.Start(); sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30)); }, "started");
-
-    private void StopService_Click(object sender, RoutedEventArgs e) =>
-        ControlService(sc => { sc.Stop(); sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(45)); }, "stopped");
-
-    private void RestartService_Click(object sender, RoutedEventArgs e) =>
-        ControlService(sc =>
-        {
-            if (sc.Status != ServiceControllerStatus.Stopped)
-            {
-                sc.Stop();
-                sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(45));
-            }
-            sc.Start();
-            sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30));
-        }, "restarted");
-
-    private void ControlService(Action<ServiceController> action, string verb)
-    {
-        try
-        {
-            using var sc = new ServiceController(AgentInfo.ServiceName);
-            action(sc);
-            RefreshStatus();
-            FooterText.Text = $"Service {verb}.";
-        }
-        catch (InvalidOperationException ex) when (ex.InnerException is System.ComponentModel.Win32Exception w
-            && w.NativeErrorCode == 5)
-        {
-            Warn("Access denied. Right-click the app and choose 'Run as administrator' to control the service.");
-        }
-        catch (Exception ex)
-        {
-            Warn($"Service control failed: {ex.Message}");
-        }
-    }
-
-    private void ForceFull_Click(object sender, RoutedEventArgs e)
-    {
-        var officeHours = DateTime.Now.Hour is >= 9 and < 20
-            && DateTime.Now.DayOfWeek is not (DayOfWeek.Saturday or DayOfWeek.Sunday);
-        var confirm = MessageBox.Show(this,
-            "This re-extracts the ENTIRE voucher history from the configured start " +
-            "date — every financial year, from the beginning.\n\n" +
-            "It takes SEVERAL HOURS and Tally will be slow for anyone using it the " +
-            "whole time.\n\n" +
-            "You do not need this for normal operation: the hourly sync already keeps " +
-            "everything up to date. Use it only if data is found to be missing.\n\n" +
-            (officeHours
-                ? "It is currently office hours. Running this now will affect people " +
-                  "working in Tally. Consider running it this evening instead.\n\n"
-                : "")
-            + "Continue?",
-            "Re-extract All History", MessageBoxButton.YesNo, MessageBoxImage.Warning);
-        if (confirm != MessageBoxResult.Yes) return;
-        try
-        {
-            AgentInfo.EnsureDirectories();
-            File.WriteAllText(Path.Combine(AgentInfo.TriggerDir, "force-full.trigger"),
-                DateTime.UtcNow.ToString("O"));
-            FooterText.Text = "Force Full Sync requested — the service will restart the full history walk.";
-        }
-        catch (Exception ex) { Warn($"Could not request full sync: {ex.Message}"); }
-    }
-
-    private void SyncNow_Click(object sender, RoutedEventArgs e)
-    {
-        try
-        {
-            AgentInfo.EnsureDirectories();
-            File.WriteAllText(Path.Combine(AgentInfo.TriggerDir, "sync-now.trigger"),
-                DateTime.UtcNow.ToString("O"));
-            FooterText.Text = "Sync requested — the service will start a cycle within a few seconds.";
-        }
-        catch (Exception ex) { Warn($"Could not request sync: {ex.Message}"); }
-    }
-
-    private void RetryFailed_Click(object sender, RoutedEventArgs e)
+    private void Refresh()
     {
         if (_db is null) return;
         try
         {
-            // Shares the machine-wide sync exclusion (Phase C2): queue mutation
-            // is refused while a sync run is active, with the active run named.
-            using var coordinator = new TallyAgent.Core.Sync.SyncCoordinator();
-            var lease = coordinator.TryAcquireAsync("retry-failed",
-                Guid.NewGuid().ToString("N")[..12], TimeSpan.Zero, CancellationToken.None)
-                .GetAwaiter().GetResult();
-            if (!lease.Acquired)
-            {
-                Warn($"A sync run is currently active (run {lease.ActiveRun?.RunId ?? "unknown"}). " +
-                     "Retry Failed Batches was not started — try again after the run completes.");
-                return;
-            }
-            int n;
-            try { n = new BatchQueueRepository(_db).RetryAllFailed(); }
-            finally { coordinator.Release(); }
-            FooterText.Text = $"Requeued {n} failed batch(es).";
-            RefreshStatus();
+            var runs = new RunHistoryRepository(_db);
+            var progress = SyncProgressStore.Read();
+            var last = runs.Latest();
+
+            RefreshHealth(progress, last);
+            RefreshLastRun(progress, last);
+            RefreshDelivery(runs);
+            RefreshHistory(runs);
+            RefreshProblems();
+            RefreshButtons();
         }
-        catch (Exception ex) { Warn($"Retry failed: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            SetHealth("Cannot read the agent's status", ex.Message, Warn);
+        }
     }
 
-    private void OpenLogs_Click(object sender, RoutedEventArgs e)
+    // ── 1. Is it healthy? ────────────────────────────────────────────────
+    private void RefreshHealth(SyncProgressSnapshot? p, RunRecord? last)
+    {
+        if (p is { Status: "running" })
+        {
+            SetHealth($"Running — {Describe(p.Operation)}",
+                $"{p.Rows:N0} records so far, {p.DatasetsDone} of {p.DatasetsTotal} datasets" +
+                (p.WindowsTotal > 0 ? $", window {p.WindowsDone} of {p.WindowsTotal}" : "") +
+                $". Started {Local(p.StartedUtc)}.", Busy);
+            return;
+        }
+
+        if (last is null)
+        {
+            SetHealth("No sync has run yet",
+                "Press “Sync now” once Tally is open and the settings are filled in.", Warn);
+            return;
+        }
+
+        var missing = last.DatasetsAttempted - last.DatasetsSucceeded;
+        switch (last.Status)
+        {
+            case "success":
+                SetHealth($"Healthy — last sync completed {Local(last.FinishedUtc)}, " +
+                          $"all {last.DatasetsSucceeded} datasets",
+                    $"{last.RecordsQueued:N0} records, {last.Mode} run" +
+                    (last.WindowFrom is null ? "" : $", {last.WindowFrom} to {last.WindowTo}") + ".", Good);
+                break;
+
+            case "partial":
+                SetHealth($"Incomplete — last sync at {Local(last.FinishedUtc)} loaded " +
+                          $"{last.DatasetsSucceeded} of {last.DatasetsAttempted} datasets, " +
+                          $"{missing} did not load",
+                    "See the “Last run” tab for which ones and why.", Warn);
+                break;
+
+            case "running":
+                SetHealth("A sync is in progress", $"Started {Local(last.StartedUtc)}.", Busy);
+                break;
+
+            case "abandoned":
+                SetHealth($"Interrupted — the run started {Local(last.StartedUtc)} did not finish",
+                    "The service stopped mid-run. It resumes from its checkpoint; no data is lost.", Warn);
+                break;
+
+            default:
+                SetHealth($"Failed — last sync at {Local(last.FinishedUtc)}" +
+                          (missing > 0 ? $", {missing} datasets not loaded" : ""),
+                    FirstPlainReason(last) ?? last.ErrorMessage ?? "See the “Problems” tab.", Bad);
+                break;
+        }
+    }
+
+    private static string? FirstPlainReason(RunRecord r) =>
+        r.Failures().Count > 0 ? $"{r.Failures()[0].Dataset}: {r.Failures()[0].Reason}" : null;
+
+    /// <summary>"extract:ledgers" is not a sentence.</summary>
+    private static string Describe(string operation)
+    {
+        if (operation.StartsWith("extract:vouchers", StringComparison.OrdinalIgnoreCase))
+            return "reading vouchers from Tally " + operation[(operation.IndexOf(' ') + 1)..];
+        if (operation.StartsWith("extract:", StringComparison.OrdinalIgnoreCase))
+            return "reading " + operation["extract:".Length..].Replace('_', ' ') + " from Tally";
+        return operation switch
+        {
+            "preflight" => "checking Tally is reachable",
+            "idle" => "idle",
+            _ => operation,
+        };
+    }
+
+    // ── 2. What did the last run do? ─────────────────────────────────────
+    private void RefreshLastRun(SyncProgressSnapshot? p, RunRecord? last)
+    {
+        ProgressText.Text = p is { Status: "running" }
+            ? $"In progress: {Describe(p.Operation)} — {p.Rows:N0} records so far."
+            : "";
+
+        if (last is null) { LastRunSummary.Text = "Nothing has run yet."; return; }
+
+        LastRunHeading.Text = $"Last run — {last.Mode}, {last.Status}";
+        var took = last.Duration is { } d ? $"{d.TotalMinutes:F0} min" : "—";
+        LastRunSummary.Text =
+            $"Started {Local(last.StartedUtc)}, finished {Local(last.FinishedUtc)} ({took}).  " +
+            (last.WindowFrom is null ? "Masters and reports only.  "
+                                     : $"Covered {last.WindowFrom} to {last.WindowTo}.  ") +
+            $"{last.DatasetsSucceeded} of {last.DatasetsAttempted} datasets loaded, " +
+            $"{last.RecordsQueued:N0} records queued for upload.";
+
+        var failures = last.Failures();
+        FailedGrid.ItemsSource = failures.Select(f => new { f.Dataset, f.Reason }).ToList();
+        NoFailuresText.Visibility = failures.Count == 0 && last.Status == "success"
+            ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    // ── 3. What has been sent to the cloud? ──────────────────────────────
+    private void RefreshDelivery(RunHistoryRepository runs)
+    {
+        DeliveryGrid.ItemsSource = runs.DeliveryByDataset().Select(d => new
+        {
+            d.Dataset,
+            Accepted = d.Acked.ToString("N0"),
+            Pending = d.Pending == 0 ? "—" : d.Pending.ToString("N0"),
+            Failed = d.Failed == 0 ? "—" : d.Failed.ToString("N0"),
+            LastAccepted = Local(d.LastAckUtc),
+        }).ToList();
+    }
+
+    // ── 4. Run history ───────────────────────────────────────────────────
+    private void RefreshHistory(RunHistoryRepository runs)
+    {
+        HistoryGrid.ItemsSource = runs.Recent(20).Select(r => new
+        {
+            Started = Local(r.StartedUtc),
+            r.Mode,
+            Window = r.WindowFrom is null ? "masters/reports" : $"{r.WindowFrom} → {r.WindowTo}",
+            Datasets = $"{r.DatasetsSucceeded}/{r.DatasetsAttempted}",
+            Records = r.RecordsQueued.ToString("N0"),
+            Duration = r.Duration is { } d ? $"{d.TotalMinutes:F0}m" : "—",
+            Status = r.Status == "success" ? "completed"
+                   : r.Status == "partial" ? $"incomplete ({r.Failures().Count} datasets)"
+                   : r.Status,
+        }).ToList();
+    }
+
+    // ── errors in plain language ─────────────────────────────────────────
+    private void RefreshProblems()
+    {
+        if (_db is null) return;
+        var rows = new List<object>();
+        using var conn = _db.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText =
+            "SELECT ts_utc, category, message FROM error_log ORDER BY ts_utc DESC LIMIT 40";
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            var explanation = PlainLanguage.Describe(r.GetString(1));
+            rows.Add(new { When = Local(r.GetString(0)), explanation.What, explanation.Action });
+        }
+        ErrorGrid.ItemsSource = rows;
+    }
+
+    private void RefreshButtons()
+    {
+        var lookback = _config?.Tally.IncrementalLookbackDays ?? 7;
+        var from = DateTime.Today.AddDays(-lookback);
+        SyncNowBtn.ToolTip =
+            $"Reads {from:dd MMM yyyy} to {DateTime.Today:dd MMM yyyy} — the last {lookback} days " +
+            "plus anything missed since the last run. Usually under a minute.";
+    }
+
+    // ── actions ──────────────────────────────────────────────────────────
+    private void SyncNow_Click(object sender, RoutedEventArgs e)
+    {
+        var lookback = _config?.Tally.IncrementalLookbackDays ?? 7;
+        var from = DateTime.Today.AddDays(-lookback);
+        if (MessageBox.Show(this,
+                $"Read {from:dd MMM yyyy} to {DateTime.Today:dd MMM yyyy} from Tally?\n\n" +
+                "This is the routine catch-up: recent vouchers, masters and the daily reports. " +
+                "It normally takes under a minute.",
+                "Sync now", MessageBoxButton.OKCancel, MessageBoxImage.Question) != MessageBoxResult.OK)
+            return;
+        WriteTrigger("sync-now", "Sync requested — the service will start within a few seconds.");
+    }
+
+    private void FullResync_Click(object sender, RoutedEventArgs e)
+    {
+        var office = DateTime.Now.Hour is >= 9 and < 20;
+        if (MessageBox.Show(this,
+                "Re-read the ENTIRE history from Tally?\n\n" +
+                "Reads 2019 to date — roughly 2 hours, and heavy load on Tally the whole time. " +
+                "Everything already collected is re-read; nothing is deleted.\n\n" +
+                (office ? "It is currently office hours. People working in Tally will feel this. " +
+                          "Consider running it this evening instead.\n\n" : "") +
+                "Continue?",
+                "Full re-extract", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+            return;
+        WriteTrigger("force-full", "Full re-extract requested — the service will restart the history walk.");
+    }
+
+    private void WriteTrigger(string name, string message)
     {
         try
         {
             AgentInfo.EnsureDirectories();
-            Process.Start(new ProcessStartInfo("explorer.exe", AgentInfo.LogsDir) { UseShellExecute = true });
+            File.WriteAllText(Path.Combine(AgentInfo.TriggerDir, $"{name}.trigger"),
+                DateTime.UtcNow.ToString("O"));
+            FooterText.Text = message;
         }
-        catch (Exception ex) { Warn(ex.Message); }
+        catch (Exception ex) { FooterText.Text = $"Could not request it: {ex.Message}"; }
     }
 
-    private void ExportDiag_Click(object sender, RoutedEventArgs e)
+    private async void TestTally_Click(object sender, RoutedEventArgs e)
     {
-        if (_config is null || _db is null) { Warn("Configure the agent first."); return; }
+        if (_config is null) return;
+        FooterText.Text = "Testing Tally…";
         try
         {
-            var exporter = new DiagnosticsExporter(_config,
-                new BatchQueueRepository(_db), new ErrorLogRepository(_db), new CheckpointRepository(_db));
-            var path = exporter.Export();
-            Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = true });
-            FooterText.Text = $"Diagnostics exported: {path}";
+            using var client = new TallyClient(_config.Tally, NullLogger<TallyClient>.Instance);
+            var probe = await client.ProbeAsync();
+            FooterText.Text = probe.Ok
+                ? $"Tally is reachable. Open companies: {string.Join(", ", probe.Companies)}"
+                : $"Tally: {PlainLanguage.Describe(probe.Category ?? ErrorCategory.TallyNotRunning).What} " +
+                  PlainLanguage.Describe(probe.Category ?? ErrorCategory.TallyNotRunning).Action;
         }
-        catch (Exception ex) { Warn($"Export failed: {ex.Message}"); }
+        catch (Exception ex) { FooterText.Text = $"Tally test failed: {ex.Message}"; }
     }
 
-    private void EditConfig_Click(object sender, RoutedEventArgs e)
+    private async void TestCloud_Click(object sender, RoutedEventArgs e)
     {
-        var win = new ConfigWindow { Owner = this };
-        if (win.ShowDialog() == true)
+        if (_config is null) return;
+        FooterText.Text = "Testing the ingestion API…";
+        try
+        {
+            var api = new IngestionApiClient(_config, NullLogger<IngestionApiClient>.Instance);
+            var ping = await api.PingAsync();
+            FooterText.Text = ping.Ok
+                ? $"Ingestion API reachable (server time {ping.ServerTime})."
+                : "The ingestion API answered but reported a problem.";
+        }
+        catch (CloudApiException ex)
+        {
+            var p = PlainLanguage.Describe(ex.Category);
+            FooterText.Text = $"{p.What} {p.Action}";
+        }
+        catch (Exception ex) { FooterText.Text = $"Cloud test failed: {ex.Message}"; }
+    }
+
+    private void Retry_Click(object sender, RoutedEventArgs e)
+    {
+        if (_db is null) return;
+        try
+        {
+            var n = new BatchQueueRepository(_db).RetryAllFailed();
+            FooterText.Text = n == 0 ? "Nothing was stuck." : $"{n} stuck upload(s) queued to try again.";
+        }
+        catch (Exception ex) { FooterText.Text = $"Retry failed: {ex.Message}"; }
+    }
+
+    private void Config_Click(object sender, RoutedEventArgs e)
+    {
+        if (new ConfigWindow { Owner = this }.ShowDialog() == true)
         {
             LoadBackend();
-
-            // v2.1.0: the running service loaded config.json at startup and does
-            // not re-read it. Telling the operator to "restart to apply" was a
-            // trap - a saved change looked applied and silently was not, and a
-            // full sync ran against the old settings. Do the restart here.
-            var wasRunning = false;
-            try
-            {
-                using var probe = new ServiceController(AgentInfo.ServiceName);
-                wasRunning = probe.Status == ServiceControllerStatus.Running;
-            }
-            catch { /* service not installed - nothing to restart */ }
-
-            if (wasRunning)
-                RestartService_Click(sender, e);   // reports its own outcome
-            else
-                FooterText.Text = "Configuration saved. Start the service to apply it.";
-
-            RefreshStatus();
+            FooterText.Text = "Settings saved — the service is restarting to pick them up.";
         }
     }
 
-    private void Refresh_Click(object sender, RoutedEventArgs e) => RefreshStatus();
+    private void Logs_Click(object sender, RoutedEventArgs e)
+    {
+        try { Process.Start(new ProcessStartInfo(AgentInfo.LogsDir) { UseShellExecute = true }); }
+        catch (Exception ex) { FooterText.Text = $"Could not open the log folder: {ex.Message}"; }
+    }
 
-    private void Warn(string message) =>
-        MessageBox.Show(this, message, "Tally BigQuery Agent", MessageBoxButton.OK, MessageBoxImage.Warning);
+    private void Diagnostics_Click(object sender, RoutedEventArgs e)
+    {
+        if (_config is null || _db is null) return;
+        try
+        {
+            var path = new DiagnosticsExporter(_config, new BatchQueueRepository(_db),
+                new ErrorLogRepository(_db), new CheckpointRepository(_db)).Export();
+            Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = true });
+            FooterText.Text = $"Diagnostics written to {path}";
+        }
+        catch (Exception ex) { FooterText.Text = $"Diagnostics export failed: {ex.Message}"; }
+    }
 }

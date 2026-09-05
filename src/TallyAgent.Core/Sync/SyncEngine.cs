@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging;
 using TallyAgent.Core.Configuration;
 using TallyAgent.Core.Data;
 using TallyAgent.Core.Notifications;
+using TallyAgent.Core.Notifications;
 using TallyAgent.Core.Tally;
 using TallyAgent.Core.Tally.Extractors;
 
@@ -76,6 +77,7 @@ public sealed class SyncEngine(
         // rows abandoned so the console never shows a phantom active run and
         // nothing can key decisions off a stale 'running' row.
         MarkAbandonedRuns();
+        PruneRunHistory();
         // Arm the per-run Tally retry budget (Phase F8): timeouts/reconnects
         // across ALL datasets and windows share one bounded pool this cycle.
         tally.ResetRunBudget(config.Tally.MaxRetriesPerRun);
@@ -95,6 +97,10 @@ public sealed class SyncEngine(
         _progress.RangeTo = string.IsNullOrWhiteSpace(config.Tally.ExtractionEndDate)
             ? "today" : config.Tally.ExtractionEndDate;
         var errorList = new List<string>();
+        // Dataset -> why it did not load. The console must be able to NAME the
+        // failures; "14 of 30" tells an operator nothing about which 16.
+        var failedDatasets = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string? windowFrom = null, windowTo = null;
         var extractedCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         int ok = 0, failed = 0;
         long totalRows = 0;
@@ -246,14 +252,14 @@ public sealed class SyncEngine(
                 {
                     // Tally is busy/exhausted: stop asking it for anything this cycle.
                     failed++;
-                    await HandleDatasetErrorAsync(ds.Name, tex, errorList);
+                    await HandleDatasetErrorAsync(ds.Name, tex, errorList, failedDatasets);
                     runEnded = true;
                     break;
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     failed++;
-                    await HandleDatasetErrorAsync(ds.Name, ex, errorList);
+                    await HandleDatasetErrorAsync(ds.Name, ex, errorList, failedDatasets);
                 }
             }
 
@@ -389,6 +395,8 @@ public sealed class SyncEngine(
                                 EnqueueAndCheckpoint(name, company, syncId, rows, wf, wt,
                                     fullDone: false);
                             }
+                            windowFrom ??= from.ToString("yyyy-MM-dd");
+                            windowTo = winTo.ToString("yyyy-MM-dd");
                             AdvanceVoucherWindowCheckpoint(company, from, winTo, plan.TargetStart);
                             RecordWindowCoverage(syncId, "vouchers", from, winTo,
                                 result.VoucherHeaders.Count, result.MinVoucherDate,
@@ -457,7 +465,7 @@ public sealed class SyncEngine(
                         {
                             failed++;
                             RecordWindowCoverage(syncId, "vouchers", from, to, 0, null, null, "failed");
-                            await HandleDatasetErrorAsync($"vouchers[{from:yyyy-MM-dd}..{to:yyyy-MM-dd}]", ex, errorList);
+                            await HandleDatasetErrorAsync($"vouchers[{from:yyyy-MM-dd}..{to:yyyy-MM-dd}]", ex, errorList, failedDatasets);
                             break; // resume from the last successful checkpoint next cycle
                         }
                     }
@@ -478,7 +486,8 @@ public sealed class SyncEngine(
             _progress.Rows = totalRows;
             _progress.Message = errorList.Count > 0 ? string.Join("; ", errorList) : "";
             RecordRunFinish(syncId, status, totalRows,
-                errorList.Count > 0 ? string.Join("; ", errorList) : null);
+                errorList.Count > 0 ? string.Join("; ", errorList) : null,
+                windowFrom, windowTo, enabled.Count, ok, failedDatasets);
             log.LogInformation("Sync {SyncId} {Status}: {Rows} rows, {Ok} ok, {Failed} failed ({Elapsed:F0}s)",
                 syncId, status, totalRows, ok, failed, (DateTime.UtcNow - started).TotalSeconds);
             return new SyncResult(syncId, status, ok, failed, totalRows, errorList);
@@ -910,8 +919,10 @@ public sealed class SyncEngine(
                 $"(limit {config.Advanced.QueueDiskLimitMb} MB). Uploads must drain before extracting more.");
     }
 
-    private async Task HandleDatasetErrorAsync(string dataset, Exception ex, List<string> errorList)
+    private async Task HandleDatasetErrorAsync(string dataset, Exception ex, List<string> errorList,
+        Dictionary<string, string>? failedDatasets = null)
     {
+        failedDatasets?.TryAdd(dataset, PlainLanguage.Explain(ex));
         var category = ex is TallyException tex ? tex.Category : ErrorCategory.UnexpectedException;
         var severity = category == ErrorCategory.DiskSpaceLow ? ErrorSeverity.Critical : ErrorSeverity.Error;
         await reporter.ReportAsync(category, severity, ex.Message, ex.StackTrace,
@@ -977,6 +988,22 @@ public sealed class SyncEngine(
         }
     }
 
+    /// <summary>Run history answers "did last night work?", so 30 days is
+    /// plenty and an unbounded table on an operator's machine is not.</summary>
+    private void PruneRunHistory()
+    {
+        try
+        {
+            using var conn = db.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM sync_runs WHERE started_utc < $cutoff";
+            cmd.Parameters.AddWithValue("$cutoff", DateTime.UtcNow.AddDays(-30).ToString("O"));
+            var n = cmd.ExecuteNonQuery();
+            if (n > 0) log.LogDebug("Pruned {N} sync run(s) older than 30 days", n);
+        }
+        catch (Exception ex) { log.LogWarning("Run-history prune failed ({Msg})", ex.Message); }
+    }
+
     private void RecordRunStart(string syncId, string mode)
     {
         using var conn = db.Open();
@@ -991,18 +1018,30 @@ public sealed class SyncEngine(
         cmd.ExecuteNonQuery();
     }
 
-    private void RecordRunFinish(string syncId, string status, long rows, string? error)
+    private void RecordRunFinish(string syncId, string status, long rows, string? error,
+        string? windowFrom = null, string? windowTo = null,
+        int attempted = 0, int succeeded = 0,
+        IReadOnlyDictionary<string, string>? failedDatasets = null)
     {
         using var conn = db.Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            UPDATE sync_runs SET finished_utc=$ts, status=$st, rows_total=$rows, error_message=$err
+            UPDATE sync_runs SET finished_utc=$ts, status=$st, rows_total=$rows, error_message=$err,
+                   window_from=$wf, window_to=$wt, datasets_attempted=$att,
+                   datasets_succeeded=$ok, records_queued=$rows, datasets_failed=$failed
             WHERE sync_id=$id
             """;
         cmd.Parameters.AddWithValue("$ts", DateTime.UtcNow.ToString("O"));
         cmd.Parameters.AddWithValue("$st", status);
         cmd.Parameters.AddWithValue("$rows", rows);
         cmd.Parameters.AddWithValue("$err", (object?)error ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$wf", (object?)windowFrom ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$wt", (object?)windowTo ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$att", attempted);
+        cmd.Parameters.AddWithValue("$ok", succeeded);
+        cmd.Parameters.AddWithValue("$failed", failedDatasets is { Count: > 0 }
+            ? string.Join("\n", failedDatasets.Select(kv => $"{kv.Key}: {kv.Value}"))
+            : (object)DBNull.Value);
         cmd.Parameters.AddWithValue("$id", syncId);
         cmd.ExecuteNonQuery();
     }

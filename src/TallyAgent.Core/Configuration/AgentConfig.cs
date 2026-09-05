@@ -187,6 +187,20 @@ public sealed class NotificationSettings
     [JsonPropertyName("enableDailyHealthSummary")] public bool EnableDailyHealthSummary { get; set; } = true;
     /// <summary>Server-local hour (0-23) for the once-daily remote health summary.</summary>
     [JsonPropertyName("dailyHealthHourLocal")] public int DailyHealthHourLocal { get; set; } = 8;
+
+    // ── SMTP, so email alerting is real rather than implied ─────────────
+    // adminEmail and enableEmailAlerts existed long before any code could send
+    // mail, which meant the settings screen promised alerts nobody received.
+    [JsonPropertyName("smtpHost")] public string SmtpHost { get; set; } = "";
+    [JsonPropertyName("smtpPort")] public int SmtpPort { get; set; } = 587;
+    [JsonPropertyName("smtpUser")] public string SmtpUser { get; set; } = "";
+    /// <summary>DPAPI-protected at rest.</summary>
+    [JsonPropertyName("smtpPassword")] public string SmtpPassword { get; set; } = "";
+    [JsonPropertyName("smtpFrom")] public string SmtpFrom { get; set; } = "";
+    [JsonPropertyName("smtpUseTls")] public bool SmtpUseTls { get; set; } = true;
+    /// <summary>Minutes without progress before a running sync counts as
+    /// stalled. The 4-Sep stall sat frozen for far longer than this.</summary>
+    [JsonPropertyName("stalledAfterMinutes")] public int StalledAfterMinutes { get; set; } = 20;
 }
 
 public sealed class AdvancedSettings

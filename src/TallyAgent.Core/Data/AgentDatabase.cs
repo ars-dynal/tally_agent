@@ -10,7 +10,7 @@ namespace TallyAgent.Core.Data;
 /// </summary>
 public sealed class AgentDatabase
 {
-    public const int CurrentSchemaVersion = 7;
+    public const int CurrentSchemaVersion = 8;
 
     private readonly string _connectionString;
     private readonly ILogger<AgentDatabase> _log;
@@ -61,6 +61,7 @@ public sealed class AgentDatabase
         if (version < 5) MigrateToV5(conn, tx);
         if (version < 6) MigrateToV6(conn, tx);
         if (version < 7) MigrateToV7(conn, tx);
+        if (version < 8) MigrateToV8(conn, tx);
         // future: additive only
 
         Exec(conn, tx, """
@@ -277,6 +278,21 @@ public sealed class AgentDatabase
             );
             UPDATE sync_checkpoints SET company = TRIM(company)
              WHERE company <> TRIM(company);
+            """);
+    }
+
+    /// <summary>V8: sync_runs records what a run actually DID. Before this it
+    /// held a status and a row count, so a successful run left no usable trace
+    /// and "did last night work, and over what window?" was unanswerable.</summary>
+    private static void MigrateToV8(SqliteConnection conn, SqliteTransaction tx)
+    {
+        Exec(conn, tx, """
+            ALTER TABLE sync_runs ADD COLUMN window_from TEXT;
+            ALTER TABLE sync_runs ADD COLUMN window_to TEXT;
+            ALTER TABLE sync_runs ADD COLUMN datasets_attempted INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE sync_runs ADD COLUMN datasets_succeeded INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE sync_runs ADD COLUMN records_queued INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE sync_runs ADD COLUMN datasets_failed TEXT;
             """);
     }
 
