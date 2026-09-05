@@ -52,6 +52,12 @@ public sealed class BatchBuilder(BatchQueueRepository queue, AgentConfig config,
         if (rows.Count == 0) return ids;
         Directory.CreateDirectory(QueueDir);
 
+        // Stamp the stable per-record identity BEFORE slicing. Occurrence
+        // numbers must be assigned over the complete row set for this dataset
+        // and window; doing it per slice would restart them at a batch boundary
+        // and two batches would claim the same key.
+        DatasetRecordKey.Assign(dataset, rows, windowFrom, windowTo);
+
         var syncTimestamp = syncTimestampOverride
             ?? DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'");
         for (var offset = 0; offset < rows.Count; offset += maxRecords)

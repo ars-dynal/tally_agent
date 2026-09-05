@@ -102,6 +102,7 @@ public sealed class MasterContentHashTests : IDisposable
         Assert.Contains("_sync_id", rows[0].Keys);
         Assert.Contains("_sync_timestamp", rows[0].Keys);
         Assert.Contains("_company", rows[0].Keys);
+        Assert.Contains("_record_key", rows[0].Keys);
         Assert.Equal(before, MasterContentHash.Compute(Dataset, Company, rows));
     }
 
