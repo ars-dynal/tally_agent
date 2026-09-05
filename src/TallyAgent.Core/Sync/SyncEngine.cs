@@ -352,13 +352,17 @@ public sealed class SyncEngine(
                         CurrentOperation = $"extract:vouchers {from:yyyy-MM-dd}..{to:yyyy-MM-dd}";
                         try
                         {
-                            GuardActivePeriod(from, to, "this voucher window");
+                            // Everything below uses the CLAMPED to-date, so the
+                            // checkpoint records what was actually extracted and
+                            // the trimmed tail is picked up on the next run
+                            // rather than being skipped for good.
+                            var winTo = ClampToBooksRange(from, to, "this voucher window");
                             var sw = System.Diagnostics.Stopwatch.StartNew();
-                            var result = await vouchers.ExtractWindow(from, to, bankLedgers, ct);
+                            var result = await vouchers.ExtractWindow(from, winTo, bankLedgers, ct);
                             sw.Stop();
-                            GuardWindowWasHonoured(result, from, to);
+                            GuardWindowWasHonoured(result, from, winTo);
                             var wf = from.ToString("yyyy-MM-dd");
-                            var wt = to.ToString("yyyy-MM-dd");
+                            var wt = winTo.ToString("yyyy-MM-dd");
 
                             foreach (var (name, rows) in FanOut(result, config.Tally.EmitLegacyVouchersDataset))
                             {
@@ -367,8 +371,8 @@ public sealed class SyncEngine(
                                 EnqueueAndCheckpoint(name, company, syncId, rows, wf, wt,
                                     fullDone: false);
                             }
-                            AdvanceVoucherWindowCheckpoint(company, from, to, plan.TargetStart);
-                            RecordWindowCoverage(syncId, "vouchers", from, to,
+                            AdvanceVoucherWindowCheckpoint(company, from, winTo, plan.TargetStart);
+                            RecordWindowCoverage(syncId, "vouchers", from, winTo,
                                 result.VoucherHeaders.Count, result.MinVoucherDate,
                                 result.MaxVoucherDate, "completed");
                             ok++;
@@ -378,7 +382,7 @@ public sealed class SyncEngine(
                             // to happen on the next (often busier) month. Halve the
                             // remaining windows now instead of discovering it the
                             // expensive way. Windows never grow within a run.
-                            var days = to.DayNumber - from.DayNumber + 1;
+                            var days = winTo.DayNumber - from.DayNumber + 1;
                             if (days > 1 && pending.Count > 0 &&
                                 sw.Elapsed > voucherBudget * 0.6)
                             {
@@ -607,7 +611,7 @@ public sealed class SyncEngine(
         // Snapshot reports are computed over fyStart..today; masters are not
         // date-ranged and are unaffected.
         if (DatasetRegistry.All.FirstOrDefault(d => d.Name == dataset)?.Kind == DatasetKind.Snapshot)
-            GuardActivePeriod(fyStart, today, $"the {dataset} report range");
+            today = ClampToBooksRange(fyStart, today, $"the {dataset} report range");
 
         return dataset switch
         {
@@ -644,15 +648,58 @@ public sealed class SyncEngine(
     /// run reports success. The actual period is printed in the message because
     /// the fix is a person pressing Alt+F2 in Tally.
     /// </summary>
-    private void GuardActivePeriod(DateOnly from, DateOnly to, string what)
+    /// <summary>
+    /// Trim a requested range to the end of Tally's books, and return the
+    /// to-date to actually use.
+    ///
+    /// CLAMP, DO NOT REJECT. The incremental window always ends TODAY, while
+    /// Tally's books always end at the last voucher anyone entered. So on any
+    /// morning before the first voucher of the day is posted, the request
+    /// overshoots the books by a day or two — and the old guard rejected the
+    /// WHOLE window, including the days that were valid and did exist.
+    /// Observed 2026-09-05: vouchers[29-Aug..05-Sep] refused outright because
+    /// the books ended 04-Sep, so a week of real data did not load while the run
+    /// still reported "Failed batches: 0".
+    ///
+    /// A guard that refuses valid data to protect against invalid data is worse
+    /// than no guard.
+    ///
+    /// What still errors, because it is the thing this guard exists for — an
+    /// operator having narrowed the active period (Alt+F2):
+    ///   • a FROM-date outside the books, which cannot be served at all;
+    ///   • a clamp that leaves nothing behind (from is past the books end).
+    /// </summary>
+    private DateOnly ClampToBooksRange(DateOnly from, DateOnly to, string what)
     {
-        if (_booksPeriod is not { } p) return;           // unknown ⇒ cannot judge
-        if (p.From <= from && p.To >= to) return;        // within the books range
+        if (_booksPeriod is not { } p) return to;        // unknown ⇒ cannot judge
 
-        throw new TallyException(ErrorCategory.TallyActivePeriodTooNarrow,
-            $"Tally's books run {p.From:dd-MMM-yyyy} to {p.To:dd-MMM-yyyy}, which does not cover " +
-            $"{what} ({from:dd-MMM-yyyy} to {to:dd-MMM-yyyy}). No data can exist outside the books " +
-            "range, so this would have extracted nothing and reported success.");
+        var (outcome, clamped) = SyncPlanner.ClampToBooks(from, to, p.From, p.To);
+        switch (outcome)
+        {
+            case SyncPlanner.BooksClamp.Ok:
+                return clamped;
+
+            case SyncPlanner.BooksClamp.Trimmed:
+                log.LogInformation(
+                    "Clamped {What} to the end of Tally's books: {From:yyyy-MM-dd}..{To:yyyy-MM-dd} " +
+                    "→ {From:yyyy-MM-dd}..{Clamped:yyyy-MM-dd} ({Days} day(s) trimmed). The books " +
+                    "end {BooksTo:yyyy-MM-dd} because that is the last voucher entered, not because " +
+                    "the period is narrow.",
+                    what, from, to, from, clamped, to.DayNumber - clamped.DayNumber, p.To);
+                return clamped;
+
+            case SyncPlanner.BooksClamp.BeforeBooksStart:
+                throw new TallyException(ErrorCategory.TallyActivePeriodTooNarrow,
+                    $"Tally's books begin {p.From:dd-MMM-yyyy}, after the start of {what} " +
+                    $"({from:dd-MMM-yyyy} to {to:dd-MMM-yyyy}). Nothing before the books start can " +
+                    "be served, so this would have extracted nothing and reported success. Widen " +
+                    "the period in Tally (Alt+F2) if the data should be there.");
+
+            default:
+                throw new TallyException(ErrorCategory.TallyActivePeriodTooNarrow,
+                    $"Tally's books end {p.To:dd-MMM-yyyy}, before the start of {what} " +
+                    $"({from:dd-MMM-yyyy} to {to:dd-MMM-yyyy}). Clamping would leave an empty window.");
+        }
     }
 
     /// <summary>

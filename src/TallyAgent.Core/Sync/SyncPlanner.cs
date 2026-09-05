@@ -39,6 +39,40 @@ public static class SyncPlanner
     /// are ignored, restarting the walk (batch dedup makes that cheap).</summary>
     public const long NewestFirstCheckpointMarker = 2;
 
+    /// <summary>What clamping a requested range to Tally's books decided.</summary>
+    public enum BooksClamp
+    {
+        /// <summary>Wholly inside the books; use the range as asked.</summary>
+        Ok,
+        /// <summary>The tail overshot the books end and was trimmed.</summary>
+        Trimmed,
+        /// <summary>Starts before the books begin — nothing there to serve.</summary>
+        BeforeBooksStart,
+        /// <summary>Starts after the books end — clamping would leave nothing.</summary>
+        AfterBooksEnd,
+    }
+
+    /// <summary>
+    /// Trim a requested range to the end of Tally's books.
+    ///
+    /// The incremental window always ends TODAY; Tally's books always end at the
+    /// last voucher anyone entered. So on any morning before the first voucher
+    /// of the day is posted, the request overshoots the books by a day or two.
+    /// That is ordinary, not an error, and the days below the overshoot are real
+    /// data that must still load.
+    ///
+    /// Pure so it can be tested directly: the version of this that lived inside
+    /// SyncEngine rejected a whole valid week and nothing caught it.
+    /// </summary>
+    public static (BooksClamp Outcome, DateOnly To) ClampToBooks(
+        DateOnly from, DateOnly to, DateOnly booksFrom, DateOnly booksTo)
+    {
+        if (from < booksFrom) return (BooksClamp.BeforeBooksStart, to);
+        if (from > booksTo) return (BooksClamp.AfterBooksEnd, to);
+        if (to <= booksTo) return (BooksClamp.Ok, to);
+        return (BooksClamp.Trimmed, booksTo);
+    }
+
     /// <summary>
     /// True when <c>extractionStartDate</c> currently has NO effect.
     ///

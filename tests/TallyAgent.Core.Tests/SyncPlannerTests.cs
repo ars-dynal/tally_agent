@@ -19,6 +19,73 @@ public class SyncPlannerTests
         new("_vouchers_window", "Co", lastFrom, lastTo,
             SyncPlanner.NewestFirstCheckpointMarker, null, false);
 
+    // ── clamping a window to Tally's books (v2.4.0) ──────────────────────
+
+    /// <summary>
+    /// THE regression, from 2026-09-05: the incremental window ran
+    /// 29-Aug..05-Sep while Tally's books ended 04-Sep, because nobody had
+    /// posted a voucher yet that morning. The old guard rejected the WHOLE
+    /// window, so a week of real data did not load — and the run still reported
+    /// "Failed batches: 0".
+    /// </summary>
+    [Fact]
+    public void AWindowOvershootingTheBooksEnd_IsTrimmed_NotRejected()
+    {
+        var (outcome, to) = SyncPlanner.ClampToBooks(
+            from: new DateOnly(2026, 8, 29), to: new DateOnly(2026, 9, 5),
+            booksFrom: new DateOnly(2019, 4, 1), booksTo: new DateOnly(2026, 9, 4));
+
+        Assert.Equal(SyncPlanner.BooksClamp.Trimmed, outcome);
+        Assert.Equal(new DateOnly(2026, 9, 4), to);   // the valid week still loads
+    }
+
+    [Fact]
+    public void AWindowInsideTheBooks_IsLeftAlone()
+    {
+        var (outcome, to) = SyncPlanner.ClampToBooks(
+            new DateOnly(2026, 8, 29), new DateOnly(2026, 9, 4),
+            new DateOnly(2019, 4, 1), new DateOnly(2026, 9, 4));
+
+        Assert.Equal(SyncPlanner.BooksClamp.Ok, outcome);
+        Assert.Equal(new DateOnly(2026, 9, 4), to);
+    }
+
+    /// <summary>The guard's real purpose survives: an operator who has narrowed
+    /// Alt+F2 so the window starts before the books is still an error, because
+    /// that range genuinely cannot be served.</summary>
+    [Fact]
+    public void AWindowStartingBeforeTheBooks_IsStillAnError()
+    {
+        var (outcome, _) = SyncPlanner.ClampToBooks(
+            new DateOnly(2019, 1, 1), new DateOnly(2019, 6, 30),
+            new DateOnly(2019, 4, 1), new DateOnly(2026, 9, 4));
+
+        Assert.Equal(SyncPlanner.BooksClamp.BeforeBooksStart, outcome);
+    }
+
+    /// <summary>Clamping must never produce an empty or inverted window.</summary>
+    [Fact]
+    public void AWindowStartingAfterTheBooksEnd_IsStillAnError()
+    {
+        var (outcome, _) = SyncPlanner.ClampToBooks(
+            new DateOnly(2026, 10, 1), new DateOnly(2026, 10, 7),
+            new DateOnly(2019, 4, 1), new DateOnly(2026, 9, 4));
+
+        Assert.Equal(SyncPlanner.BooksClamp.AfterBooksEnd, outcome);
+    }
+
+    [Fact]
+    public void ASingleDayAtTheBooksEnd_Survives()
+    {
+        // The boundary itself: from == to == booksTo must not be trimmed away.
+        var (outcome, to) = SyncPlanner.ClampToBooks(
+            new DateOnly(2026, 9, 4), new DateOnly(2026, 9, 4),
+            new DateOnly(2019, 4, 1), new DateOnly(2026, 9, 4));
+
+        Assert.Equal(SyncPlanner.BooksClamp.Ok, outcome);
+        Assert.Equal(new DateOnly(2026, 9, 4), to);
+    }
+
     // ── extractionStartDate: inert once the checkpoint latches (v2.2.0) ──
 
     /// <summary>The setting is only read inside the !FullSyncDone branch, so
