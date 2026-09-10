@@ -105,9 +105,37 @@ public static partial class TallyXml
         {
             // Not UTF-8. Latin-1 maps every byte to a character, so nothing is
             // lost and 0xD7 becomes the multiplication sign it always was.
-            return Encoding.Latin1.GetString(raw);
+            // Tally on Windows actually writes Windows-1252, which agrees with
+            // Latin-1 everywhere except 0x80-0x9F: there Latin-1 yields C1
+            // control characters and 1252 yields the punctuation Tally meant.
+            // Five Dynalektric ledgers ("Travel Expenses – New Customer")
+            // reached BigQuery with U+0096 where the en dash was. The 1252 table
+            // is applied by hand so the agent needs no code-page package.
+            return Cp1252(Encoding.Latin1.GetString(raw));
         }
     }
+
+    /// <summary>Windows-1252 for the 0x80-0x9F range that Latin-1 leaves as
+    /// C1 controls; every other character is already correct.</summary>
+    public static string Cp1252(string latin1)
+    {
+        var needs = false;
+        foreach (var c in latin1) if (c is >= '\u0080' and <= '\u009F') { needs = true; break; }
+        if (!needs) return latin1;
+        var sb = new StringBuilder(latin1.Length);
+        foreach (var c in latin1)
+            sb.Append(c is >= '\u0080' and <= '\u009F' ? Cp1252High[c - 0x80] : c);
+        return sb.ToString();
+    }
+
+    // Undefined positions (0x81, 0x8D, 0x8F, 0x90, 0x9D) keep the control character.
+    private static readonly char[] Cp1252High =
+    [
+        '\u20AC', '\u0081', '\u201A', '\u0192', '\u201E', '\u2026', '\u2020', '\u2021',
+        '\u02C6', '\u2030', '\u0160', '\u2039', '\u0152', '\u008D', '\u017D', '\u008F',
+        '\u0090', '\u2018', '\u2019', '\u201C', '\u201D', '\u2022', '\u2013', '\u2014',
+        '\u02DC', '\u2122', '\u0161', '\u203A', '\u0153', '\u009D', '\u017E', '\u0178',
+    ];
 
     /// <summary>encoding="..." from the XML declaration, read from the first
     /// bytes with any UTF-16 padding nulls removed.</summary>

@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.4.1 - Item invoices lost their sales ledger; en dashes lost their shape
+
+Found by tying the warehouse to Tally's own ledger-wise Trial Balance for
+10-Sep-2026 (1,044 of 1,048 ledgers matched by name, 979 equal to the rupee).
+
+### Sales/purchase ledger lines missing from item invoices
+
+From 2026-09-04 Dynalektric books sales as ITEM invoices. In that shape Tally
+puts the party, the taxes and round-off in `ALLLEDGERENTRIES.LIST` and the
+sales ledger ONLY inside each stock line's `ACCOUNTINGALLOCATIONS.LIST`. The
+extractor read the ledger list alone, so 14 vouchers (DEPL/26-27/222..235)
+arrived with the party debit and the GST credits and no sales line: every one
+failed to balance and the trial balance was Rs 1,79,06,000 short on Sales,
+Rs 59,70,000 on Purchases. A full re-extract did not help - the lines were
+never read in either mode.
+
+`VoucherExtractor` now appends the accounting allocations as ordinary ledger
+lines (entry_type `ledger`, continuing `line_index`) when, and only when, the
+ledger list does not sum to zero. An accounting invoice already balances and is
+left alone, so nothing is double-counted. A voucher that still cannot balance
+is logged by number.
+
+### Windows-1252 punctuation
+
+The Latin-1 fallback in `TallyXml.Decode` maps 0x80-0x9F to C1 control
+characters; Tally writes Windows-1252, where 0x96 is the en dash. Five ledgers
+("Travel Expenses – New Customer") reached BigQuery with U+0096. The 1252
+table for that range is now applied by hand, with no code-page package.
+
+Tests: `ItemInvoiceAllocationTests` (item invoice balances from the allocation;
+accounting invoice not doubled; en dash survives).
+
 ## 2.4.0 - The report envelope was wrong all along
 
 A full sync stalled Tally on 2026-09-04: 85 windows, each asking Tally to

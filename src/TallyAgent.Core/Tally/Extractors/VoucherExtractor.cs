@@ -355,6 +355,24 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                 lineIndex++;
             }
 
+            // ITEM INVOICES KEEP THE SALES/PURCHASE LEDGER OFF THE LEDGER LIST.
+            // In an item (inventory) invoice Tally puts the party, the taxes and
+            // round-off in ALLLEDGERENTRIES.LIST, and the sales or purchase
+            // ledger ONLY inside each stock line's ACCOUNTINGALLOCATIONS.LIST.
+            // An accounting invoice carries every ledger on the ledger list, so
+            // this was invisible until Dynalektric started booking sales as item
+            // invoices on 2026-09-04: 14 vouchers (DEPL/26-27/222..235) arrived
+            // with the party debit and the GST credits and no sales line at all,
+            // Rs 1,79,06,000 short against Tally's own trial balance, and every
+            // such voucher failed to balance. The allocations are appended as
+            // ordinary ledger lines when, and only when, the ledger list does not
+            // balance on its own — a balanced voucher already has its lines and
+            // adding them again would double it.
+            var ledgerSum = 0.0;
+            foreach (var entry in ledgerEntries) ledgerSum += Num(entry, "AMOUNT");
+            var needsAllocations = Math.Abs(ledgerSum) >= 0.005;
+            var allocationLines = 0;
+
             // Same dual-shape issue as ledger entries: prefer ALLINVENTORYENTRIES,
             // fall back to INVENTORYENTRIES only when it is absent (Concat+Distinct
             // was reference-equality and double-counted stock movements).
@@ -382,6 +400,53 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                 };
                 result.InventoryEntries.Add(invRow);
 
+                if (needsAllocations)
+                {
+                    foreach (var acc in inv.Elements("ACCOUNTINGALLOCATIONS.LIST"))
+                    {
+                        var accLedger = Text(acc, "LEDGERNAME");
+                        if (accLedger.Length == 0) continue;
+                        var accAmount = Num(acc, "AMOUNT");
+                        var accDeemedPositive = Bool(acc, "ISDEEMEDPOSITIVE");
+                        result.VoucherLines.Add(new Row
+                        {
+                            ["voucher_guid"] = guid,
+                            ["entry_type"] = "ledger",
+                            ["line_index"] = lineIndex,
+                            ["voucher_date"] = voucherDateText,
+                            ["voucher_number"] = voucherNumber,
+                            ["ledger_name"] = accLedger,
+                            ["amount"] = accAmount,
+                            ["is_deemed_positive"] = accDeemedPositive,
+                        });
+                        var accFlat = new Row
+                        {
+                            ["voucher_date"] = voucherDateText,
+                            ["voucher_type"] = vchType,
+                            ["voucher_number"] = voucherNumber,
+                            ["reference"] = header["reference"],
+                            ["narration"] = header["narration"],
+                            ["party_name"] = header["party_name"],
+                            ["guid"] = guid,
+                            ["master_id"] = header["master_id"],
+                            ["alter_id"] = header["alter_id"],
+                            ["is_cancelled"] = header["is_cancelled"],
+                            ["is_optional"] = isOptional,
+                            ["is_deleted"] = false,
+                            ["source_status"] = header["source_status"],
+                            ["source_last_seen_at"] = header["source_last_seen_at"],
+                            ["line_index"] = lineIndex,
+                            ["ledger_name"] = accLedger,
+                            ["amount"] = accAmount,
+                            ["is_deemed_positive"] = accDeemedPositive,
+                        };
+                        result.Vouchers.Add(accFlat);
+                        result.DayBook.Add(new Row(accFlat));
+                        lineIndex++;
+                        allocationLines++;
+                    }
+                }
+
                 if (IsSalesType(vchType))
                 {
                     result.SalesInvoiceLines.Add(new Row
@@ -397,6 +462,11 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                     });
                 }
             }
+
+            if (needsAllocations && allocationLines == 0)
+                log.LogWarning(
+                    "Voucher {VoucherNumber} ({VoucherType}, {VoucherDate}) ledger lines sum to {Sum:0.00} and carry no accounting allocations; it will not balance",
+                    voucherNumber, vchType, voucherDateText, ledgerSum);
 
             if (IsSalesType(vchType))
                 result.SalesRegister.Add(RegisterRow(header, vchType, cgst, sgst, igst));
