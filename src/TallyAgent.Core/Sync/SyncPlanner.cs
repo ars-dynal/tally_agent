@@ -14,7 +14,19 @@ public sealed record VoucherPlan(
     /// <summary>For a full sync: the oldest date the walk must reach. The
     /// engine marks the full sync done when a completed window's From reaches
     /// this date. Null for incremental plans.</summary>
-    DateOnly? TargetStart = null);
+    DateOnly? TargetStart = null,
+    /// <summary>
+    /// The newest-first walk has already reached <see cref="TargetStart"/>:
+    /// there is nothing left to extract and the checkpoint should be latched.
+    ///
+    /// This exists because the walk could otherwise finish and never be RECORDED
+    /// as finished. FullSyncDone was only ever set inside the window loop, and
+    /// once the frontier reaches the target the planner returns ZERO windows —
+    /// so the loop never runs, the flag never latches, and every subsequent run
+    /// replans "full" forever. Observed on the server: 85/85 windows and 622,379
+    /// records, still choosing full mode on every run.
+    /// </summary>
+    bool WalkComplete = false);
 
 /// <summary>
 /// Pure voucher-window planning (extracted from SyncEngine for testability).
@@ -38,6 +50,40 @@ public static class SyncPlanner
     /// forward-walk checkpoints (null/other) cannot be resumed backwards and
     /// are ignored, restarting the walk (batch dedup makes that cheap).</summary>
     public const long NewestFirstCheckpointMarker = 2;
+
+    /// <summary>What clamping a requested range to Tally's books decided.</summary>
+    public enum BooksClamp
+    {
+        /// <summary>Wholly inside the books; use the range as asked.</summary>
+        Ok,
+        /// <summary>The tail overshot the books end and was trimmed.</summary>
+        Trimmed,
+        /// <summary>Starts before the books begin — nothing there to serve.</summary>
+        BeforeBooksStart,
+        /// <summary>Starts after the books end — clamping would leave nothing.</summary>
+        AfterBooksEnd,
+    }
+
+    /// <summary>
+    /// Trim a requested range to the end of Tally's books.
+    ///
+    /// The incremental window always ends TODAY; Tally's books always end at the
+    /// last voucher anyone entered. So on any morning before the first voucher
+    /// of the day is posted, the request overshoots the books by a day or two.
+    /// That is ordinary, not an error, and the days below the overshoot are real
+    /// data that must still load.
+    ///
+    /// Pure so it can be tested directly: the version of this that lived inside
+    /// SyncEngine rejected a whole valid week and nothing caught it.
+    /// </summary>
+    public static (BooksClamp Outcome, DateOnly To) ClampToBooks(
+        DateOnly from, DateOnly to, DateOnly booksFrom, DateOnly booksTo)
+    {
+        if (from < booksFrom) return (BooksClamp.BeforeBooksStart, to);
+        if (from > booksTo) return (BooksClamp.AfterBooksEnd, to);
+        if (to <= booksTo) return (BooksClamp.Ok, to);
+        return (BooksClamp.Trimmed, booksTo);
+    }
 
     /// <summary>
     /// True when <c>extractionStartDate</c> currently has NO effect.
@@ -74,7 +120,8 @@ public static class SyncPlanner
                 TryParseIsoDate(checkpoint.LastFromDate) is { } frontier)
             {
                 if (frontier <= target) // walk already reached the start
-                    return new VoucherPlan(windows, IsFullSync: true, 0, target);
+                    return new VoucherPlan(windows, IsFullSync: true, 0, target,
+                        WalkComplete: true);
                 top = frontier.AddDays(-1);
                 if (top > ceiling) top = ceiling;
             }

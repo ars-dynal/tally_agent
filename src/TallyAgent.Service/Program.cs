@@ -84,6 +84,7 @@ try
         builder.Services.AddSingleton<HeartbeatRepository>();
         builder.Services.AddSingleton<MasterBalanceRepository>();
         builder.Services.AddSingleton<MasterContentHashRepository>();
+        builder.Services.AddSingleton<RunHistoryRepository>();
         builder.Services.AddSingleton(sp => new TallyClient(config.Tally,
             sp.GetRequiredService<ILogger<TallyClient>>()));
         builder.Services.AddSingleton<MasterExtractor>();
@@ -95,6 +96,7 @@ try
         builder.Services.AddSingleton(sp => new IngestionApiClient(config,
             sp.GetRequiredService<ILogger<IngestionApiClient>>()));
         builder.Services.AddSingleton<WebhookNotifier>();
+        builder.Services.AddSingleton<RunAlerter>();
         builder.Services.AddSingleton<ErrorReporter>();
         builder.Services.AddSingleton<DiagnosticsExporter>();
         builder.Services.AddSingleton<AgentState>();

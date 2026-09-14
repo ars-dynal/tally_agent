@@ -149,7 +149,10 @@ public class BillsExtractionTests
         var xml = TallyEnvelopes.BillsReport("Bills Payable",
             new DateOnly(2026, 4, 1), new DateOnly(2026, 9, 3), "Dynalektric Equipment Private Limited");
 
-        Assert.Contains("<REPORTNAME>Bills Payable</REPORTNAME>", xml);
+        // v2.4.0: the report name goes in ID, in the envelope shape Tally
+        // actually accepts. See ReportEnvelopeTests.
+        Assert.Contains("<ID>Bills Payable</ID>", xml);
+        Assert.Contains("<TYPE>Data</TYPE>", xml);
         Assert.Contains("<SVFROMDATE>20260401</SVFROMDATE>", xml);
         Assert.Contains("<SVTODATE>20260903</SVTODATE>", xml);
         Assert.Contains("<SVCURRENTCOMPANY>Dynalektric Equipment Private Limited</SVCURRENTCOMPANY>", xml);

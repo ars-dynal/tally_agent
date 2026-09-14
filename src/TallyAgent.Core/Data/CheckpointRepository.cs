@@ -10,7 +10,13 @@ public sealed class CheckpointRepository(AgentDatabase db)
     {
         using var conn = db.Open();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT * FROM sync_checkpoints WHERE dataset=$d AND company=$c";
+        // TRIM + NOCASE. SQLite's = is case-sensitive and does not ignore
+        // whitespace, so a config edit changing the case or padding of the
+        // company name silently orphans an entire history walk - the writer
+        // stores under one key and the reader looks under another.
+        cmd.CommandText =
+            "SELECT * FROM sync_checkpoints " +
+            "WHERE dataset=$d AND TRIM(company)=TRIM($c) COLLATE NOCASE";
         cmd.Parameters.AddWithValue("$d", dataset);
         cmd.Parameters.AddWithValue("$c", company);
         using var r = cmd.ExecuteReader();
@@ -58,7 +64,8 @@ public sealed class CheckpointRepository(AgentDatabase db)
               last_success_utc=$s, full_sync_done=$done
             """;
         cmd.Parameters.AddWithValue("$d", cp.Dataset);
-        cmd.Parameters.AddWithValue("$c", cp.Company);
+        // Normalised on the way in so the stored key cannot drift.
+        cmd.Parameters.AddWithValue("$c", cp.Company.Trim());
         cmd.Parameters.AddWithValue("$f", (object?)cp.LastFromDate ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$t", (object?)cp.LastToDate ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$a", (object?)cp.LastAlterId ?? DBNull.Value);

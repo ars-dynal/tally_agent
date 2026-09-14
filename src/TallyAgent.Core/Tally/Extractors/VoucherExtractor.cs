@@ -48,26 +48,44 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
         public string? ServedMaxDate { get; set; }
     }
 
-    /// <summary>Fetch vouchers for a window and fan out to all voucher datasets.
-    /// The explicit collection-level date filter avoids dependence on the period
-    /// selected in the interactive Tally UI.</summary>
+    /// <summary>
+    /// Fetch vouchers for a window and fan out to all voucher datasets.
+    ///
+    /// ONE REQUEST PER DAY, driven by SVCURRENTDATE.
+    ///
+    /// Measured 2026-09-04: the Day Book report ignores SVFROMDATE and SVTODATE
+    /// completely and reports whatever day SVCURRENTDATE names. Asked for
+    /// 5-Apr..7-Apr with SVCURRENTDATE=7-Apr it returned 85 vouchers, all dated
+    /// 7-Apr. A range request is therefore not a smaller request — it is the
+    /// wrong request, and the earlier stall was the agent believing otherwise.
+    ///
+    /// So the window is walked a day at a time. Each request is tiny and bounded
+    /// (12.6 MB for the heaviest day observed, ~148 KB per voucher, against a
+    /// 256 MB cap), empty days come back empty and cost nothing, and nothing is
+    /// discarded client-side. About 2,900 requests cover 2019-2027.
+    ///
+    /// The window still exists as the CHECKPOINT unit: a 7-day window is 7
+    /// requests and one enqueue, so a resumed walk restarts at most a week of
+    /// cheap requests rather than re-running a month.
+    /// </summary>
     public async Task<DayBookResult> ExtractWindow(DateOnly from, DateOnly to,
         ISet<string> bankLedgerNames, CancellationToken ct)
     {
-        // Multi-day windows do NOT retry a timeout at the same size — the
-        // SyncEngine splits the window instead (retrying an identical heavy
-        // request is deterministic waste). Single-day windows can't be split,
-        // so they keep the full retry ladder.
-        var days = to.DayNumber - from.DayNumber + 1;
-        var doc = await client.PostAsync(
-            TallyEnvelopes.VoucherCollection(from, to, client.Company, client.FetchLegacyVoucherLists),
-            requestTimeout: client.VoucherRequestTimeout,
-            maxTimeoutRetries: days > 1 ? 0 : null, ct);
         var result = new DayBookResult();
         var seenVoucherKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var outOfWindow = 0;
         var invalidDates = 0;
         var duplicateVouchers = 0;
+
+        for (var day = from; day <= to; day = day.AddDays(1))
+        {
+        ct.ThrowIfCancellationRequested();
+        // Single-day requests cannot be split, so they keep the full retry
+        // ladder; there is no larger size left to fall back to.
+        var doc = await client.PostAsync(
+            TallyEnvelopes.Report("Day Book", day, day, client.Company, currentDate: day),
+            requestTimeout: client.VoucherRequestTimeout,
+            maxTimeoutRetries: null, ct);
 
         foreach (var v in doc.Descendants("VOUCHER"))
         {
@@ -90,17 +108,25 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                 string.CompareOrdinal(voucherDateText, result.ServedMaxDate) > 0)
                 result.ServedMaxDate = voucherDateText;
 
-            if (voucherDate < from || voucherDate > to)
+            // EQUALITY, not a range. One request asks for one day, so every
+            // voucher in the response must carry that date. This is a stronger
+            // check than the range test it replaces: each of the ~2,900 requests
+            // is individually verifiable instead of a month being spot-checked.
+            if (voucherDate != day)
             {
                 outOfWindow++;
                 log.LogWarning(
-                    "Skipping out-of-window voucher {VoucherNumber} dated {VoucherDate}; requested {From}..{To}",
-                    Text(v, "VOUCHERNUMBER"), voucherDate, from, to);
+                    "Skipping voucher {VoucherNumber} dated {VoucherDate}; requested exactly {Day}",
+                    Text(v, "VOUCHERNUMBER"), voucherDate, day);
                 continue;
             }
 
             var guid = Text(v, "GUID");
+            // Day Book emits VCHTYPE as an ATTRIBUTE on <VOUCHER>; the
+            // collection emitted VOUCHERTYPENAME as a child. Text() checks
+            // children then attributes, so both shapes read the same way.
             var vchType = Text(v, "VOUCHERTYPENAME");
+            if (vchType.Length == 0) vchType = Text(v, "VCHTYPE");
             var voucherNumber = Text(v, "VOUCHERNUMBER");
             var voucherKey = guid.Length > 0
                 ? guid
@@ -329,6 +355,24 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                 lineIndex++;
             }
 
+            // ITEM INVOICES KEEP THE SALES/PURCHASE LEDGER OFF THE LEDGER LIST.
+            // In an item (inventory) invoice Tally puts the party, the taxes and
+            // round-off in ALLLEDGERENTRIES.LIST, and the sales or purchase
+            // ledger ONLY inside each stock line's ACCOUNTINGALLOCATIONS.LIST.
+            // An accounting invoice carries every ledger on the ledger list, so
+            // this was invisible until Dynalektric started booking sales as item
+            // invoices on 2026-09-04: 14 vouchers (DEPL/26-27/222..235) arrived
+            // with the party debit and the GST credits and no sales line at all,
+            // Rs 1,79,06,000 short against Tally's own trial balance, and every
+            // such voucher failed to balance. The allocations are appended as
+            // ordinary ledger lines when, and only when, the ledger list does not
+            // balance on its own — a balanced voucher already has its lines and
+            // adding them again would double it.
+            var ledgerSum = 0.0;
+            foreach (var entry in ledgerEntries) ledgerSum += Num(entry, "AMOUNT");
+            var needsAllocations = Math.Abs(ledgerSum) >= 0.005;
+            var allocationLines = 0;
+
             // Same dual-shape issue as ledger entries: prefer ALLINVENTORYENTRIES,
             // fall back to INVENTORYENTRIES only when it is absent (Concat+Distinct
             // was reference-equality and double-counted stock movements).
@@ -356,6 +400,53 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                 };
                 result.InventoryEntries.Add(invRow);
 
+                if (needsAllocations)
+                {
+                    foreach (var acc in inv.Elements("ACCOUNTINGALLOCATIONS.LIST"))
+                    {
+                        var accLedger = Text(acc, "LEDGERNAME");
+                        if (accLedger.Length == 0) continue;
+                        var accAmount = Num(acc, "AMOUNT");
+                        var accDeemedPositive = Bool(acc, "ISDEEMEDPOSITIVE");
+                        result.VoucherLines.Add(new Row
+                        {
+                            ["voucher_guid"] = guid,
+                            ["entry_type"] = "ledger",
+                            ["line_index"] = lineIndex,
+                            ["voucher_date"] = voucherDateText,
+                            ["voucher_number"] = voucherNumber,
+                            ["ledger_name"] = accLedger,
+                            ["amount"] = accAmount,
+                            ["is_deemed_positive"] = accDeemedPositive,
+                        });
+                        var accFlat = new Row
+                        {
+                            ["voucher_date"] = voucherDateText,
+                            ["voucher_type"] = vchType,
+                            ["voucher_number"] = voucherNumber,
+                            ["reference"] = header["reference"],
+                            ["narration"] = header["narration"],
+                            ["party_name"] = header["party_name"],
+                            ["guid"] = guid,
+                            ["master_id"] = header["master_id"],
+                            ["alter_id"] = header["alter_id"],
+                            ["is_cancelled"] = header["is_cancelled"],
+                            ["is_optional"] = isOptional,
+                            ["is_deleted"] = false,
+                            ["source_status"] = header["source_status"],
+                            ["source_last_seen_at"] = header["source_last_seen_at"],
+                            ["line_index"] = lineIndex,
+                            ["ledger_name"] = accLedger,
+                            ["amount"] = accAmount,
+                            ["is_deemed_positive"] = accDeemedPositive,
+                        };
+                        result.Vouchers.Add(accFlat);
+                        result.DayBook.Add(new Row(accFlat));
+                        lineIndex++;
+                        allocationLines++;
+                    }
+                }
+
                 if (IsSalesType(vchType))
                 {
                     result.SalesInvoiceLines.Add(new Row
@@ -372,22 +463,29 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                 }
             }
 
+            if (needsAllocations && allocationLines == 0)
+                log.LogWarning(
+                    "Voucher {VoucherNumber} ({VoucherType}, {VoucherDate}) ledger lines sum to {Sum:0.00} and carry no accounting allocations; it will not balance",
+                    voucherNumber, vchType, voucherDateText, ledgerSum);
+
             if (IsSalesType(vchType))
                 result.SalesRegister.Add(RegisterRow(header, vchType, cgst, sgst, igst));
             else if (IsPurchaseType(vchType))
                 result.PurchaseRegister.Add(RegisterRow(header, vchType, cgst, sgst, igst));
         }
+        }   // day
 
         if (outOfWindow > 0 || invalidDates > 0 || duplicateVouchers > 0)
         {
             log.LogWarning(
-                "Voucher window {From}..{To} rejected {OutOfWindow} out-of-window, {InvalidDates} invalid-date and {Duplicates} duplicate vouchers",
+                "Voucher window {From}..{To} rejected {OutOfWindow} wrong-date, {InvalidDates} invalid-date and {Duplicates} duplicate vouchers",
                 from, to, outOfWindow, invalidDates, duplicateVouchers);
         }
 
         log.LogInformation(
-            "Voucher window {From}..{To}: {V} vouchers, {L} lines, {B} bills, {BA} bank, {CC} cost-centre, {I} inventory",
-            from, to, result.VoucherHeaders.Count, result.VoucherLines.Count,
+            "Voucher window {From}..{To} ({Days} daily requests): {V} vouchers, {L} lines, {B} bills, {BA} bank, {CC} cost-centre, {I} inventory",
+            from, to, to.DayNumber - from.DayNumber + 1,
+            result.VoucherHeaders.Count, result.VoucherLines.Count,
             result.BillAllocations.Count, result.BankAllocations.Count,
             result.CostCentreAllocations.Count, result.InventoryEntries.Count);
         result.OutOfWindowCount = outOfWindow;

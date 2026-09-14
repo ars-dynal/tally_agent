@@ -1,5 +1,189 @@
 # Changelog
 
+## 2.4.2 - One sync a day, and "nothing changed" said as such
+
+### Daily schedule
+New setting `tally.dailySyncAt` (Manager: Settings > "Daily sync at (HH:mm)").
+When set -- e.g. `21:00` -- the service runs one scheduled sync a day at that
+local time, after the working day, instead of every N minutes. "Sync now" is
+unaffected. On a service restart in daily mode the first run waits for the
+slot rather than reading half a day's books at once. Read at service start.
+
+### A run the AlterID gate skipped is not "0 of 30 datasets"
+When nothing changed in Tally, the gate skips every collection -- correct --
+but the run was recorded as 0 of 30 datasets and raised the "sync incomplete"
+alert every hour. On 14 Sep 2026 that produced seventeen alerts for a company
+nobody had posted to, and the Manager read "Healthy ... all 0 datasets".
+Datasets attempted now means attempted; an untouched run records 0 of 0 with
+the message "No changes in Tally since the last sync", the Manager says
+"Healthy -- Tally unchanged; checked <time>", and no alert is raised.
+
+
+## 2.4.1 - Item invoices lost their sales ledger; en dashes lost their shape
+
+Found by tying the warehouse to Tally's own ledger-wise Trial Balance for
+10-Sep-2026 (1,044 of 1,048 ledgers matched by name, 979 equal to the rupee).
+
+### Sales/purchase ledger lines missing from item invoices
+
+From 2026-09-04 Dynalektric books sales as ITEM invoices. In that shape Tally
+puts the party, the taxes and round-off in `ALLLEDGERENTRIES.LIST` and the
+sales ledger ONLY inside each stock line's `ACCOUNTINGALLOCATIONS.LIST`. The
+extractor read the ledger list alone, so 14 vouchers (DEPL/26-27/222..235)
+arrived with the party debit and the GST credits and no sales line: every one
+failed to balance and the trial balance was Rs 1,79,06,000 short on Sales,
+Rs 59,70,000 on Purchases. A full re-extract did not help - the lines were
+never read in either mode.
+
+`VoucherExtractor` now appends the accounting allocations as ordinary ledger
+lines (entry_type `ledger`, continuing `line_index`) when, and only when, the
+ledger list does not sum to zero. An accounting invoice already balances and is
+left alone, so nothing is double-counted. A voucher that still cannot balance
+is logged by number.
+
+### Windows-1252 punctuation
+
+The Latin-1 fallback in `TallyXml.Decode` maps 0x80-0x9F to C1 control
+characters; Tally writes Windows-1252, where 0x96 is the en dash. Five ledgers
+("Travel Expenses – New Customer") reached BigQuery with U+0096. The 1252
+table for that range is now applied by hand, with no code-page package.
+
+Tests: `ItemInvoiceAllocationTests` (item invoice balances from the allocation;
+accounting invoice not doubled; en dash survives).
+
+## 2.4.0 - The report envelope was wrong all along
+
+A full sync stalled Tally on 2026-09-04: 85 windows, each asking Tally to
+serialise a whole financial year, on a single application thread. Five probes
+against the live server found the cause, and it was not where anyone had been
+looking.
+
+### Measured, 2026-09-04, same server and company, seconds apart
+
+| Request | Result |
+|---|---|
+| `TALLYREQUEST=Export Data` + `EXPORTDATA/REQUESTDESC/REPORTNAME` | **REFUSED** - "Unknown Request, cannot be processed" |
+| `TALLYREQUEST=Export` + `TYPE=Data` + `ID=<report>` | **ACCEPTED** |
+| Voucher collection, 1 day, no filter | 4,355 vouchers, 5,640,137 bytes |
+| Voucher collection, 1 day, `##SVFromDate` filter | 4,355 vouchers, **byte-identical** |
+| Voucher collection, 1 day, literal `$$Date:"1-Sep-2026"` | **4 vouchers**, 6,874 bytes |
+| Day Book report, 1 day | full voucher detail, 424,860 bytes |
+| Trial Balance report | `DSPACCNAME` x11, `DSPCLDRAMTA` x11, 3,055 bytes |
+
+Day Book shows 3 vouchers on that day.
+
+### The Day Book is driven by SVCURRENTDATE, one day per request
+
+`Report()` sending the accepted shape was necessary but not sufficient. The
+Day Book **ignores SVFROMDATE and SVTODATE entirely** and reports whatever day
+`SVCURRENTDATE` names.
+
+Measured 2026-09-04: `SVCURRENTDATE=7-Apr-2026` with `SVFROMDATE=5-Apr` and
+`SVTODATE=7-Apr` returned 85 vouchers, every one dated 7-Apr — 12.6 MB, ~148 KB
+per voucher. A range request was never a bigger request; it was the wrong
+request.
+
+* The window is now walked a **day at a time**. Each request is tiny and bounded
+  (12.6 MB on the heaviest day observed, against a 256 MB cap — ~20x headroom
+  that no longer grows with the window). Empty days return empty and cost
+  nothing. Nothing is discarded client-side.
+* ~2,922 requests cover 2019-2027. With the default 2s/5s pauses that is ~2.2
+  hours of deliberate pausing plus request time; set both to 0 for a backfill
+  when nobody is using Tally.
+* The window survives as the **checkpoint unit**: 7 days is 7 requests and one
+  enqueue, so a resumed walk repeats at most a week of cheap requests.
+* `SVCURRENTDATE` is opt-in per report. Trial Balance honours FROM/TO (probe 18
+  returned the 11 primary groups for 1-Apr..1-Sep), and pinning a current date
+  there would collapse a period report to a single day.
+
+### The guard got stronger
+
+One request asks for exactly one day, so the check is now **equality, not
+range**: every voucher in a response must carry the date asked for. Each of the
+~2,900 requests is individually verifiable, where before a month was
+spot-checked. The rc1 failure — asked 04-May..03-Jun, served 4 vouchers dated
+01-Sep — is pinned as a test.
+
+### A diagnostic probe is not read-only
+
+The rc1 gate run was measuring contamination, not a defect. Probes carrying
+`<SYSTEM TYPE="Formulae">` and a literal date set session state that outlived
+the request, and the next real extraction inherited it. A probe that injects TDL
+definitions into the production Tally must be run last and followed by a restart
+before any real extraction. Recorded in CLAUDE.md.
+
+### The report envelope
+
+The agent has sent the refused shape since its first commit. Every report
+request it has ever made was refused. That single fact explains three separate
+investigations:
+
+* `trial_balance` had never once come from the report route - it has always
+  served its ledger fallback, which is why it reconciled while nothing recorded
+  which route produced it;
+* the bills envelope hunt could never converge, because no bills envelope in
+  that shape could be accepted;
+* the Day Book voucher path was abandoned in `aeb6dca` for a Voucher collection,
+  because the report "did not work".
+
+`TallyEnvelopes.Report()` now sends the accepted shape and every report is
+unblocked at once. `BillsReport` is simply `Report` - there is no second shape
+left to get wrong.
+
+### Vouchers go back to the Day Book report
+
+Voucher collections ignore `SVFROMDATE` and serve from the financial-year start,
+so windowing had no effect: 85 windows, each a year's worth of serialisation,
+~99% discarded client-side.
+
+This is a straight revert of `aeb6dca`, which changed **only** the envelope -
+`VoucherExtractor` was written against the Day Book report and never stopped
+being a Day Book parser. The revert reunites it with the response it was built
+for. `VCHTYPE` is read as a fallback for `VOUCHERTYPENAME`, since Day Book
+carries it as an attribute.
+
+### The `$Date` filter ban was a misattribution
+
+`197f055` removed the TDL date filter because 4-day and 1-month windows timed
+out identically, and concluded the filter was forcing a full scan. It was not:
+with and without the filter the response is **byte-identical**. The filter was
+inert because `##SVFromDate` does not resolve inside a TDL formula here, and
+`<FILTER>` versus `<FILTERS>` makes no difference either.
+
+Identical timings across window sizes are exactly what you see when the window
+never mattered - which happens with or without a filter. One symptom, two
+candidate causes, only one of them tested. Literal dates work
+(`VoucherDatesForCounting`), and that is what the per-financial-year counts use.
+
+### The guard had to be re-derived, not kept
+
+The v2.3.0 period guard fired on Tally OVER-serving a window. That is the
+symptom of the bug this release fixes, so under the new mechanism it could never
+fire again - it would have passed silently forever while appearing to protect
+something. A guard that cannot fire is worse than none.
+
+Same evidence, opposite polarity: **any** out-of-window row is now an alarm
+(`TallyWindowNotHonoured`), checked on every window of every run, naming the two
+things that could have regressed. The client-side skip stays as the second line
+of defence.
+
+Completeness is proven separately, because the in-cycle guard cannot see
+truncation: `TallyAgent.Cli verify --fy-counts` asks Tally how many vouchers it
+holds per financial year, using a literal-date filtered collection. That is the
+independent number a finished walk is measured against.
+
+### Window sizing, from bytes
+
+One day of Day Book is 424,860 bytes for 3 vouchers - ~142 KB each, full detail
+with GST duty heads, address lists and invoice lines - at ~28 vouchers/day.
+7 days is ~28 MB against `maxResponseMb` 256 (~9x headroom); 30 days is ~119 MB
+(~2x, too little for a busy month-end). The default stays 7, now for a measured
+reason. A test asserts a default window stays under a quarter of the cap.
+
+`FETCH` does not reduce the payload: a `FETCH DATE` collection still returned 21
+fields per voucher. Do not size on the assumption that asking for less costs
+less.
+
 ## 2.3.0 - Verified against Tally's own export
 
 The final agent release for this phase. Everything in it was checked against

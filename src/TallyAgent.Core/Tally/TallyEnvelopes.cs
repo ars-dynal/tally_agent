@@ -29,23 +29,63 @@ public static class TallyEnvelopes
         return sb.ToString();
     }
 
-    /// <summary>Report export: "Day Book", "Trial Balance", "Balance Sheet",
-    /// "Profit and Loss A/c", "Stock Summary", ...</summary>
-    public static string Report(string reportName, DateOnly? from = null, DateOnly? to = null, string? company = null)
+    /// <summary>
+    /// Report export: "Day Book", "Trial Balance", "Balance Sheet",
+    /// "Profit and Loss A/c", "Stock Summary", ...
+    ///
+    /// THE SHAPE MATTERS, AND IT WAS WRONG UNTIL v2.4.0.
+    ///
+    /// Every report request this agent made from its first commit until v2.3.0
+    /// used TALLYREQUEST=Export Data with EXPORTDATA/REQUESTDESC/REPORTNAME,
+    /// and Tally refused ALL of them with
+    /// "&lt;RESPONSE&gt;Unknown Request, cannot be processed&lt;/RESPONSE&gt;".
+    /// Measured 2026-09-04: that shape refused, this one accepted, same server,
+    /// same company, same dates, seconds apart.
+    ///
+    /// The refusal is why trial_balance had never once come from the report
+    /// route, why the bills envelope hunt never converged, and why the Day Book
+    /// voucher path was abandoned for a Voucher collection in aeb6dca. One
+    /// wrong element name, three separate investigations.
+    ///
+    /// The accepted shape is the SAME envelope Collection requests use — the
+    /// report name goes in ID, and the static variables live under BODY/DESC:
+    ///
+    ///     &lt;HEADER&gt;&lt;TALLYREQUEST&gt;Export&lt;/TALLYREQUEST&gt;
+    ///             &lt;TYPE&gt;Data&lt;/TYPE&gt;&lt;ID&gt;Day Book&lt;/ID&gt;&lt;/HEADER&gt;
+    ///     &lt;BODY&gt;&lt;DESC&gt;&lt;STATICVARIABLES&gt;...&lt;/STATICVARIABLES&gt;&lt;/DESC&gt;&lt;/BODY&gt;
+    ///
+    /// Reports honour SVFROMDATE/SVTODATE. Voucher COLLECTIONS do not (they
+    /// ignore SVFROMDATE and serve from the financial-year start), which is the
+    /// whole reason windowing stopped working.
+    /// </summary>
+    /// <param name="currentDate">
+    /// SVCURRENTDATE. For the DAY BOOK this is the ONLY control that works:
+    /// measured 2026-09-04, SVCURRENTDATE=7-Apr-2026 with SVFROMDATE=5-Apr and
+    /// SVTODATE=7-Apr returned 85 vouchers, every one dated 7-Apr. FROM and TO
+    /// are ignored by that report entirely.
+    ///
+    /// Period reports are different — Trial Balance honours FROM/TO (probe 18
+    /// returned the 11 primary groups for 1-Apr..1-Sep) — so this is opt-in and
+    /// only the Day Book passes it. Sending it where it is not wanted would
+    /// collapse a period report to a single day.
+    /// </param>
+    public static string Report(string reportName, DateOnly? from = null, DateOnly? to = null,
+        string? company = null, DateOnly? currentDate = null)
     {
         var sb = new StringBuilder(512);
-        sb.Append("<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER>")
-          .Append("<BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>")
-          .Append(reportName)
-          .Append("</REPORTNAME><STATICVARIABLES>");
+        sb.Append("<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>")
+          .Append("<TYPE>Data</TYPE><ID>").Append(TallyXml.XmlEscape(reportName)).Append("</ID></HEADER>")
+          .Append("<BODY><DESC><STATICVARIABLES>")
+          .Append("<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>");
         if (!string.IsNullOrEmpty(company))
             sb.Append("<SVCURRENTCOMPANY>").Append(TallyXml.XmlEscape(company)).Append("</SVCURRENTCOMPANY>");
+        if (currentDate is { } cd)
+            sb.Append("<SVCURRENTDATE>").Append(cd.ToString("yyyyMMdd")).Append("</SVCURRENTDATE>");
         if (from is { } f)
             sb.Append("<SVFROMDATE>").Append(f.ToString("yyyyMMdd")).Append("</SVFROMDATE>");
         if (to is { } t)
             sb.Append("<SVTODATE>").Append(t.ToString("yyyyMMdd")).Append("</SVTODATE>");
-        sb.Append("<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>")
-          .Append("</STATICVARIABLES></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>");
+        sb.Append("</STATICVARIABLES></DESC></BODY></ENVELOPE>");
         return sb.ToString();
     }
 
@@ -139,27 +179,8 @@ public static class TallyEnvelopes
     /// "as of" SVTODATE. Remember the active period still governs
     /// (see CLAUDE.md) — a range outside it returns a valid, EMPTY response.
     /// </summary>
-    public static string BillsReport(string reportName, DateOnly from, DateOnly to, string? company)
-    {
-        var sb = new StringBuilder(768);
-        sb.Append("<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER>")
-          .Append("<BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>")
-          .Append(TallyXml.XmlEscape(reportName))
-          .Append("</REPORTNAME><STATICVARIABLES>");
-        if (!string.IsNullOrEmpty(company))
-            sb.Append("<SVCURRENTCOMPANY>").Append(TallyXml.XmlEscape(company)).Append("</SVCURRENTCOMPANY>");
-        sb.Append("<SVFROMDATE>").Append(from.ToString("yyyyMMdd")).Append("</SVFROMDATE>")
-          .Append("<SVTODATE>").Append(to.ToString("yyyyMMdd")).Append("</SVTODATE>")
-          // NO EXPLODEFLAG. v2.2.0 added one on the reasoning that the export
-          // would otherwise collapse to a party-level summary. Tally's own UI
-          // export disproves it: Bills.xml is bill-level (351 BILLFIXED records)
-          // and this envelope is otherwise identical to Report(), which the
-          // Trial Balance export shows working. It was the only thing separating
-          // the two, and it was never evidence.
-          .Append("<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>")
-          .Append("</STATICVARIABLES></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>");
-        return sb.ToString();
-    }
+    public static string BillsReport(string reportName, DateOnly from, DateOnly to, string? company) =>
+        Report(reportName, from, to, company);
 
     /// <summary>
     /// Fallback for an empty Bills Outstanding report export: the Bills
@@ -193,6 +214,50 @@ public static class TallyEnvelopes
           .Append("</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>");
         return sb.ToString();
     }
+
+    /// <summary>
+    /// Voucher DATEs for a range, for counting only.
+    ///
+    /// Uses a LITERAL date filter, not ##SVFromDate. Measured 2026-09-04: the
+    /// same collection with ##SVFromDate returned 4,355 vouchers for a one-day
+    /// window (byte-identical to sending no filter at all), while a literal
+    /// date returned 4. The filter mechanism was never broken — the variables
+    /// simply do not resolve inside a TDL formula here, so the filter was inert
+    /// and Tally served the financial year instead.
+    ///
+    /// &lt;FILTER&gt; and &lt;FILTERS&gt; behave identically, so the element name
+    /// was not the problem either.
+    ///
+    /// This is the agent's INDEPENDENT count of what Tally holds, used to prove
+    /// a walk was complete rather than assuming it. Roughly 1.3 KB per voucher
+    /// (Tally serialises a fixed field set whatever FETCH asks for), so a
+    /// financial year costs a few MB — cheap enough to run once per full sync,
+    /// far too expensive to run every cycle.
+    /// </summary>
+    public static string VoucherDatesForCounting(DateOnly from, DateOnly to, string? company)
+    {
+        var sb = new StringBuilder(1024);
+        sb.Append("<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>")
+          .Append("<TYPE>Collection</TYPE><ID>AgentVoucherDates</ID></HEADER>")
+          .Append("<BODY><DESC><STATICVARIABLES>")
+          .Append("<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>");
+        if (!string.IsNullOrEmpty(company))
+            sb.Append("<SVCURRENTCOMPANY>").Append(TallyXml.XmlEscape(company)).Append("</SVCURRENTCOMPANY>");
+        sb.Append("<SVFROMDATE>").Append(from.ToString("yyyyMMdd")).Append("</SVFROMDATE>")
+          .Append("<SVTODATE>").Append(to.ToString("yyyyMMdd")).Append("</SVTODATE>")
+          .Append("</STATICVARIABLES><TDL><TDLMESSAGE>")
+          .Append("<COLLECTION NAME=\"AgentVoucherDates\"><TYPE>Voucher</TYPE>")
+          .Append("<FETCH>DATE</FETCH><FILTER>AgentVoucherDateRange</FILTER></COLLECTION>")
+          .Append("<SYSTEM TYPE=\"Formulae\" NAME=\"AgentVoucherDateRange\">")
+          .Append("$Date &gt;= $$Date:\"").Append(TallyDate(from)).Append("\"")
+          .Append(" AND $Date &lt;= $$Date:\"").Append(TallyDate(to)).Append("\"")
+          .Append("</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>");
+        return sb.ToString();
+    }
+
+    /// <summary>The date form Tally's TDL formulas accept: 1-Sep-2026.</summary>
+    internal static string TallyDate(DateOnly d) =>
+        d.ToString("d-MMM-yyyy", System.Globalization.CultureInfo.InvariantCulture);
 
     /// <summary>
     /// The open company's period. Tally bounds EVERY export by the active

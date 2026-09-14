@@ -38,6 +38,7 @@ public partial class ConfigWindow : Window
         if (_startDateInert) StartDateInertText.Visibility = Visibility.Visible;
         EndDateBox.Text = _config.Tally.ExtractionEndDate;
         FrequencyBox.Text = _config.Tally.SyncFrequencyMinutes.ToString();
+        DailyAtBox.Text = _config.Tally.DailySyncAt;
         LookbackBox.Text = _config.Tally.IncrementalLookbackDays.ToString();
         SnapshotsCheck.IsChecked = _config.Tally.EnableSnapshots;
         // Per-report flags (v2.1.0). A report with no entry in snapshotDatasets
@@ -74,6 +75,10 @@ public partial class ConfigWindow : Window
             _config.Tally.ExtractionStartDate = StartDateBox.Text.Trim();
             _config.Tally.ExtractionEndDate = EndDateBox.Text.Trim();
             _config.Tally.SyncFrequencyMinutes = int.Parse(FrequencyBox.Text.Trim());
+            var dailyAt = DailyAtBox.Text.Trim();
+            if (dailyAt.Length > 0 && TallyAgent.Core.Sync.SyncSchedule.ParseDailyAt(dailyAt) is null)
+                throw new FormatException("Daily sync at must be HH:mm, e.g. 21:00, or blank.");
+            _config.Tally.DailySyncAt = dailyAt;
             _config.Tally.IncrementalLookbackDays = int.Parse(LookbackBox.Text.Trim());
             _config.Tally.EnableSnapshots = SnapshotsCheck.IsChecked == true;
             // Always write every report explicitly, so what the window shows is

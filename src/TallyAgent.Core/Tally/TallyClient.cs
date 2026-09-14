@@ -186,6 +186,38 @@ public sealed class TallyClient : IDisposable
     }
 
     /// <summary>
+    /// How many vouchers Tally itself holds in a date range, and their extent.
+    ///
+    /// This is the INDEPENDENT number a completed walk is measured against.
+    /// Without it "the sync finished" only ever means "the agent stopped", and
+    /// truncation is invisible — which is the failure this project keeps
+    /// rediscovering.
+    ///
+    /// Uses a literal-date TDL filter (see
+    /// <see cref="TallyEnvelopes.VoucherDatesForCounting"/>): ##SVFromDate does
+    /// not resolve here, and a filter referencing it is silently inert.
+    /// </summary>
+    public async Task<(int Count, string? MinDate, string? MaxDate)> CountVouchersAsync(
+        DateOnly from, DateOnly to, CancellationToken ct = default)
+    {
+        var doc = await PostAsync(TallyEnvelopes.VoucherDatesForCounting(from, to, _settings.Company),
+            VoucherRequestTimeout, maxTimeoutRetries: 0, ct);
+
+        string? min = null, max = null;
+        var n = 0;
+        foreach (var el in doc.Descendants())
+        {
+            if (!el.Name.LocalName.Equals("DATE", StringComparison.OrdinalIgnoreCase)) continue;
+            var iso = TallyXml.Date(new XElement("X", new XElement("DATE", el.Value)), "DATE");
+            if (iso is null) continue;
+            n++;
+            if (min is null || string.CompareOrdinal(iso, min) < 0) min = iso;
+            if (max is null || string.CompareOrdinal(iso, max) > 0) max = iso;
+        }
+        return (n, min, max);
+    }
+
+    /// <summary>
     /// The company's BOOKS range — the outer bound of what data can exist.
     ///
     /// This is NOT the active period. Measured on the Tally server: the agent
