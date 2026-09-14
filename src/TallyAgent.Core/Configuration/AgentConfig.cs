@@ -29,6 +29,12 @@ public sealed class TallySettings
     /// tracking live data should use.</summary>
     [JsonPropertyName("extractionEndDate")] public string ExtractionEndDate { get; set; } = "";
     [JsonPropertyName("syncFrequencyMinutes")] public int SyncFrequencyMinutes { get; set; } = 15;
+    /// <summary>ONE SYNC A DAY, AT THIS LOCAL TIME (HH:mm), e.g. "21:00" -- after the
+    /// working day, so the books are read once when they are complete rather than
+    /// polled every hour while accounts is still posting. When set, the interval in
+    /// syncFrequencyMinutes is ignored for scheduled runs; "Sync now" still runs at
+    /// once. Blank keeps the interval schedule. Read at service start.</summary>
+    [JsonPropertyName("dailySyncAt")] public string DailySyncAt { get; set; } = "";
     [JsonPropertyName("requestTimeoutSeconds")] public int RequestTimeoutSeconds { get; set; } = 120;
     /// <summary>Timeout for windowed voucher extraction requests, which are the
     /// heaviest calls the agent makes. Defaults higher than requestTimeoutSeconds

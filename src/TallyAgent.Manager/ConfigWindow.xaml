@@ -12,7 +12,7 @@
                 <Grid.RowDefinitions>
                     <RowDefinition/><RowDefinition/><RowDefinition/>
                     <RowDefinition/><RowDefinition/><RowDefinition/>
-                    <RowDefinition/>
+                    <RowDefinition/><RowDefinition/>
                 </Grid.RowDefinitions>
                 <TextBlock Grid.Row="0" Text="Host" VerticalAlignment="Center"/>
                 <TextBox Grid.Row="0" Grid.Column="1" x:Name="HostBox" Margin="0,2"/>
@@ -37,8 +37,11 @@
                          ToolTip="yyyy-MM-dd. Leave BLANK on the machine that tracks live data.&#x0a;Set it with the start date to back-fill one financial year at a time,&#x0a;e.g. start 2019-04-01 and end 2020-03-31."/>
                 <TextBlock Grid.Row="5" Text="Sync frequency (min)" VerticalAlignment="Center"/>
                 <TextBox Grid.Row="5" Grid.Column="1" x:Name="FrequencyBox" Margin="0,2"/>
-                <TextBlock Grid.Row="6" Text="Lookback days" VerticalAlignment="Center"/>
-                <TextBox Grid.Row="6" Grid.Column="1" x:Name="LookbackBox" Margin="0,2"/>
+                <TextBlock Grid.Row="6" Text="Daily sync at (HH:mm)" VerticalAlignment="Center"/>
+                <TextBox Grid.Row="6" Grid.Column="1" x:Name="DailyAtBox" Margin="0,2"
+                         ToolTip="One sync a day at this local time, e.g. 21:00 -- after the working day.&#x0a;When set, the frequency above is ignored for scheduled runs; Sync now still runs at once.&#x0a;Leave blank to sync every N minutes. Takes effect after the service restarts."/>
+                <TextBlock Grid.Row="7" Text="Lookback days" VerticalAlignment="Center"/>
+                <TextBox Grid.Row="7" Grid.Column="1" x:Name="LookbackBox" Margin="0,2"/>
             </Grid>
         </GroupBox>
 

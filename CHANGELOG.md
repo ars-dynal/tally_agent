@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.4.2 - One sync a day, and "nothing changed" said as such
+
+### Daily schedule
+New setting `tally.dailySyncAt` (Manager: Settings > "Daily sync at (HH:mm)").
+When set -- e.g. `21:00` -- the service runs one scheduled sync a day at that
+local time, after the working day, instead of every N minutes. "Sync now" is
+unaffected. On a service restart in daily mode the first run waits for the
+slot rather than reading half a day's books at once. Read at service start.
+
+### A run the AlterID gate skipped is not "0 of 30 datasets"
+When nothing changed in Tally, the gate skips every collection -- correct --
+but the run was recorded as 0 of 30 datasets and raised the "sync incomplete"
+alert every hour. On 14 Sep 2026 that produced seventeen alerts for a company
+nobody had posted to, and the Manager read "Healthy ... all 0 datasets".
+Datasets attempted now means attempted; an untouched run records 0 of 0 with
+the message "No changes in Tally since the last sync", the Manager says
+"Healthy -- Tally unchanged; checked <time>", and no alert is raised.
+
+
 ## 2.4.1 - Item invoices lost their sales ledger; en dashes lost their shape
 
 Found by tying the warehouse to Tally's own ledger-wise Trial Balance for

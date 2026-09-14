@@ -4,7 +4,7 @@ A Windows service + WPF Manager that extracts data from TallyPrime and uploads i
 to GCP (GCS → BigQuery) for Dynalektric Equipment Private Limited. Part of
 Dynalektric Enterprise AI, Domain 1 (Finance & Accounts).
 
-Current version: **2.4.0**. Installed on the Tally server.
+Current version: **2.4.2**. Installed on the Tally server.
 
 ## Build, test, release
 

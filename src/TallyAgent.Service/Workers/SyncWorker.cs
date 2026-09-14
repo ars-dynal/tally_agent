@@ -27,8 +27,9 @@ public sealed class SyncWorker(
 {
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        log.LogInformation("SyncWorker started: every {N} min, lookback {L} days",
-            config.Tally.SyncFrequencyMinutes, config.Tally.IncrementalLookbackDays);
+        log.LogInformation("SyncWorker started: {Schedule}, lookback {L} days",
+            SyncSchedule.Describe(config.Tally.DailySyncAt, config.Tally.SyncFrequencyMinutes),
+            config.Tally.IncrementalLookbackDays);
 
         // Say once whether anybody would actually be told about a failure.
         alerter.LogChannelStatus();
@@ -36,8 +37,13 @@ public sealed class SyncWorker(
         // Small startup delay so boot-time services (incl. Tally) settle first.
         await SafeDelay(TimeSpan.FromSeconds(20), ct);
 
-        var interval = TimeSpan.FromMinutes(config.Tally.SyncFrequencyMinutes);
-        var nextRun = DateTime.UtcNow; // first cycle immediately
+        // Interval schedule: first cycle immediately. Daily schedule: wait for the
+        // slot -- a service restart at 11:00 must not read half a day's books.
+        var daily = SyncSchedule.ParseDailyAt(config.Tally.DailySyncAt) is not null;
+        var nextRun = daily
+            ? SyncSchedule.NextRunUtc(DateTime.UtcNow, config.Tally.DailySyncAt, config.Tally.SyncFrequencyMinutes)
+            : DateTime.UtcNow;
+        if (daily) log.LogInformation("First scheduled sync at {Next:HH:mm:ss} UTC", nextRun);
 
         while (!ct.IsCancellationRequested)
         {
@@ -50,7 +56,7 @@ public sealed class SyncWorker(
                 // Provisional (in case the cycle crashes before the finally
                 // below); the real next-run time is computed AFTER the cycle
                 // ends so Tally always gets a full idle interval between cycles.
-                nextRun = DateTime.UtcNow + interval;
+                nextRun = SyncSchedule.NextRunUtc(DateTime.UtcNow, config.Tally.DailySyncAt, config.Tally.SyncFrequencyMinutes);
                 state.LastAttemptedSyncUtc = DateTime.UtcNow.ToString("O");
                 try
                 {
@@ -132,8 +138,8 @@ public sealed class SyncWorker(
                     // v2.0.4 computed nextRun before running, so any cycle longer
                     // than the interval was followed by another one immediately —
                     // Tally never got an idle gap during office hours.
-                    nextRun = DateTime.UtcNow + interval;
-                    log.LogInformation("Next scheduled sync at {Next:HH:mm:ss} UTC", nextRun);
+                    nextRun = SyncSchedule.NextRunUtc(DateTime.UtcNow, config.Tally.DailySyncAt, config.Tally.SyncFrequencyMinutes);
+                    log.LogInformation("Next scheduled sync at {Next:HH:mm:ss} UTC ({Local:dd MMM HH:mm} local)", nextRun, nextRun.ToLocalTime());
                 }
             }
 

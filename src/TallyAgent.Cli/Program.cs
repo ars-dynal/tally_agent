@@ -1038,6 +1038,7 @@ static void ApplySet(AgentConfig cfg, string key, string value)
         case "tally.company": cfg.Tally.Company = value; break;
         case "tally.extractionstartdate": cfg.Tally.ExtractionStartDate = value; break;
         case "tally.syncfrequencyminutes": cfg.Tally.SyncFrequencyMinutes = int.Parse(value); break;
+        case "tally.dailysyncat": cfg.Tally.DailySyncAt = value; break;
         case "tally.autodiscovercompanies": cfg.Tally.AutoDiscoverCompanies = bool.Parse(value); break;
         case "tally.enablemasters": cfg.Tally.EnableMasters = bool.Parse(value); break;
         case "tally.enablevouchers": cfg.Tally.EnableVouchers = bool.Parse(value); break;

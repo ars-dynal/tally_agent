@@ -114,6 +114,11 @@ public partial class MainWindow : Window
         var missing = last.DatasetsAttempted - last.DatasetsSucceeded;
         switch (last.Status)
         {
+            case "success" when last.DatasetsAttempted == 0:
+                SetHealth($"Healthy — Tally unchanged; checked {Local(last.FinishedUtc)}",
+                    $"No changes in Tally since the last sync, so nothing was loaded ({last.Mode} run).", Good);
+                break;
+
             case "success":
                 SetHealth($"Healthy — last sync completed {Local(last.FinishedUtc)}, " +
                           $"all {last.DatasetsSucceeded} datasets",

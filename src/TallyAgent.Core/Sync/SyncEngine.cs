@@ -482,12 +482,22 @@ public sealed class SyncEngine(
             }
 
             var status = failed == 0 ? "success" : ok > 0 ? "partial" : "failed";
+            // ATTEMPTED MEANS ATTEMPTED. A cycle the AlterID gate waved through --
+            // nothing changed in Tally, nothing asked for -- used to be recorded as
+            // "0 of 30 datasets" and raised the 'sync incomplete' alert every hour
+            // (14 Sep 2026: seventeen alerts for a company nobody had posted to).
+            // Only datasets actually asked for count, and an untouched run says why.
+            var attempted = ok + failed;
+            var unchanged = status == "success" && attempted == 0 && alterIds is not null;
             _progress.Status = status;
             _progress.Rows = totalRows;
-            _progress.Message = errorList.Count > 0 ? string.Join("; ", errorList) : "";
+            _progress.Message = errorList.Count > 0 ? string.Join("; ", errorList)
+                : unchanged ? "No changes in Tally since the last sync (AlterID unchanged) — nothing to load." : "";
             RecordRunFinish(syncId, status, totalRows,
                 errorList.Count > 0 ? string.Join("; ", errorList) : null,
-                windowFrom, windowTo, enabled.Count, ok, failedDatasets);
+                windowFrom, windowTo, attempted, ok, failedDatasets);
+            if (unchanged)
+                log.LogInformation("Sync {SyncId}: no changes in Tally since the last sync — nothing to load", syncId);
             log.LogInformation("Sync {SyncId} {Status}: {Rows} rows, {Ok} ok, {Failed} failed ({Elapsed:F0}s)",
                 syncId, status, totalRows, ok, failed, (DateTime.UtcNow - started).TotalSeconds);
             return new SyncResult(syncId, status, ok, failed, totalRows, errorList);
