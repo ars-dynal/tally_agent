@@ -341,7 +341,25 @@ static async Task<int> MasterBalances(List<string> a, bool json)
     if (await FailFastIfTallyUnreachable(client, cfg, json) is { } unreachable) return unreachable;
 
     var books = await client.GetBooksPeriodAsync();
-    var db = new AgentDatabase(NullLogger<AgentDatabase>.Instance);
+
+    // A THROWAWAY DATABASE, AND THAT IS THE POINT.
+    //
+    // This command fetches master balances AS OF AN ARBITRARY DATE, and
+    // StockItems()/Ledgers() persist whatever they fetch into the balance
+    // store. Pointed at the agent's own database, asking for 30-Apr would
+    // leave April's stock values sitting in the cache that the service serves
+    // on any cycle that does not re-fetch -- a month-end figure published as
+    // today's, in a finance warehouse, with nothing on screen to say so.
+    //
+    // Running the command unprivileged surfaced this as "SQLite Error 8:
+    // attempt to write a readonly database", which was the file permissions
+    // doing the right thing by accident. Elevating would have silently made it
+    // worse. So the command now gets its own empty database in TEMP: the
+    // fetch is live from Tally either way, the cache it writes is discarded,
+    // and the real agent.db is never opened.
+    var diagDb = Path.Combine(Path.GetTempPath(),
+        $"tally-agent-diag-{Guid.NewGuid():N}.db");
+    var db = new AgentDatabase(NullLogger<AgentDatabase>.Instance, diagDb);
     var masters = new MasterExtractor(client, new MasterBalanceRepository(db),
         NullLogger<MasterExtractor>.Instance);
     masters.BeginCycle(cfg.Tally.Company, fetchBalances: true, asOf: asOf);
@@ -368,6 +386,8 @@ static async Task<int> MasterBalances(List<string> a, bool json)
         ledger_closing_balance = target is null ? (double?)null : Math.Round(D(target["closing_balance"]), 2),
         balance_as_of = target?["balance_as_of"],
     };
+
+    try { File.Delete(diagDb); } catch { /* temp file; best effort */ }
 
     if (json) Console.WriteLine(JsonSerializer.Serialize(payload,
         new JsonSerializerOptions { WriteIndented = true }));
