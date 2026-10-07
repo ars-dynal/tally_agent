@@ -381,10 +381,34 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                 ? allInventory
                 : v.Descendants("INVENTORYENTRIES.LIST").ToList();
 
+            // STOCK JOURNALS (2.4.4, found 8 Oct 2026). In the Day Book REPORT
+            // export (2.4.0 onward) a Stock Journal carries its lines as
+            // INVENTORYENTRIESOUT.LIST (Source / consumption) and
+            // INVENTORYENTRIESIN.LIST (Destination / production) -- neither of the
+            // two shapes above. Every stock journal since 4 Sep arrived with its
+            // header and NO stock line: September had 137 stock journals and 0
+            // item lines, which emptied the production feed downstream. Read
+            // them, signed the way every other stock line is: inward quantity
+            // positive with a negative (debit) amount, outward the reverse.
+            var journalIn = new List<XElement>();
+            var journalOut = new List<XElement>();
+            if (inventoryEntries.Count == 0)
+            {
+                journalIn = v.Descendants("INVENTORYENTRIESIN.LIST").ToList();
+                journalOut = v.Descendants("INVENTORYENTRIESOUT.LIST").ToList();
+                inventoryEntries = journalOut.Concat(journalIn).ToList();
+            }
+            var inwardSet = new HashSet<XElement>(journalIn);
+            var outwardSet = new HashSet<XElement>(journalOut);
+
             foreach (var inv in inventoryEntries)
             {
                 var stockItem = Text(inv, "STOCKITEMNAME");
                 if (stockItem.Length == 0) continue;
+                var qty = Num(inv, "ACTUALQTY");
+                var amt = Num(inv, "AMOUNT");
+                if (inwardSet.Contains(inv)) { qty = Math.Abs(qty); amt = -Math.Abs(amt); }
+                else if (outwardSet.Contains(inv)) { qty = -Math.Abs(qty); amt = Math.Abs(amt); }
                 var invRow = new Row
                 {
                     ["voucher_guid"] = guid,
@@ -393,9 +417,9 @@ public sealed class VoucherExtractor(TallyClient client, ILogger<VoucherExtracto
                     ["voucher_date"] = voucherDateText,
                     ["voucher_number"] = voucherNumber,
                     ["stock_item"] = stockItem,
-                    ["quantity"] = Num(inv, "ACTUALQTY"),
+                    ["quantity"] = qty,
                     ["rate"] = Num(inv, "RATE"),
-                    ["amount"] = Num(inv, "AMOUNT"),
+                    ["amount"] = amt,
                     ["godown"] = FirstGodown(inv),
                 };
                 result.InventoryEntries.Add(invRow);

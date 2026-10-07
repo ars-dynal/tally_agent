@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.4.4 - Stock journal lines
+
+The Day Book report (2.4.0 onward) serialises a Stock Journal's lines as
+`INVENTORYENTRIESOUT.LIST` (source / consumption) and `INVENTORYENTRIESIN.LIST`
+(destination / production). The extractor read only `ALLINVENTORYENTRIES.LIST`
+and `INVENTORYENTRIES.LIST`, so every stock journal since 4 Sep 2026
+arrived with its header and no stock line (September: 137 stock journals, 0
+item lines), which emptied the product P&L's production feed. Both lists are
+now read, signed like every other stock line (inward qty positive / amount
+negative, outward the reverse). Test `StockJournalLinesTests`. After installing,
+run one sync with Lookback 40 days so September's journals are re-sent.
+
+## 2.4.3 - The version on the window
+
+The Manager's title bar and health banner now show the installed agent version
+(`Tally BigQuery Agent v2.4.3`; "Agent v2.4.3 · service TallyBigQueryAgent" under
+the banner). On 19 Sep 2026 nobody could tell from the Manager which build was
+running, and the answer decided whether a known defect still applied. No
+extraction changes.
+
+Operational note from the same day: after "Sync now", the agent still UPLOADS
+for a few minutes ("records queued for upload"). A BigQuery mart rebuild started
+before the upload finishes rebuilds from the old data and looks like the sync
+did nothing. Wait for "Sent to cloud" to drain (or for the app's strip to say
+"new data landed") before rebuilding.
+
 ## 2.4.2 - One sync a day, and "nothing changed" said as such
 
 ### Daily schedule
