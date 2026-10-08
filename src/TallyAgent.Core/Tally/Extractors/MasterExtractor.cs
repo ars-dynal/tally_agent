@@ -36,23 +36,60 @@ public sealed class MasterExtractor(TallyClient client, MasterBalanceRepository 
     private XDocument? _stockItemDoc;
     private bool _fetchBalances;
     private string _company = "";
+    private DateOnly _asOf = DateOnly.FromDateTime(DateTime.Today);
 
     /// <summary>Start a cycle. <paramref name="fetchBalances"/>: ask Tally for
     /// computed balances this cycle (and persist them); otherwise balances are
-    /// filled from the last capture.</summary>
-    public void BeginCycle(string company, bool fetchBalances)
+    /// filled from the last capture. <paramref name="asOf"/>: the date the
+    /// balances are computed AS OF (see <see cref="BalanceBearingCollection"/>);
+    /// defaults to today.</summary>
+    public void BeginCycle(string company, bool fetchBalances, DateOnly? asOf = null)
     {
         EndCycle();
         _company = company;
         _fetchBalances = fetchBalances || client.IncludeMasterBalances;
+        _asOf = asOf ?? DateOnly.FromDateTime(DateTime.Today);
     }
     public void EndCycle() { _ledgerDoc = null; _stockItemDoc = null; }
 
     /// <summary>True when this cycle captured fresh balances from Tally.</summary>
     public bool FetchedBalancesThisCycle => _fetchBalances;
 
+    /// <summary>The date balance-bearing collections are computed as of.</summary>
+    public DateOnly AsOfDate => _asOf;
+
     private async Task<XDocument> FetchCollection(string type, string[] fields, CancellationToken ct) =>
         await client.PostAsync(TallyEnvelopes.Collection(type, fields, client.Company), ct);
+
+    /// <summary>
+    /// A collection whose values Tally COMPUTES as of a date — Ledger
+    /// (OPENING/CLOSINGBALANCE) and StockItem (CLOSINGBALANCE/VALUE/RATE).
+    ///
+    /// SVTODATE ONLY. Never SVFROMDATE.
+    ///
+    /// Pinning the to-date is necessary: without it Tally evaluates
+    /// $ClosingBalance against whatever period is loaded, so the as-of date of
+    /// every master balance was decided by whoever last pressed Alt+F2.
+    ///
+    /// Adding a FROM-date is not. It was added so P&amp;L ledgers would scope to
+    /// the financial year, and it WEDGES TALLY: the ledgers-with-balances
+    /// request never returns and tally.exe has to be restarted. Raising
+    /// requestTimeoutSeconds to 300 did not help, because it is not a timeout —
+    /// asking Tally to compute period movement for 2,507 ledgers in one request
+    /// is work it does not come back from.
+    ///
+    /// The FY scoping is no longer needed anyway: the statements read fact_gl,
+    /// not the ledger master. The master is a cross-check now, and a cross-check
+    /// does not need financial-year scoping.
+    ///
+    /// Masters are not period-bound, so this changes WHEN the values are
+    /// measured, not WHICH masters come back.
+    /// </summary>
+    private async Task<XDocument> BalanceBearingCollection(string type, string[] fields,
+        CancellationToken ct) =>
+        await client.PostAsync(
+            TallyEnvelopes.Collection(type, fields, client.Company, from: null, to: _asOf), ct);
+
 
     private static readonly string[] LedgerBaseFields =
     [
@@ -90,7 +127,11 @@ public sealed class MasterExtractor(TallyClient client, MasterBalanceRepository 
             var fields = _fetchBalances
                 ? LedgerBaseFields.Concat(LedgerBalanceFields).ToArray()
                 : LedgerBaseFields;
-            _ledgerDoc = await FetchCollection("Ledger", fields, ct);
+            // NO from-date. A from-date wedges Tally on this request - see
+            // BalanceBearingCollection. P&L ledgers therefore come back as an
+            // all-time accumulation from the start of the books, which is
+            // correct for a cross-check and is NOT what the statements read.
+            _ledgerDoc = await BalanceBearingCollection("Ledger", fields, ct);
             return _ledgerDoc;
         }
         finally { _cacheLock.Release(); }
@@ -107,7 +148,10 @@ public sealed class MasterExtractor(TallyClient client, MasterBalanceRepository 
             var fields = _fetchBalances
                 ? StockItemBaseFields.Concat(StockItemBalanceFields).ToArray()
                 : StockItemBaseFields;
-            _stockItemDoc = await FetchCollection("StockItem", fields, ct);
+            // Stock valuation is cumulative by nature - closing stock is
+            // everything ever bought less everything ever sold - and with
+            // SVTODATE alone it ties to Tally exactly (-18,70,08,352.35).
+            _stockItemDoc = await BalanceBearingCollection("StockItem", fields, ct);
             return _stockItemDoc;
         }
         finally { _cacheLock.Release(); }
@@ -147,6 +191,11 @@ public sealed class MasterExtractor(TallyClient client, MasterBalanceRepository 
     private BalanceSource NewBalanceSource(string dataset)
     {
         if (_fetchBalances)
+            // Still the capture instant, NOT the as-of date. With SVTODATE
+            // pinned to today the two coincide, and the cached path serves
+            // LastCapturedUtc — making this date-only would mix formats in one
+            // column. Carrying the as-of date properly is a schema change and a
+            // separate decision.
             return new BalanceSource(true, new(), DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"));
         try
         {

@@ -160,7 +160,8 @@ public sealed class RequestRejectionTests : IDisposable
         {
             Calls++;
             var body = await req.Content!.ReadAsStringAsync(ct);
-            var reply = body.Contains("REPORTNAME") ? refuse : ledgers;
+            // A report request is TYPE=Data; a collection is TYPE=Collection.
+            var reply = body.Contains("<TYPE>Data</TYPE>") ? refuse : ledgers;
             return new HttpResponseMessage(HttpStatusCode.OK)
             { Content = new StringContent(reply, Encoding.UTF8, "text/xml") };
         }

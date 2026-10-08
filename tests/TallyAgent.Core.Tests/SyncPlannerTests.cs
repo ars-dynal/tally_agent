@@ -19,6 +19,122 @@ public class SyncPlannerTests
         new("_vouchers_window", "Co", lastFrom, lastTo,
             SyncPlanner.NewestFirstCheckpointMarker, null, false);
 
+    // ── the walk must be able to RECORD that it finished ─────────────────
+
+    /// <summary>
+    /// The dead-end: a finished walk that can never latch.
+    ///
+    /// Once the frontier reaches the target the planner returns ZERO windows.
+    /// FullSyncDone was only ever set inside the window loop, so the loop never
+    /// ran, the flag never latched, and every run replanned "full" for ever.
+    /// Observed on the server: 85/85 windows, 622,379 records, still full mode.
+    /// </summary>
+    [Fact]
+    public void AWalkThatHasReachedTheTarget_ReportsItselfComplete()
+    {
+        var reached = new SyncCheckpoint("_vouchers_window", "Co",
+            LastFromDate: "2019-04-01", LastToDate: "2026-09-04",
+            LastAlterId: SyncPlanner.NewestFirstCheckpointMarker,
+            LastSuccessUtc: null, FullSyncDone: false);
+
+        var plan = SyncPlanner.PlanVoucherWindows(Settings(start: "2019-04-01"), reached, Today);
+
+        Assert.True(plan.WalkComplete);      // the engine latches on this
+        Assert.Empty(plan.Windows);          // nothing left to extract
+        Assert.Equal(new DateOnly(2019, 4, 1), plan.TargetStart);
+    }
+
+    [Fact]
+    public void AWalkStillInProgress_IsNotReportedComplete_AndResumesFromTheFrontier()
+    {
+        var midway = new SyncCheckpoint("_vouchers_window", "Co",
+            LastFromDate: "2024-01-01", LastToDate: "2026-09-04",
+            LastAlterId: SyncPlanner.NewestFirstCheckpointMarker,
+            LastSuccessUtc: null, FullSyncDone: false);
+
+        var plan = SyncPlanner.PlanVoucherWindows(Settings(start: "2019-04-01"), midway, Today);
+
+        Assert.False(plan.WalkComplete);
+        Assert.NotEmpty(plan.Windows);
+        // Resumes BACKWARDS from the day before the frontier, not from today.
+        Assert.Equal(new DateOnly(2023, 12, 31), plan.Windows[0].To);
+    }
+
+    [Fact]
+    public void AFirstRun_IsNotReportedComplete()
+    {
+        var plan = SyncPlanner.PlanVoucherWindows(Settings(start: "2019-04-01"), null, Today);
+        Assert.False(plan.WalkComplete);
+        Assert.NotEmpty(plan.Windows);
+    }
+
+    // ── clamping a window to Tally's books (v2.4.0) ──────────────────────
+
+    /// <summary>
+    /// THE regression, from 2026-09-05: the incremental window ran
+    /// 29-Aug..05-Sep while Tally's books ended 04-Sep, because nobody had
+    /// posted a voucher yet that morning. The old guard rejected the WHOLE
+    /// window, so a week of real data did not load — and the run still reported
+    /// "Failed batches: 0".
+    /// </summary>
+    [Fact]
+    public void AWindowOvershootingTheBooksEnd_IsTrimmed_NotRejected()
+    {
+        var (outcome, to) = SyncPlanner.ClampToBooks(
+            from: new DateOnly(2026, 8, 29), to: new DateOnly(2026, 9, 5),
+            booksFrom: new DateOnly(2019, 4, 1), booksTo: new DateOnly(2026, 9, 4));
+
+        Assert.Equal(SyncPlanner.BooksClamp.Trimmed, outcome);
+        Assert.Equal(new DateOnly(2026, 9, 4), to);   // the valid week still loads
+    }
+
+    [Fact]
+    public void AWindowInsideTheBooks_IsLeftAlone()
+    {
+        var (outcome, to) = SyncPlanner.ClampToBooks(
+            new DateOnly(2026, 8, 29), new DateOnly(2026, 9, 4),
+            new DateOnly(2019, 4, 1), new DateOnly(2026, 9, 4));
+
+        Assert.Equal(SyncPlanner.BooksClamp.Ok, outcome);
+        Assert.Equal(new DateOnly(2026, 9, 4), to);
+    }
+
+    /// <summary>The guard's real purpose survives: an operator who has narrowed
+    /// Alt+F2 so the window starts before the books is still an error, because
+    /// that range genuinely cannot be served.</summary>
+    [Fact]
+    public void AWindowStartingBeforeTheBooks_IsStillAnError()
+    {
+        var (outcome, _) = SyncPlanner.ClampToBooks(
+            new DateOnly(2019, 1, 1), new DateOnly(2019, 6, 30),
+            new DateOnly(2019, 4, 1), new DateOnly(2026, 9, 4));
+
+        Assert.Equal(SyncPlanner.BooksClamp.BeforeBooksStart, outcome);
+    }
+
+    /// <summary>Clamping must never produce an empty or inverted window.</summary>
+    [Fact]
+    public void AWindowStartingAfterTheBooksEnd_IsStillAnError()
+    {
+        var (outcome, _) = SyncPlanner.ClampToBooks(
+            new DateOnly(2026, 10, 1), new DateOnly(2026, 10, 7),
+            new DateOnly(2019, 4, 1), new DateOnly(2026, 9, 4));
+
+        Assert.Equal(SyncPlanner.BooksClamp.AfterBooksEnd, outcome);
+    }
+
+    [Fact]
+    public void ASingleDayAtTheBooksEnd_Survives()
+    {
+        // The boundary itself: from == to == booksTo must not be trimmed away.
+        var (outcome, to) = SyncPlanner.ClampToBooks(
+            new DateOnly(2026, 9, 4), new DateOnly(2026, 9, 4),
+            new DateOnly(2019, 4, 1), new DateOnly(2026, 9, 4));
+
+        Assert.Equal(SyncPlanner.BooksClamp.Ok, outcome);
+        Assert.Equal(new DateOnly(2026, 9, 4), to);
+    }
+
     // ── extractionStartDate: inert once the checkpoint latches (v2.2.0) ──
 
     /// <summary>The setting is only read inside the !FullSyncDone branch, so
@@ -237,4 +353,42 @@ public class SyncPlannerTests
         Assert.All(plan.Windows, w => Assert.True(w.To <= new DateOnly(2020, 3, 31)));
     }
 
+
+    // ── 2.4.5: the previous month is re-read until month-end entries settle ──
+
+    [Fact]
+    public void EarlyInTheMonth_TheWholePreviousMonthIsReRead()
+    {
+        // 8 Oct with a 30-day lookback starts 8 Sep -- 1-7 Sep were never re-sent
+        // after the stock-journal fix. Until the 20th, start at 1 Sep instead.
+        var s = new TallySettings { IncrementalLookbackDays = 30, FullSyncChunkDays = 7, CoverPreviousMonthUntilDay = 20 };
+        var plan = SyncPlanner.PlanVoucherWindows(s, Cp("2026-10-07", fullDone: true), new DateOnly(2026, 10, 8));
+        Assert.False(plan.IsFullSync);
+        Assert.Equal(new DateOnly(2026, 9, 1), plan.Windows[0].From);
+        Assert.Equal(new DateOnly(2026, 10, 8), plan.Windows[^1].To);
+    }
+
+    [Fact]
+    public void AfterTheCoverDay_OnlyTheLookbackIsRead()
+    {
+        var s = new TallySettings { IncrementalLookbackDays = 30, FullSyncChunkDays = 7, CoverPreviousMonthUntilDay = 20 };
+        var plan = SyncPlanner.PlanVoucherWindows(s, Cp("2026-10-24", fullDone: true), new DateOnly(2026, 10, 25));
+        Assert.Equal(new DateOnly(2026, 9, 25), plan.Windows[0].From);
+    }
+
+    [Fact]
+    public void CoverDayZero_TurnsItOff()
+    {
+        var s = new TallySettings { IncrementalLookbackDays = 7, FullSyncChunkDays = 7, CoverPreviousMonthUntilDay = 0 };
+        var plan = SyncPlanner.PlanVoucherWindows(s, Cp("2026-10-07", fullDone: true), new DateOnly(2026, 10, 8));
+        Assert.Equal(new DateOnly(2026, 10, 1), plan.Windows[0].From);
+    }
+
+    [Fact]
+    public void January_ReachesBackIntoDecember()
+    {
+        var s = new TallySettings { IncrementalLookbackDays = 7, FullSyncChunkDays = 7, CoverPreviousMonthUntilDay = 20 };
+        var plan = SyncPlanner.PlanVoucherWindows(s, Cp("2027-01-04", fullDone: true), new DateOnly(2027, 1, 5));
+        Assert.Equal(new DateOnly(2026, 12, 1), plan.Windows[0].From);
+    }
 }

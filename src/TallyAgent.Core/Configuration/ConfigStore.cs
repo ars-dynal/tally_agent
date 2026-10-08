@@ -46,6 +46,7 @@ public sealed class ConfigStore
         cfg.Notifications.ErrorWebhookUrl = DpapiProtector.Protect(cfg.Notifications.ErrorWebhookUrl);
         cfg.Notifications.GoogleChatWebhookUrl = DpapiProtector.Protect(cfg.Notifications.GoogleChatWebhookUrl);
         cfg.Notifications.SlackWebhookUrl = DpapiProtector.Protect(cfg.Notifications.SlackWebhookUrl);
+        cfg.Notifications.SmtpPassword = DpapiProtector.Protect(cfg.Notifications.SmtpPassword);
 
         AgentInfo.EnsureDirectories();
         var json = JsonSerializer.Serialize(cfg, JsonOpts);
@@ -60,4 +61,5 @@ public sealed class ConfigStore
     public static string GetErrorWebhook(AgentConfig c) => DpapiProtector.Unprotect(c.Notifications.ErrorWebhookUrl);
     public static string GetGoogleChatWebhook(AgentConfig c) => DpapiProtector.Unprotect(c.Notifications.GoogleChatWebhookUrl);
     public static string GetSlackWebhook(AgentConfig c) => DpapiProtector.Unprotect(c.Notifications.SlackWebhookUrl);
+    public static string GetSmtpPassword(AgentConfig c) => DpapiProtector.Unprotect(c.Notifications.SmtpPassword);
 }
