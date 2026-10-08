@@ -123,6 +123,13 @@ public sealed class TallySettings
     [JsonPropertyName("enableGst")] public bool EnableGst { get; set; } = true;
     [JsonPropertyName("enableCostCentres")] public bool EnableCostCentres { get; set; } = true;
     [JsonPropertyName("incrementalLookbackDays")] public int IncrementalLookbackDays { get; set; } = 7;
+    /// <summary>Until this day of the month, every incremental sync also re-reads
+    /// the WHOLE previous month, whatever the lookback. Month-end entries
+    /// (production stock journals, provisions, corrections) are posted late,
+    /// and a 30-day lookback stops reaching the 1st of last month by the 1st
+    /// of this one. 0 turns it off. Added 2.4.5 after September 2026 had to
+    /// be re-sent by hand.</summary>
+    [JsonPropertyName("coverPreviousMonthUntilDay")] public int CoverPreviousMonthUntilDay { get; set; } = 20;
     /// <summary>Voucher window size for a history walk — a CHECKPOINT unit, not
     /// a request. Since v2.4.0 the Day Book is fetched one day at a time
     /// (SVCURRENTDATE is its only date control), so a 7-day window is 7 small

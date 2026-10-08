@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.4.5 - The previous month is always re-read until the 20th
+
+Month-end entries -- production stock journals, provisions, corrections -- are
+posted days after the month ends, and a 30-day lookback stops reaching the 1st
+of last month by the 1st of this one. Fixing September 2026 needed a manual
+Lookback-40 run for exactly this reason. Now, until day `coverPreviousMonthUntilDay`
+(default 20, `tally.coverPreviousMonthUntilDay` in agent config, 0 = off) every
+incremental sync starts at the 1st of the previous month or the lookback,
+whichever is earlier. Tests in `SyncPlannerTests` (October back to 1 Sep;
+after the 20th only the lookback; 0 turns it off; January reaches December).
+
 ## 2.4.4 - Stock journal lines
 
 The Day Book report (2.4.0 onward) serialises a Stock Journal's lines as

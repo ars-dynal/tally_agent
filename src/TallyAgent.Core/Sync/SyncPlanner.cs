@@ -132,6 +132,13 @@ public static class SyncPlanner
 
         var lookback = Math.Max(0, settings.IncrementalLookbackDays);
         var lookbackStart = today.AddDays(-lookback);
+        // Month-end entries are posted late: until CoverPreviousMonthUntilDay,
+        // re-read the whole previous month (2.4.5).
+        if (settings.CoverPreviousMonthUntilDay > 0 && today.Day <= settings.CoverPreviousMonthUntilDay)
+        {
+            var prevMonthStart = new DateOnly(today.Year, today.Month, 1).AddMonths(-1);
+            if (prevMonthStart < lookbackStart) lookbackStart = prevMonthStart;
+        }
 
         // Resume point: the day after the last successfully extracted window.
         var resumeStart = TryParseIsoDate(checkpoint.LastToDate) is { } lastTo

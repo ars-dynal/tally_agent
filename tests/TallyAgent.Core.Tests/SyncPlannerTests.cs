@@ -353,4 +353,42 @@ public class SyncPlannerTests
         Assert.All(plan.Windows, w => Assert.True(w.To <= new DateOnly(2020, 3, 31)));
     }
 
+
+    // ── 2.4.5: the previous month is re-read until month-end entries settle ──
+
+    [Fact]
+    public void EarlyInTheMonth_TheWholePreviousMonthIsReRead()
+    {
+        // 8 Oct with a 30-day lookback starts 8 Sep -- 1-7 Sep were never re-sent
+        // after the stock-journal fix. Until the 20th, start at 1 Sep instead.
+        var s = new TallySettings { IncrementalLookbackDays = 30, FullSyncChunkDays = 7, CoverPreviousMonthUntilDay = 20 };
+        var plan = SyncPlanner.PlanVoucherWindows(s, Cp("2026-10-07", fullDone: true), new DateOnly(2026, 10, 8));
+        Assert.False(plan.IsFullSync);
+        Assert.Equal(new DateOnly(2026, 9, 1), plan.Windows[0].From);
+        Assert.Equal(new DateOnly(2026, 10, 8), plan.Windows[^1].To);
+    }
+
+    [Fact]
+    public void AfterTheCoverDay_OnlyTheLookbackIsRead()
+    {
+        var s = new TallySettings { IncrementalLookbackDays = 30, FullSyncChunkDays = 7, CoverPreviousMonthUntilDay = 20 };
+        var plan = SyncPlanner.PlanVoucherWindows(s, Cp("2026-10-24", fullDone: true), new DateOnly(2026, 10, 25));
+        Assert.Equal(new DateOnly(2026, 9, 25), plan.Windows[0].From);
+    }
+
+    [Fact]
+    public void CoverDayZero_TurnsItOff()
+    {
+        var s = new TallySettings { IncrementalLookbackDays = 7, FullSyncChunkDays = 7, CoverPreviousMonthUntilDay = 0 };
+        var plan = SyncPlanner.PlanVoucherWindows(s, Cp("2026-10-07", fullDone: true), new DateOnly(2026, 10, 8));
+        Assert.Equal(new DateOnly(2026, 10, 1), plan.Windows[0].From);
+    }
+
+    [Fact]
+    public void January_ReachesBackIntoDecember()
+    {
+        var s = new TallySettings { IncrementalLookbackDays = 7, FullSyncChunkDays = 7, CoverPreviousMonthUntilDay = 20 };
+        var plan = SyncPlanner.PlanVoucherWindows(s, Cp("2027-01-04", fullDone: true), new DateOnly(2027, 1, 5));
+        Assert.Equal(new DateOnly(2026, 12, 1), plan.Windows[0].From);
+    }
 }

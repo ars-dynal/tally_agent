@@ -23,6 +23,8 @@ public static partial class ConfigValidator
             errors.Add("Sync frequency must be between 5 and 1440 minutes.");
         if (cfg.Tally.IncrementalLookbackDays is < 0 or > 90)
             errors.Add("Incremental lookback must be 0-90 days.");
+        if (cfg.Tally.CoverPreviousMonthUntilDay is < 0 or > 31)
+            errors.Add("Cover-previous-month day must be 0-31 (0 = off).");
         if (cfg.Tally.FullSyncChunkDays is < 1 or > 366)
             errors.Add("Full-sync chunk size must be 1-366 days.");
         if (!string.IsNullOrWhiteSpace(cfg.Tally.ExtractionStartDate) &&
