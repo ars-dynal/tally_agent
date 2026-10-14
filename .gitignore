@@ -8,3 +8,4 @@ TestResults/
 release-v*/
 __pycache__/
 *.patch
+_to_delete/
