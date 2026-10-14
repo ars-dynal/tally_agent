@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.4.7 - Re-send the month-end snapshots once
+
+The first 2.4.6 run (15 Oct 2026 00:31) captured Apr..Sep and the ingestion API
+accepted them, but the raw loader's dataset registry did not yet list
+`trial_balance_month_end` / `stock_summary_month_end`, so the files were
+quarantined and never reached BigQuery. The loader now lists both; this release
+moves the month-end checkpoints to new keys (`_month_end_v2:`), so the next run
+treats every month-end as never captured and sends them again as new batches.
+No other change.
+
 ## 2.4.6 - Month-end snapshots: Tally's own figures as at each month-end
 
 The bank Stock Statement and the month-end Balance Sheet need Tally's figures AS AT

@@ -546,8 +546,12 @@ public sealed class SyncEngine(
     /// ones that already succeeded today.</summary>
     // ── month-end snapshots (2.4.6) ───────────────────────────────
 
-    private const string MonthEndCheckpointPrefix = "_month_end:";
-    private const string MonthEndStepCheckpoint = "_month_end_step";
+    // "_v2" since 2.4.7: the 2.4.6 captures of 15 Oct 2026 were accepted by the
+    // ingestion API but refused by the raw loader (dataset names not yet in its
+    // registry), so they never reached BigQuery. New keys make every month-end
+    // "never captured" once, and the next run re-sends Apr..Sep as new batches.
+    private const string MonthEndCheckpointPrefix = "_month_end_v2:";
+    private const string MonthEndStepCheckpoint = "_month_end_step_v2";
 
     /// <summary>
     /// Tally's own Trial Balance and Stock Summary AS AT each due month-end
