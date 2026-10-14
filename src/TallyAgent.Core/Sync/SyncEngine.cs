@@ -472,6 +472,13 @@ public sealed class SyncEngine(
                 }
             }
 
+            // ── Month-end snapshots (2.4.6) ───────────────────────────────
+            // Last, after the day's data is extracted and queued, and only when
+            // the day's sync had no failures: a struggling Tally is never asked
+            // for more. Its own problems never change this run's status.
+            if (failed == 0)
+                await RunMonthEndSnapshotsAsync(company, syncId, mode, ct);
+
             // Advance AlterID gate watermarks only after a fully successful cycle.
             if (alterIds is { } finalIds && failed == 0)
             {
@@ -537,6 +544,142 @@ public sealed class SyncEngine(
     /// server-local day at/after tally.snapshotHourLocal. Per-dataset, so a
     /// snapshot that timed out is retried next cycle without re-running the
     /// ones that already succeeded today.</summary>
+    // ── month-end snapshots (2.4.6) ───────────────────────────────
+
+    private const string MonthEndCheckpointPrefix = "_month_end:";
+    private const string MonthEndStepCheckpoint = "_month_end_step";
+
+    /// <summary>
+    /// Tally's own Trial Balance and Stock Summary AS AT each due month-end
+    /// (see <see cref="MonthEndPlanner"/>). The Stock Summary is the report the
+    /// agent's notes call heavy, so every safety the plan agreed is here:
+    ///   1. only outside office hours (monthEndHourLocal .. monthEndLatestHourLocal);
+    ///   2. at most once per night (12-hour guard), at most monthEndMaxPerNight months;
+    ///   3. a reachability probe before every request and a pause after it;
+    ///   4. the snapshot request budget, never retried at the same size;
+    ///   5. the FIRST problem ends the step for the night - nothing more is asked
+    ///      of a slow Tally - and is reported as a warning (morning email);
+    ///   6. a Stock Summary that did not come from the DATED report is not
+    ///      uploaded: the collection fallback ignores the date and would publish
+    ///      today's stock as a month-end figure.
+    /// Rows carry as_of / period_from; the batch window is FY start .. month-end.
+    /// </summary>
+    private async Task RunMonthEndSnapshotsAsync(string company, string syncId, string mode,
+        CancellationToken ct)
+    {
+        var s = config.Tally;
+        if (!s.MonthEndSnapshotEnabled) return;
+        var now = DateTime.Now;
+        if (!MonthEndPlanner.InWindow(now.Hour, s.MonthEndHourLocal, s.MonthEndLatestHourLocal))
+        {
+            log.LogDebug("Month-end snapshot: outside its window ({Hour}:00)", now.Hour);
+            return;
+        }
+        var step = checkpoints.Get(MonthEndStepCheckpoint, company);
+        if (step?.LastSuccessUtc is { } lastStep
+            && DateTime.TryParse(lastStep, null, System.Globalization.DateTimeStyles.RoundtripKind, out var lastStepUtc)
+            && DateTime.UtcNow - lastStepUtc.ToUniversalTime() < TimeSpan.FromHours(12))
+        {
+            log.LogDebug("Month-end snapshot: already attempted tonight");
+            return;
+        }
+
+        var today = DateOnly.FromDateTime(now);
+        var backfill = DateOnly.TryParse(s.MonthEndBackfillFrom, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None, out var bf)
+            ? bf : MonthEndPlanner.FinancialYearStart(today);
+        var due = MonthEndPlanner.Due(today, backfill, s.MonthEndRefreshUntilDay, s.MonthEndMaxPerNight,
+            m => LastMonthEndCapture(m, company));
+        checkpoints.Upsert(new SyncCheckpoint(MonthEndStepCheckpoint, company, null, null, null,
+            DateTime.UtcNow.ToString("O"), true));
+        if (due.Count == 0)
+        {
+            log.LogInformation("Month-end snapshot: nothing due (every month-end is frozen or fresh)");
+            return;
+        }
+        log.LogInformation("Month-end snapshot ({Mode}): {N} due - {List}", mode, due.Count,
+            string.Join(", ", due.Select(d => d.ToString("dd-MMM-yyyy"))));
+
+        var pause = TimeSpan.FromSeconds(Math.Max(0, s.MonthEndPauseSeconds));
+        foreach (var m in due)
+        {
+            ct.ThrowIfCancellationRequested();
+            var fy = MonthEndPlanner.FinancialYearStart(m);
+            var from = fy.ToString("yyyy-MM-dd");
+            var to = m.ToString("yyyy-MM-dd");
+            try
+            {
+                CurrentOperation = $"month-end:{to} trial balance";
+                await EnsureTallyAnswersAsync(ct);
+                var tb = await reports.TrialBalance(fy, m, ct);
+                if (tb.Count == 0)
+                    throw new InvalidOperationException($"Trial Balance as at {to} returned no rows");
+                StampMonthEnd(tb, from, to);
+                EnqueueAndCheckpoint("trial_balance_month_end", company, syncId, tb, from, to, fullDone: true);
+                await Task.Delay(pause, ct);
+
+                CurrentOperation = $"month-end:{to} stock summary";
+                await EnsureTallyAnswersAsync(ct);
+                var st = await reports.StockSummary(fy, m, ct);
+                var undated = st.Count(r => !string.Equals(r.GetValueOrDefault("source") as string, "report",
+                    StringComparison.OrdinalIgnoreCase));
+                if (st.Count == 0 || undated > 0)
+                    throw new InvalidOperationException(
+                        $"Stock Summary as at {to} did not come from Tally's dated report " +
+                        $"({st.Count} rows, {undated} from the undated fallback) - not uploaded, " +
+                        "because the fallback ignores the date and would publish today's stock");
+                StampMonthEnd(st, from, to);
+                EnqueueAndCheckpoint("stock_summary_month_end", company, syncId, st, from, to, fullDone: true);
+
+                checkpoints.Upsert(new SyncCheckpoint(MonthEndCheckpointPrefix + to, company, from, to, null,
+                    DateTime.UtcNow.ToString("O"), true));
+                log.LogInformation("Month-end snapshot as at {To}: {Tb} trial-balance rows, {St} stock rows",
+                    to, tb.Count, st.Count);
+                await Task.Delay(pause, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                var message = $"Month-end snapshot as at {m:dd-MMM-yyyy} stopped for tonight: {ex.Message}. " +
+                              "Nothing more was asked of Tally; it is retried tomorrow night. " +
+                              "If Tally is not responding in the morning, restart it before office hours.";
+                log.LogWarning("{Message}", message);
+                await reporter.ReportAsync(
+                    ex is TallyException tex ? tex.Category : ErrorCategory.UnexpectedException,
+                    ErrorSeverity.Warning, message, operation: CurrentOperation, dataset: "month_end",
+                    ct: CancellationToken.None);
+                break;
+            }
+        }
+    }
+
+    private async Task EnsureTallyAnswersAsync(CancellationToken ct)
+    {
+        var probe = await tally.ProbeAsync(ct);
+        if (!probe.Ok)
+            throw new InvalidOperationException($"Tally did not answer the probe: {probe.Error}");
+    }
+
+    private static void StampMonthEnd(List<Row> rows, string periodFrom, string asOf)
+    {
+        foreach (var r in rows)
+        {
+            r["as_of"] = asOf;
+            r["period_from"] = periodFrom;
+        }
+    }
+
+    private DateOnly? LastMonthEndCapture(DateOnly monthEnd, string company)
+    {
+        var cp = checkpoints.Get(MonthEndCheckpointPrefix + monthEnd.ToString("yyyy-MM-dd"), company);
+        return cp?.LastSuccessUtc is { } t
+            && DateTime.TryParse(t, null, System.Globalization.DateTimeStyles.RoundtripKind, out var utc)
+            ? DateOnly.FromDateTime(utc.ToLocalTime()) : null;
+    }
+
     private bool ShouldRunSnapshot(string dataset, string company, string mode, out string reason)
     {
         if (config.Tally.SnapshotEveryCycle) { reason = "snapshotEveryCycle"; return true; }

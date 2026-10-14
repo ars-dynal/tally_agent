@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.4.6 - Month-end snapshots: Tally's own figures as at each month-end
+
+The bank Stock Statement and the month-end Balance Sheet need Tally's figures AS AT
+a month-end, and the agent only ever sent them as at today. After the daily sync
+(at or after `monthEndHourLocal`, default 21; never between 07:00 and 21:00) the
+agent now asks Tally for its own Trial Balance and Stock Summary as at each due
+month-end and uploads them as `trial_balance_month_end` and
+`stock_summary_month_end` (rows carry `as_of` and `period_from`).
+
+Which month-ends: every closed month from `monthEndBackfillFrom` (default: start of
+the financial year), newest first, at most `monthEndMaxPerNight` (8) a night. A
+month-end is refreshed nightly until `monthEndRefreshUntilDay` (20) of the next
+month for late entries, captured once more after that, then frozen and never
+asked again (`MonthEndPlanner`, tests in `MonthEndPlannerTests`).
+
+Stock Summary is a heavy report, so: only after a sync with no failures; once a
+night (12-hour guard); a reachability probe before every request and
+`monthEndPauseSeconds` (30) after it; the snapshot request budget, never retried
+at the same size; the first problem ends the step for the night and is reported
+as a warning; and a Stock Summary that did not come from the DATED report is not
+uploaded (the collection fallback ignores the date). Off switch:
+`tally.monthEndSnapshotEnabled = false`.
+
+Needs the ingestion API to accept the two dataset names (deploy it first).
+
 ## 2.4.5 - The previous month is always re-read until the 20th
 
 Month-end entries -- production stock journals, provisions, corrections -- are

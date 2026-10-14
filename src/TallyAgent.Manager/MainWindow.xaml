@@ -32,6 +32,8 @@
                            TextWrapping="Wrap" Text="Checking…"/>
                 <TextBlock x:Name="HealthDetail" FontSize="11" Foreground="#555555"
                            TextWrapping="Wrap" Margin="0,4,0,0"/>
+                <TextBlock x:Name="VersionText" FontSize="11" Foreground="#777777"
+                           Margin="0,4,0,0" Text="Agent v?"/>
             </StackPanel>
         </Border>
 

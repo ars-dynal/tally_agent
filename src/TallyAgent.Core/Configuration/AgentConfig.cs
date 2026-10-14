@@ -52,6 +52,30 @@ public sealed class TallySettings
     /// Force Full Sync. Set snapshotEveryCycle=true to restore v2.0.4 behaviour.</summary>
     [JsonPropertyName("snapshotHourLocal")] public int SnapshotHourLocal { get; set; } = 20;
     [JsonPropertyName("snapshotEveryCycle")] public bool SnapshotEveryCycle { get; set; } = false;
+    /// <summary>MONTH-END SNAPSHOT (2.4.6). After the daily run, ask Tally for
+    /// its own Trial Balance and Stock Summary AS AT each month-end, so the bank
+    /// Stock Statement and the month-end Balance Sheet are Tally's figures for
+    /// that date, not today's. Safety: only at or after monthEndHourLocal, only
+    /// when the day's sync had no failures, one request at a time with a pause
+    /// and a reachability probe before each, a hard timeout, and the whole step
+    /// stops for the night on the first problem. A month-end is refreshed nightly
+    /// until monthEndRefreshUntilDay of the following month (late entries), then
+    /// frozen and never asked again. Off switch: monthEndSnapshotEnabled=false.</summary>
+    [JsonPropertyName("monthEndSnapshotEnabled")] public bool MonthEndSnapshotEnabled { get; set; } = true;
+    /// <summary>Earliest local hour the month-end step may run (default 21 —
+    /// it runs at the end of the 21:00 daily sync, after the day's data).</summary>
+    [JsonPropertyName("monthEndHourLocal")] public int MonthEndHourLocal { get; set; } = 21;
+    /// <summary>Latest local hour (exclusive) the step may START; 0-6 are also
+    /// allowed (overnight). Keeps it out of office hours.</summary>
+    [JsonPropertyName("monthEndLatestHourLocal")] public int MonthEndLatestHourLocal { get; set; } = 7;
+    /// <summary>Re-capture a month-end nightly until this day of the next month, then freeze it.</summary>
+    [JsonPropertyName("monthEndRefreshUntilDay")] public int MonthEndRefreshUntilDay { get; set; } = 20;
+    /// <summary>First month-end to back-fill (yyyy-MM-dd). Empty = start of the current financial year.</summary>
+    [JsonPropertyName("monthEndBackfillFrom")] public string MonthEndBackfillFrom { get; set; } = "";
+    /// <summary>Pause between month-end requests, so Tally's UI thread breathes.</summary>
+    [JsonPropertyName("monthEndPauseSeconds")] public int MonthEndPauseSeconds { get; set; } = 30;
+    /// <summary>Most month-ends captured in one night (back-fill is spread over nights).</summary>
+    [JsonPropertyName("monthEndMaxPerNight")] public int MonthEndMaxPerNight { get; set; } = 8;
     /// <summary>Computed balances (ledger OPENING/CLOSINGBALANCE, stock item
     /// closing qty/value/rate) force Tally to walk every voucher for every
     /// ledger/item. By default (false) they are requested from Tally once a day

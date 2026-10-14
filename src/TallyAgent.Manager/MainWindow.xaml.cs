@@ -35,6 +35,13 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        // THE VERSION IS ON THE WINDOW, not only in Help. On 19 Sep 2026 nobody
+        // could tell from the Manager which agent was installed, and the answer
+        // decided whether a purchase-line defect (fixed in 2.4.1) still applied.
+        // The title bar and the banner both carry it; the installer stamps the
+        // same constant, so the number can never disagree with the binaries.
+        Title = $"Tally BigQuery Agent  v{AgentInfo.Version}";
+        VersionText.Text = $"Agent v{AgentInfo.Version} · service {AgentInfo.ServiceName}";
         _refreshTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
         _refreshTimer.Tick += (_, _) => Refresh();
         Loaded += (_, _) => { LoadBackend(); Refresh(); _refreshTimer.Start(); };

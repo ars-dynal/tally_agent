@@ -93,6 +93,9 @@ public static class DatasetRecordKey
         ["balance_sheet"] = new(["ledger_name"], true, ""),
         ["profit_loss"] = new(["ledger_name"], true, ""),
         ["stock_summary"] = new(["item_name"], true, ""),
+        // 2.4.6 month-end snapshots: the window (FY start .. month-end) is the as-of date.
+        ["trial_balance_month_end"] = new(["ledger_name"], true, ""),
+        ["stock_summary_month_end"] = new(["item_name"], true, ""),
         ["outstanding_payables"] = new(["party_name"], true, ""),
         ["outstanding_receivables"] = new(["party_name"], true, ""),
     };

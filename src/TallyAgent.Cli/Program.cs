@@ -32,6 +32,7 @@ try
         "capture-xml" => await CaptureXml(argv.Skip(1).ToList()),
         "verify" => await Verify(argv.Skip(1).ToList(), json),
         "master-balances" => await MasterBalances(argv.Skip(1).ToList(), json),
+        "stock-asof" => await StockAsOf(argv.Skip(1).ToList(), json),
         "verify-bills" => await VerifyBills(argv.Skip(1).ToList(), json),
         "diagnose-opening-bills" => await DiagnoseOpeningBills(argv.Skip(1).ToList(), json),
         "retry-failed" => RetryFailed(json),
@@ -323,6 +324,73 @@ static string Truncate(string s, int max) => s.Length <= max ? s : s[..max] + "â
 ///
 /// usage: master-balances [--as-of yyyy-MM-dd] [--ledger "Salary and Wages"] [--json]
 /// </summary>
+/// <summary>
+/// stock-asof â€” closing stock AS AT A DATE, through the REPORT path.
+///
+/// usage: stock-asof --as-of 2026-04-30 [--json]
+///
+/// WHY THIS EXISTS AND WHY IT IS NOT master-balances.
+/// master-balances asks the StockItem COLLECTION with SVTODATE pinned.
+/// Measured 19 Sep 2026 against the live company, that returns THE SAME FIGURE
+/// for every date asked for -- -16,73,63,929.83 for each of 30-Apr, 31-May,
+/// 30-Jun, 31-Jul and 31-Aug, which is simply today's stock printed five times.
+/// The collection ignores the date.
+///
+/// Reports do not. TallyEnvelopes.Report is the envelope Trial Balance already
+/// uses to honour SVFROMDATE/SVTODATE, and ReportExtractor.StockSummary goes
+/// through it. SyncEngine only ever calls it as (fyStart, today), so the
+/// capability was there and nothing had asked it for a past date.
+///
+/// `source` in the output is load-bearing: "report" means the dated Stock
+/// Summary answered. If it reads "items", the report export came back empty and
+/// the fallback used the StockItem collection -- the very thing that ignores
+/// the date -- so the figure is TODAY'S and must not be believed.
+/// </summary>
+static async Task<int> StockAsOf(List<string> a, bool json)
+{
+    var cfg = new ConfigStore().Load();
+    var asOf = DateOnly.FromDateTime(DateTime.Today);
+    for (var i = 0; i < a.Count - 1; i++)
+        if (a[i] == "--as-of") asOf = DateOnly.Parse(a[++i]);
+
+    // The financial year the as-of date falls in: April to March.
+    var fyStart = new DateOnly(asOf.Month >= 4 ? asOf.Year : asOf.Year - 1, 4, 1);
+
+    using var client = new TallyClient(cfg.Tally, NullLogger<TallyClient>.Instance);
+    if (await FailFastIfTallyUnreachable(client, cfg, json) is { } unreachable) return unreachable;
+
+    var reports = new ReportExtractor(client, NullLogger<ReportExtractor>.Instance);
+    var rows = await reports.StockSummary(fyStart, asOf, CancellationToken.None);
+
+    static double D(object? v) => v is null ? 0d : Convert.ToDouble(v);
+    var closing = rows.Sum(r => D(r["closing_value"]));
+    var source = rows.Count > 0 ? (string?)rows[0]["source"] ?? "unknown" : "none";
+
+    var payload = new
+    {
+        ok = true,
+        as_of = asOf.ToString("yyyy-MM-dd"),
+        window = $"{fyStart:yyyy-MM-dd}..{asOf:yyyy-MM-dd}",
+        source,
+        dated = source == "report",
+        rows = rows.Count,
+        total_closing_stock_value = Math.Round(closing, 2),
+    };
+
+    if (json) Console.WriteLine(JsonSerializer.Serialize(payload,
+        new JsonSerializerOptions { WriteIndented = true }));
+    else
+    {
+        Console.WriteLine($"as of      : {payload.as_of}   (window {payload.window})");
+        Console.WriteLine($"source     : {source}" + (source == "report"
+            ? "   (dated Stock Summary report - trustworthy)"
+            : "   *** FALLBACK: the collection ignores the date, this is TODAY'S stock ***"));
+        Console.WriteLine($"rows       : {rows.Count:N0}");
+        Console.WriteLine($"CLOSING    : {closing,20:N2}");
+    }
+    return 0;
+}
+
 static async Task<int> MasterBalances(List<string> a, bool json)
 {
     var cfg = new ConfigStore().Load();
