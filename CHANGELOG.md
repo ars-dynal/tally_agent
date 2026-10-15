@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.5.0 - Month-end book debts: Tally's Bills Receivable as at each month-end
+
+The app rebuilt pending customer bills from bill-allocation lines. Checked on 16 Oct
+2026 against Tally's Bills Receivable (Sundry Debtors, 1-Apr..31-Aug): the rebuild
+put 70,39,281 over 90 days against Tally's 62,18,767 -- old bills Tally shows
+settled were still open in the replay. The month-end step now also uploads
+`bills_receivable_month_end`: Tally's own Bills Receivable report as at each
+month-end (party, bill ref, bill date, pending amount, due date, Tally's
+overdue days). Proven by hand first: the same request for 31-Aug returned
+13,42,24,879.16, Tally's screen to the paisa. Only rows from the dated report
+are uploaded. Checkpoints move to `_month_end_v5:` so Apr..Sep are captured once
+more. (The 21:00 retry when Tally is closed and the cached-balance fix are NOT
+in this release: both need investigation first, and nothing goes in untested.)
+
 ## 2.4.9 - Month-end detail from Tally's DETAILED Trial Balance report
 
 2.4.8 read ledger balances from a dated Ledger collection. Tally ignores the
