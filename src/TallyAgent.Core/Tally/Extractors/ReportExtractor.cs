@@ -190,6 +190,38 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
         return rows;
     }
 
+    /// <summary>
+    /// Every ledger's closing balance AS AT <paramref name="to"/> (agent 2.4.8,
+    /// month-end step). Same dated Ledger collection the Trial Balance fallback
+    /// uses: CLOSINGBALANCE honours SVTODATE. Tally sign: positive = credit.
+    /// Zero balances are kept, so "absent" never has to stand in for "nil".
+    /// The cloud ties these rows, summed by primary group, to Tally's own
+    /// Trial Balance report for the same date before anything reads them.
+    /// </summary>
+    public async Task<List<Row>> LedgerBalancesAsAt(DateOnly to, CancellationToken ct)
+    {
+        var doc = await LedgerBalancesDocument(to, ct);
+        var rows = new List<Row>();
+        foreach (var el in doc.Descendants().Where(e => Is(e, "LEDGER")))
+        {
+            var name = Text(el, "NAME");
+            if (name.Length == 0) continue;
+            var closing = Num(el, "CLOSINGBALANCE");
+            rows.Add(new Row
+            {
+                ["ledger_name"] = name,
+                ["parent_group"] = Text(el, "PARENT"),
+                ["closing_balance"] = closing,
+                ["closing_debit"] = closing < 0 ? Math.Abs(closing) : 0,
+                ["closing_credit"] = closing > 0 ? closing : 0,
+                ["net_amount"] = -closing,
+                ["source"] = "ledger_collection",
+            });
+        }
+        log.LogInformation("Ledger balances as at {To}: {N} ledgers", to, rows.Count);
+        return rows;
+    }
+
     public async Task<List<Row>> BalanceSheet(DateOnly from, DateOnly to, CancellationToken ct)
     {
         var doc = await PostReportAllowingRefusal(

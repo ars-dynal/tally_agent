@@ -550,8 +550,8 @@ public sealed class SyncEngine(
     // ingestion API but refused by the raw loader (dataset names not yet in its
     // registry), so they never reached BigQuery. New keys make every month-end
     // "never captured" once, and the next run re-sends Apr..Sep as new batches.
-    private const string MonthEndCheckpointPrefix = "_month_end_v2:";
-    private const string MonthEndStepCheckpoint = "_month_end_step_v2";
+    private const string MonthEndCheckpointPrefix = "_month_end_v3:";
+    private const string MonthEndStepCheckpoint = "_month_end_step_v3";
 
     /// <summary>
     /// Tally's own Trial Balance and Stock Summary AS AT each due month-end
@@ -634,11 +634,22 @@ public sealed class SyncEngine(
                         "because the fallback ignores the date and would publish today's stock");
                 StampMonthEnd(st, from, to);
                 EnqueueAndCheckpoint("stock_summary_month_end", company, syncId, st, from, to, fullDone: true);
+                await Task.Delay(pause, ct);
+
+                // 2.4.8: every ledger as at the month-end, so month-end balances
+                // are Tally's own per ledger instead of worked back from today.
+                CurrentOperation = $"month-end:{to} ledger balances";
+                await EnsureTallyAnswersAsync(ct);
+                var lb = await reports.LedgerBalancesAsAt(m, ct);
+                if (lb.Count == 0)
+                    throw new InvalidOperationException($"Ledger balances as at {to} returned no rows");
+                StampMonthEnd(lb, from, to);
+                EnqueueAndCheckpoint("ledger_balances_month_end", company, syncId, lb, from, to, fullDone: true);
 
                 checkpoints.Upsert(new SyncCheckpoint(MonthEndCheckpointPrefix + to, company, from, to, null,
                     DateTime.UtcNow.ToString("O"), true));
-                log.LogInformation("Month-end snapshot as at {To}: {Tb} trial-balance rows, {St} stock rows",
-                    to, tb.Count, st.Count);
+                log.LogInformation("Month-end snapshot as at {To}: {Tb} trial-balance rows, {St} stock rows, {Lb} ledgers",
+                    to, tb.Count, st.Count, lb.Count);
                 await Task.Delay(pause, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)

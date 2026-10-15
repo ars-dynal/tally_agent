@@ -96,6 +96,7 @@ public static class DatasetRecordKey
         // 2.4.6 month-end snapshots: the window (FY start .. month-end) is the as-of date.
         ["trial_balance_month_end"] = new(["ledger_name"], true, ""),
         ["stock_summary_month_end"] = new(["item_name"], true, ""),
+        ["ledger_balances_month_end"] = new(["ledger_name"], true, ""),
         ["outstanding_payables"] = new(["party_name"], true, ""),
         ["outstanding_receivables"] = new(["party_name"], true, ""),
     };

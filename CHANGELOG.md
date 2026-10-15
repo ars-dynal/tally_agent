@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.4.8 - Month-end: every ledger's balance as at the month-end
+
+The app worked out older month-end balances as "today's ledger balance minus
+everything posted after the month-end". Tested on 15 Oct 2026 against Tally's own
+Trial Balance as at each month-end: Aug and Sep tie to the paisa, but Apr-Jul were
+off by up to 41,903.81 inside Indirect Expenses / Current Assets / Current
+Liabilities (totals still balance), because the voucher feed and Tally disagree
+on a few earlier vouchers. The month-end step now also uploads
+`ledger_balances_month_end`: every ledger's closing balance as at the month-end
+from the dated Ledger collection (zero balances included), so month-end
+balances are Tally's own per ledger. The cloud ties them, summed by primary
+group, to the `trial_balance_month_end` report before using them. Checkpoints
+move to `_month_end_v3:` / `_month_end_step_v3`, so the next run (Sync now
+between 21:00 and 07:00) captures Apr..Sep once more, now with ledgers.
+
 ## 2.4.7 - Re-send the month-end snapshots once
 
 The first 2.4.6 run (15 Oct 2026 00:31) captured Apr..Sep and the ingestion API
