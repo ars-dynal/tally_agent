@@ -191,34 +191,32 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
     }
 
     /// <summary>
-    /// Every ledger's closing balance AS AT <paramref name="to"/> (agent 2.4.8,
-    /// month-end step). Same dated Ledger collection the Trial Balance fallback
-    /// uses: CLOSINGBALANCE honours SVTODATE. Tally sign: positive = credit.
-    /// Zero balances are kept, so "absent" never has to stand in for "nil".
-    /// The cloud ties these rows, summed by primary group, to Tally's own
-    /// Trial Balance report for the same date before anything reads them.
+    /// Tally's own DETAILED Trial Balance as at <paramref name="to"/> (agent 2.4.9,
+    /// month-end step): the "Trial Balance" report with EXPLODEFLAG, which lists
+    /// the sub-groups and ledgers under each primary group with their closing
+    /// balance for the period. Proven on 15 Oct 2026 against Tally's screen:
+    /// Interest on Corporate Loan-603090077525 as at 30-Apr-26 = 5,89,479.45 Dr
+    /// from this report, the same on Ledger Vouchers 1-Apr..30-Apr; the dated
+    /// Ledger COLLECTION returned 0.00 for it and today's balances for the rest
+    /// (2.4.8), so it is never used here and there is no fallback: no report
+    /// rows means nothing is uploaded. Rows are named groups or ledgers;
+    /// closing_balance is credit-positive. The cloud ties each primary group's
+    /// direct children to the group total before anything reads them.
     /// </summary>
-    public async Task<List<Row>> LedgerBalancesAsAt(DateOnly to, CancellationToken ct)
+    public async Task<List<Row>> LedgerBalancesAsAt(DateOnly from, DateOnly to, CancellationToken ct)
     {
-        var doc = await LedgerBalancesDocument(to, ct);
-        var rows = new List<Row>();
-        foreach (var el in doc.Descendants().Where(e => Is(e, "LEDGER")))
+        var envelope = TallyEnvelopes.Report("Trial Balance", from, to, client.Company)
+            .Replace("</STATICVARIABLES>", "<EXPLODEFLAG>Yes</EXPLODEFLAG></STATICVARIABLES>");
+        var doc = await PostReportAllowingRefusal(envelope, "Trial Balance (detailed)", ct);
+        var rows = doc is null ? [] : ParseTrialBalanceReport(doc);
+        foreach (var r in rows)
         {
-            var name = Text(el, "NAME");
-            if (name.Length == 0) continue;
-            var closing = Num(el, "CLOSINGBALANCE");
-            rows.Add(new Row
-            {
-                ["ledger_name"] = name,
-                ["parent_group"] = Text(el, "PARENT"),
-                ["closing_balance"] = closing,
-                ["closing_debit"] = closing < 0 ? Math.Abs(closing) : 0,
-                ["closing_credit"] = closing > 0 ? closing : 0,
-                ["net_amount"] = -closing,
-                ["source"] = "ledger_collection",
-            });
+            var debit = Convert.ToDouble(r["closing_debit"] ?? 0.0);
+            var credit = Convert.ToDouble(r["closing_credit"] ?? 0.0);
+            r["closing_balance"] = credit - debit;
+            r["source"] = "report_detailed";
         }
-        log.LogInformation("Ledger balances as at {To}: {N} ledgers", to, rows.Count);
+        log.LogInformation("Detailed trial balance as at {To}: {N} rows", to, rows.Count);
         return rows;
     }
 

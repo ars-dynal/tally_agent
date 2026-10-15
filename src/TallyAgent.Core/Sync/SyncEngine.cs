@@ -550,8 +550,8 @@ public sealed class SyncEngine(
     // ingestion API but refused by the raw loader (dataset names not yet in its
     // registry), so they never reached BigQuery. New keys make every month-end
     // "never captured" once, and the next run re-sends Apr..Sep as new batches.
-    private const string MonthEndCheckpointPrefix = "_month_end_v3:";
-    private const string MonthEndStepCheckpoint = "_month_end_step_v3";
+    private const string MonthEndCheckpointPrefix = "_month_end_v4:";
+    private const string MonthEndStepCheckpoint = "_month_end_step_v4";
 
     /// <summary>
     /// Tally's own Trial Balance and Stock Summary AS AT each due month-end
@@ -636,13 +636,13 @@ public sealed class SyncEngine(
                 EnqueueAndCheckpoint("stock_summary_month_end", company, syncId, st, from, to, fullDone: true);
                 await Task.Delay(pause, ct);
 
-                // 2.4.8: every ledger as at the month-end, so month-end balances
-                // are Tally's own per ledger instead of worked back from today.
-                CurrentOperation = $"month-end:{to} ledger balances";
+                // 2.4.9: Tally's DETAILED Trial Balance as at the month-end (sub-groups
+                // and ledgers), so month-end balances are Tally's own, not worked back.
+                CurrentOperation = $"month-end:{to} detailed trial balance";
                 await EnsureTallyAnswersAsync(ct);
-                var lb = await reports.LedgerBalancesAsAt(m, ct);
+                var lb = await reports.LedgerBalancesAsAt(fy, m, ct);
                 if (lb.Count == 0)
-                    throw new InvalidOperationException($"Ledger balances as at {to} returned no rows");
+                    throw new InvalidOperationException($"Detailed Trial Balance as at {to} returned no rows");
                 StampMonthEnd(lb, from, to);
                 EnqueueAndCheckpoint("ledger_balances_month_end", company, syncId, lb, from, to, fullDone: true);
 

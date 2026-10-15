@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.4.9 - Month-end detail from Tally's DETAILED Trial Balance report
+
+2.4.8 read ledger balances from a dated Ledger collection. Tally ignores the
+date there: every month-end came back with today's balances (Loans 44,77,53,450.45
+in April and September alike) and one ledger with 0.00. The cloud's tie to the
+Trial Balance report refused all six months, so nothing wrong reached the app.
+Tested by hand on 15 Oct 2026, 23:20: the "Trial Balance" report with
+EXPLODEFLAG=Yes, 1-Apr..30-Apr, gives Interest on Corporate Loan-603090077525
+= 5,89,479.45 Dr, exactly Tally's Ledger Vouchers screen for that period.
+`ledger_balances_month_end` now comes from that report (rows are sub-groups and
+ledgers, `source` = report_detailed), with no collection fallback. Checkpoints
+move to `_month_end_v4:` so Apr..Sep are captured once more.
+
 ## 2.4.8 - Month-end: every ledger's balance as at the month-end
 
 The app worked out older month-end balances as "today's ledger balance minus
