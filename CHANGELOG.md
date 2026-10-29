@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.5.1 - Nightly full-year refresh; more than one daily sync time
+
+ALTERED OLD VOUCHERS NEVER REACHED THE CLOUD. The daily sync re-reads only the
+lookback (30 days), so an entry Accounts change or delete after that stays as it
+was first sent: Indirect Expenses was 35,105.99 out on 29 Oct 2026 (Professional
+Expenses 41,903.81, out since 15 Oct), and Tally's Edit Log shows 403 August
+vouchers altered after August. Every night, after the month-end step and inside
+the same night window, the agent now re-reads from the Day Book every day of the
+financial year the lookback no longer reaches, a week at a time, with a probe
+before each week; the first problem stops it for the night and it resumes from
+there the next night (`fullYearRefreshEnabled`, `fullYearRefreshMaxDays`). The
+daily sync's checkpoints are not moved. Days go up whole, so the cloud can also
+tell deleted vouchers.
+
+"Daily sync at" now takes several times, e.g. `19:00, 21:30`. With the daily
+sync moved to 19:00 the night steps (month-end reports, the refresh) had no run
+inside their 21:00-07:00 window; the 21:30 slot is that run.
+
 ## 2.5.0 - Month-end book debts: Tally's Bills Receivable as at each month-end
 
 The app rebuilt pending customer bills from bill-allocation lines. Checked on 16 Oct

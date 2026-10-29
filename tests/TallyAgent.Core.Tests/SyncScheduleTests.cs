@@ -49,4 +49,22 @@ public class SyncScheduleTests
         Assert.Equal("every 15 min", SyncSchedule.Describe("", 15));
         Assert.Equal("daily at 21:00 (local time)", SyncSchedule.Describe("21:00", 15));
     }
+
+    // 2.5.1: several slots a day -- 19:00 for the day's data, 21:30 for the night work.
+    [Fact]
+    public void Several_daily_slots_run_at_the_soonest_next_one()
+    {
+        var times = SyncSchedule.ParseDailyTimes("21:30, 19:00");
+        Assert.Equal([new TimeOnly(19, 0), new TimeOnly(21, 30)], times);
+        Assert.Equal(new TimeOnly(19, 0), SyncSchedule.ParseDailyAt("21:30, 19:00"));
+        Assert.Equal(new DateTime(2026, 10, 29, 19, 0, 0), SyncSchedule.NextDailyRun(new DateTime(2026, 10, 29, 11, 0, 0), times));
+        Assert.Equal(new DateTime(2026, 10, 29, 21, 30, 0), SyncSchedule.NextDailyRun(new DateTime(2026, 10, 29, 19, 5, 0), times));
+        Assert.Equal(new DateTime(2026, 10, 30, 19, 0, 0), SyncSchedule.NextDailyRun(new DateTime(2026, 10, 29, 22, 0, 0), times));
+    }
+
+    [Theory]
+    [InlineData("19:00, 9pm")]
+    [InlineData("19:00,,25:00")]
+    public void One_bad_slot_rejects_the_whole_schedule(string text)
+        => Assert.Null(SyncSchedule.ParseDailyAt(text));
 }

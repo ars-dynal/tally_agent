@@ -76,6 +76,18 @@ public sealed class TallySettings
     [JsonPropertyName("monthEndPauseSeconds")] public int MonthEndPauseSeconds { get; set; } = 30;
     /// <summary>Most month-ends captured in one night (back-fill is spread over nights).</summary>
     [JsonPropertyName("monthEndMaxPerNight")] public int MonthEndMaxPerNight { get; set; } = 8;
+    /// <summary>NIGHTLY FULL-YEAR REFRESH (2.5.1). Once a night, inside the month-end
+    /// window and after the month-end step, every day of the financial year that
+    /// the incremental lookback no longer reaches is read again from the Day
+    /// Book. Accounts alter old vouchers (403 August vouchers altered after the
+    /// month, Edit Log 29 Oct 2026); without this an altered voucher outside the
+    /// lookback stayed stale in the cloud for good (Professional Expenses was
+    /// 41,903.81 out from 15 Oct). Days are re-sent whole, so the cloud can also
+    /// see what was deleted. Off switch: fullYearRefreshEnabled=false.</summary>
+    [JsonPropertyName("fullYearRefreshEnabled")] public bool FullYearRefreshEnabled { get; set; } = true;
+    /// <summary>Most days re-read in one night; the rest continue the next night
+    /// from where this one stopped. 400 = the whole year in one night.</summary>
+    [JsonPropertyName("fullYearRefreshMaxDays")] public int FullYearRefreshMaxDays { get; set; } = 400;
     /// <summary>Computed balances (ledger OPENING/CLOSINGBALANCE, stock item
     /// closing qty/value/rate) force Tally to walk every voucher for every
     /// ledger/item. By default (false) they are requested from Tally once a day

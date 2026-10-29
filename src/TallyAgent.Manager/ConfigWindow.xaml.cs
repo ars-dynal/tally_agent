@@ -77,7 +77,7 @@ public partial class ConfigWindow : Window
             _config.Tally.SyncFrequencyMinutes = int.Parse(FrequencyBox.Text.Trim());
             var dailyAt = DailyAtBox.Text.Trim();
             if (dailyAt.Length > 0 && TallyAgent.Core.Sync.SyncSchedule.ParseDailyAt(dailyAt) is null)
-                throw new FormatException("Daily sync at must be HH:mm, e.g. 21:00, or blank.");
+                throw new FormatException("Daily sync at must be HH:mm, or several separated by commas (e.g. 19:00, 21:30), or blank.");
             _config.Tally.DailySyncAt = dailyAt;
             _config.Tally.IncrementalLookbackDays = int.Parse(LookbackBox.Text.Trim());
             _config.Tally.EnableSnapshots = SnapshotsCheck.IsChecked == true;

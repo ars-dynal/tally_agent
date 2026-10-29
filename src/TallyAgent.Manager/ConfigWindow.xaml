@@ -39,7 +39,7 @@
                 <TextBox Grid.Row="5" Grid.Column="1" x:Name="FrequencyBox" Margin="0,2"/>
                 <TextBlock Grid.Row="6" Text="Daily sync at (HH:mm)" VerticalAlignment="Center"/>
                 <TextBox Grid.Row="6" Grid.Column="1" x:Name="DailyAtBox" Margin="0,2"
-                         ToolTip="One sync a day at this local time, e.g. 21:00 -- after the working day.&#x0a;When set, the frequency above is ignored for scheduled runs; Sync now still runs at once.&#x0a;Leave blank to sync every N minutes. Takes effect after the service restarts."/>
+                         ToolTip="Sync at these local times, e.g. 19:00, 21:30 -- 19:00 for the day's data,&#x0a;21:30 for the night work (month-end reports and the full-year refresh).&#x0a;When set, the frequency above is ignored for scheduled runs; Sync now still runs at once.&#x0a;Leave blank to sync every N minutes. Takes effect after the service restarts."/>
                 <TextBlock Grid.Row="7" Text="Lookback days" VerticalAlignment="Center"/>
                 <TextBox Grid.Row="7" Grid.Column="1" x:Name="LookbackBox" Margin="0,2"/>
             </Grid>

@@ -478,6 +478,9 @@ public sealed class SyncEngine(
             // for more. Its own problems never change this run's status.
             if (failed == 0)
                 await RunMonthEndSnapshotsAsync(company, syncId, mode, ct);
+            // ── Nightly full-year refresh (2.5.1) ─────────────────────────
+            if (failed == 0)
+                await RunFullYearRefreshAsync(company, syncId, enabled, ct);
 
             // Advance AlterID gate watermarks only after a fully successful cycle.
             if (alterIds is { } finalIds && failed == 0)
@@ -686,6 +689,120 @@ public sealed class SyncEngine(
                 break;
             }
         }
+    }
+
+    private const string FullYearRefreshStep = "_full_year_refresh_step";
+    private const string FullYearRefreshFrontier = "_full_year_refresh_frontier";
+
+    /// <summary>
+    /// 2.5.1. Re-read, from the Day Book, every day of the financial year that the
+    /// incremental lookback no longer reaches -- so a voucher Accounts alter or
+    /// delete weeks later reaches the cloud. Same request as the daily sync (one
+    /// day at a time), same upload, same per-voucher "latest wins" downstream.
+    /// Safety, as the month-end step: night window only, once per night, a
+    /// probe before each week, a pause between weeks, at most
+    /// fullYearRefreshMaxDays a night (it resumes the next night), and the FIRST
+    /// problem ends the step for the night. Days go up WHOLE, so the cloud can
+    /// tell a deleted voucher from one that was not asked for.
+    /// </summary>
+    private async Task RunFullYearRefreshAsync(string company, string syncId,
+        IReadOnlyCollection<DatasetDefinition> enabled, CancellationToken ct)
+    {
+        var s = config.Tally;
+        if (!s.FullYearRefreshEnabled || !s.EnableVouchers) return;
+        var now = DateTime.Now;
+        if (!MonthEndPlanner.InWindow(now.Hour, s.MonthEndHourLocal, s.MonthEndLatestHourLocal))
+        {
+            log.LogDebug("Full-year refresh: outside its window ({Hour}:00)", now.Hour);
+            return;
+        }
+        var step = checkpoints.Get(FullYearRefreshStep, company);
+        if (step?.LastSuccessUtc is { } lastStep
+            && DateTime.TryParse(lastStep, null, System.Globalization.DateTimeStyles.RoundtripKind, out var lastUtc)
+            && DateTime.UtcNow - lastUtc.ToUniversalTime() < TimeSpan.FromHours(12))
+        {
+            log.LogDebug("Full-year refresh: already run tonight");
+            return;
+        }
+        checkpoints.Upsert(new SyncCheckpoint(FullYearRefreshStep, company, null, null, null,
+            DateTime.UtcNow.ToString("O"), true));
+
+        var today = DateOnly.FromDateTime(now);
+        var start = MonthEndPlanner.FinancialYearStart(today);
+        if (SyncPlanner.TryParseIsoDate(s.ExtractionStartDate) is { } es && es > start) start = es;
+        // The incremental sync already re-reads the lookback (and the previous
+        // month until coverPreviousMonthUntilDay); this covers everything older.
+        var end = today.AddDays(-Math.Max(1, s.IncrementalLookbackDays) - 1);
+        if (end < start)
+        {
+            log.LogInformation("Full-year refresh: the lookback already covers the year");
+            return;
+        }
+        // Resume where the last night stopped; start over once the year is done.
+        var fr = checkpoints.Get(FullYearRefreshFrontier, company);
+        var from = start;
+        if (SyncPlanner.TryParseIsoDate(fr?.LastToDate) is { } done && done >= start && done < end)
+            from = done.AddDays(1);
+        var last = from.AddDays(Math.Max(1, s.FullYearRefreshMaxDays) - 1);
+        if (last > end) last = end;
+        log.LogInformation("Full-year refresh: re-reading {From:dd-MMM-yyyy} to {To:dd-MMM-yyyy}", from, last);
+
+        HashSet<string> bankLedgers;
+        try { bankLedgers = _bankLedgerCache ?? await masters.BankLedgerNames(ct); _bankLedgerCache = bankLedgers; }
+        catch (TallyException tex) when (tex.IsRunEnding) { throw; }
+        catch { bankLedgers = _bankLedgerCache ?? []; }
+
+        var names = enabled.Select(d => d.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var pause = TimeSpan.FromSeconds(Math.Clamp(s.MonthEndPauseSeconds / 6, 0, 10));
+        var days = 0;
+        var vouchersRead = 0;
+        for (var wFrom = from; wFrom <= last; wFrom = wFrom.AddDays(7))
+        {
+            ct.ThrowIfCancellationRequested();
+            var wTo = wFrom.AddDays(6);
+            if (wTo > last) wTo = last;
+            try
+            {
+                CurrentOperation = $"full-year refresh {wFrom:yyyy-MM-dd}..{wTo:yyyy-MM-dd}";
+                await EnsureTallyAnswersAsync(ct);
+                var result = await vouchers.ExtractWindow(wFrom, wTo, bankLedgers, ct);
+                GuardWindowWasHonoured(result, wFrom, wTo);
+                var wf = wFrom.ToString("yyyy-MM-dd");
+                var wt = wTo.ToString("yyyy-MM-dd");
+                var now2 = DateTime.UtcNow;
+                foreach (var (name, rows) in FanOut(result, s.EmitLegacyVouchersDataset))
+                {
+                    if (!names.Contains(name)) continue;
+                    // Enqueued without moving the daily sync's checkpoints: this
+                    // step re-reads, it does not advance anything.
+                    batchBuilder.BuildAndEnqueue(name, company, syncId, rows, now2, now2,
+                        wf, wt, config.Cloud.UploadBatchMaxRecords);
+                }
+                RecordWindowCoverage(syncId, "vouchers", wFrom, wTo,
+                    result.VoucherHeaders.Count, result.MinVoucherDate, result.MaxVoucherDate, "completed");
+                checkpoints.Upsert(new SyncCheckpoint(FullYearRefreshFrontier, company,
+                    start.ToString("yyyy-MM-dd"), wt, null, DateTime.UtcNow.ToString("O"), wTo >= end));
+                days += wTo.DayNumber - wFrom.DayNumber + 1;
+                vouchersRead += result.VoucherHeaders.Count;
+                await Task.Delay(pause, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                var message = $"Full-year refresh stopped for tonight at {wFrom:dd-MMM-yyyy}: {ex.Message}. " +
+                              "It resumes from there tomorrow night; the day's sync is not affected.";
+                log.LogWarning("{Message}", message);
+                await reporter.ReportAsync(
+                    ex is TallyException tex ? tex.Category : ErrorCategory.UnexpectedException,
+                    ErrorSeverity.Warning, message, operation: CurrentOperation, dataset: "full_year_refresh",
+                    ct: CancellationToken.None);
+                break;
+            }
+        }
+        log.LogInformation("Full-year refresh: {Days} days re-read, {Vouchers} vouchers re-sent", days, vouchersRead);
     }
 
     private async Task EnsureTallyAnswersAsync(CancellationToken ct)
