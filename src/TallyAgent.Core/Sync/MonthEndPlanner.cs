@@ -33,8 +33,15 @@ public static class MonthEndPlanner
     }
 
     public static List<DateOnly> Due(DateOnly today, DateOnly backfillFrom, int refreshUntilDay,
-        int maxPerNight, Func<DateOnly, DateOnly?> lastCapturedOn)
+        int maxPerNight, Func<DateOnly, DateOnly?> lastCapturedOn, int recheckDays = 0)
     {
+        // WEEKLY RE-CHECK OF FROZEN MONTH-ENDS (2.5.2). A month-end used to be
+        // frozen after the 20th of the next month and never asked again, so an
+        // entry Accounts changed later in a closed month left the cloud's copy
+        // behind Tally: Sep 2026 closing stock was 606.30 under Tally on 31 Oct
+        // (17,99,51,731.19 vs 17,99,52,337.49). Frozen month-ends of the current
+        // financial year are now asked again once every recheckDays (0 = never).
+        var fyStart = FinancialYearStart(today.AddDays(-today.Day));
         var due = new List<DateOnly>();
         var first = MonthEnd(backfillFrom.Year, backfillFrom.Month);
         var lastClosed = today.AddDays(-today.Day); // the last day of the previous month
@@ -44,7 +51,9 @@ public static class MonthEndPlanner
             var freeze = FreezeDate(m, refreshUntilDay);
             var isDue = last is null
                 || (today <= freeze && last.Value < today)
-                || (today > freeze && last.Value < freeze);
+                || (today > freeze && last.Value < freeze)
+                || (recheckDays > 0 && today > freeze && m >= fyStart
+                    && last.Value.AddDays(recheckDays) <= today);
             if (isDue) due.Add(m);
             if (due.Count >= Math.Max(1, maxPerNight)) break;
         }

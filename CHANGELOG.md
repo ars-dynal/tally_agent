@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.5.2 - Month-ends re-checked weekly after they are frozen
+
+A month-end snapshot (Trial Balance and Stock Summary as at the month-end) was
+re-read nightly until the 20th of the following month, then frozen for good.
+Accounts changed a September entry after 20 October, Tally revalued September's
+closing stock by 606.30, and the cloud kept the old figure: the app's monthly
+P&L showed September 606.30 more loss and October 606.30 more profit than Tally
+(the year total still matched). Frozen month-ends of the current financial year
+are now asked again once a week (`monthEndRecheckDays`, default 7; 0 turns it
+off), inside the same night window and the same per-night limit.
+
 ## 2.5.1 - Nightly full-year refresh; more than one daily sync time
 
 ALTERED OLD VOUCHERS NEVER REACHED THE CLOUD. The daily sync re-reads only the

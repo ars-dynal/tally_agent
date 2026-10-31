@@ -62,6 +62,21 @@ public class MonthEndPlannerTests
         Assert.Equal(new[] { new DateOnly(2026, 12, 31) }, due);
     }
 
+    [Fact]
+    public void Frozen_month_end_is_rechecked_weekly_in_this_financial_year()
+    {
+        var sep = new DateOnly(2026, 9, 30);
+        // frozen on 20 Oct; last captured 20 Oct; on 31 Oct (11 days on) it is due again
+        Assert.Contains(sep, MonthEndPlanner.Due(new DateOnly(2026, 10, 31), Fy, 20, 8,
+            m => m == sep ? new DateOnly(2026, 10, 20) : new DateOnly(2026, 10, 31), 7));
+        // captured 3 days ago: not yet
+        Assert.DoesNotContain(sep, MonthEndPlanner.Due(new DateOnly(2026, 10, 31), Fy, 20, 8,
+            m => m == sep ? new DateOnly(2026, 10, 28) : new DateOnly(2026, 10, 31), 7));
+        // 0 keeps the old rule: frozen for good
+        Assert.DoesNotContain(sep, MonthEndPlanner.Due(new DateOnly(2026, 10, 31), Fy, 20, 8,
+            m => m == sep ? new DateOnly(2026, 10, 20) : new DateOnly(2026, 10, 31), 0));
+    }
+
     [Theory]
     [InlineData(21, true)]
     [InlineData(23, true)]

@@ -596,7 +596,7 @@ public sealed class SyncEngine(
                 System.Globalization.DateTimeStyles.None, out var bf)
             ? bf : MonthEndPlanner.FinancialYearStart(today);
         var due = MonthEndPlanner.Due(today, backfill, s.MonthEndRefreshUntilDay, s.MonthEndMaxPerNight,
-            m => LastMonthEndCapture(m, company));
+            m => LastMonthEndCapture(m, company), s.MonthEndRecheckDays);
         checkpoints.Upsert(new SyncCheckpoint(MonthEndStepCheckpoint, company, null, null, null,
             DateTime.UtcNow.ToString("O"), true));
         if (due.Count == 0)

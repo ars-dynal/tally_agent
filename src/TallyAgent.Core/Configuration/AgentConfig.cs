@@ -70,6 +70,11 @@ public sealed class TallySettings
     [JsonPropertyName("monthEndLatestHourLocal")] public int MonthEndLatestHourLocal { get; set; } = 7;
     /// <summary>Re-capture a month-end nightly until this day of the next month, then freeze it.</summary>
     [JsonPropertyName("monthEndRefreshUntilDay")] public int MonthEndRefreshUntilDay { get; set; } = 20;
+    /// <summary>After a month-end is frozen, ask Tally for it again once every this many
+    /// days (current financial year only), so an entry changed later in a closed month
+    /// reaches the cloud. 0 = never (the old behaviour). Default 7: about one request a
+    /// month-end a week, inside the same night window.</summary>
+    [JsonPropertyName("monthEndRecheckDays")] public int MonthEndRecheckDays { get; set; } = 7;
     /// <summary>First month-end to back-fill (yyyy-MM-dd). Empty = start of the current financial year.</summary>
     [JsonPropertyName("monthEndBackfillFrom")] public string MonthEndBackfillFrom { get; set; } = "";
     /// <summary>Pause between month-end requests, so Tally's UI thread breathes.</summary>
