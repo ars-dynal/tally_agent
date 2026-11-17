@@ -553,7 +553,9 @@ public sealed class SyncEngine(
     // ingestion API but refused by the raw loader (dataset names not yet in its
     // registry), so they never reached BigQuery. New keys make every month-end
     // "never captured" once, and the next run re-sends Apr..Sep as new batches.
-    private const string MonthEndCheckpointPrefix = "_month_end_v5:";
+    // "_v6" since 2.5.3: Bills Payable joined the month-end step, so Apr..Oct are
+    // captured once more (as 2.5.0 did for Bills Receivable).
+    private const string MonthEndCheckpointPrefix = "_month_end_v6:";
     private const string MonthEndStepCheckpoint = "_month_end_step_v5";
 
     /// <summary>
@@ -665,11 +667,29 @@ public sealed class SyncEngine(
                         $"({br.Count} rows, {brUndated} from the fallback) - not uploaded");
                 StampMonthEnd(br, from, to);
                 EnqueueAndCheckpoint("bills_receivable_month_end", company, syncId, br, from, to, fullDone: true);
+                await Task.Delay(pause, ct);
+
+                // 2.5.3: Tally's own Bills Payable AS AT the month-end -- the
+                // supplier-wise ageing Accounts asked for (17 Nov 2026). Its due
+                // date is Tally's: bill date + the bill's credit period, which
+                // defaults from the supplier ledger. Same rule as Bills
+                // Receivable: only rows from the dated REPORT are uploaded.
+                CurrentOperation = $"month-end:{to} bills payable";
+                await EnsureTallyAnswersAsync(ct);
+                var bp = await reports.Bills("Bills Payable", "Sundry Creditors", fy, m, ct);
+                var bpUndated = bp.Count(r => !string.Equals(r.GetValueOrDefault("source") as string, "report",
+                    StringComparison.OrdinalIgnoreCase));
+                if (bp.Count == 0 || bpUndated > 0)
+                    throw new InvalidOperationException(
+                        $"Bills Payable as at {to} did not come from Tally's dated report " +
+                        $"({bp.Count} rows, {bpUndated} from the fallback) - not uploaded");
+                StampMonthEnd(bp, from, to);
+                EnqueueAndCheckpoint("bills_payable_month_end", company, syncId, bp, from, to, fullDone: true);
 
                 checkpoints.Upsert(new SyncCheckpoint(MonthEndCheckpointPrefix + to, company, from, to, null,
                     DateTime.UtcNow.ToString("O"), true));
-                log.LogInformation("Month-end snapshot as at {To}: {Tb} trial-balance rows, {St} stock rows, {Lb} detailed rows, {Br} bills",
-                    to, tb.Count, st.Count, lb.Count, br.Count);
+                log.LogInformation("Month-end snapshot as at {To}: {Tb} trial-balance rows, {St} stock rows, {Lb} detailed rows, {Br} receivable bills, {Bp} payable bills",
+                    to, tb.Count, st.Count, lb.Count, br.Count, bp.Count);
                 await Task.Delay(pause, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)

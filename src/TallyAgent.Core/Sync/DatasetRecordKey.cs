@@ -98,6 +98,7 @@ public static class DatasetRecordKey
         ["stock_summary_month_end"] = new(["item_name"], true, ""),
         ["ledger_balances_month_end"] = new(["ledger_name"], true, ""),
         ["bills_receivable_month_end"] = new(["party_name", "bill_ref", "bill_date"], true, ""),
+        ["bills_payable_month_end"] = new(["party_name", "bill_ref", "bill_date"], true, ""),
         ["outstanding_payables"] = new(["party_name"], true, ""),
         ["outstanding_receivables"] = new(["party_name"], true, ""),
     };

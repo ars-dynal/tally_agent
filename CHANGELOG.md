@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.5.3 - Month-end supplier bills: Tally's Bills Payable as at each month-end
+
+Accounts asked for a supplier-wise ageing (17 Nov 2026) with a Not Yet Due
+column and days overdue counted from each bill's DUE date -- invoice date plus
+the supplier's credit period. The cloud rebuilt supplier bills from
+bill-allocation lines, which carry no credit period, so it could age only from
+the bill date. The month-end step now also uploads `bills_payable_month_end`:
+Tally's own Bills Payable report as at each month-end (party, bill ref, bill
+date, pending amount, due date, Tally's overdue days), the same report and
+parser as Bills Receivable in 2.5.0. Only rows from the dated report are
+uploaded. Checkpoints move to `_month_end_v6:` so Apr..Oct are captured once
+more. Prove by hand before tagging: Tally's Bills Payable for 1-Apr..31-Oct
+against the first night's upload, to the paisa.
+
 ## 2.5.2 - Month-ends re-checked weekly after they are frozen
 
 A month-end snapshot (Trial Balance and Stock Summary as at the month-end) was
