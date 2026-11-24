@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.5.4 - Detailed Trial Balance every sync: lines Tally computes reach the cloud
+
+The nightly tie-out (23 Nov 2026) showed 7 deviations from one cause: Tally's
+Trial Balance carried "Sales Bills to Make" (-)38,800 inside both Sales Accounts
+and Sundry Debtors -- a line Tally computes from Delivery Note tracking (an
+invoice not linked to its Delivery Note). It has no ledger and no voucher, so
+nothing the agent sent had it, and the cloud could see the group totals differ
+but not why. Every sync with snapshots now also uploads
+`trial_balance_detailed`: the "Trial Balance" report with EXPLODEFLAG for the
+year to date, EVERY row in report order with repeats kept (that line appears
+under two groups) and Tally's sign kept (`debit_raw`, `credit_raw`,
+`net_debit_signed`; a (-) amount reverses its column). Record key: ledger_name +
+row_index. Default ON like trial_balance; `snapshotDatasets` can turn it off.
+Prove by hand before tagging: the first upload's "Sales Bills to Make" rows
+against Tally's Trial Balance > Sales Accounts and > Sundry Debtors.
+
+
 ## 2.5.3 - Month-end supplier bills: Tally's Bills Payable as at each month-end
 
 Accounts asked for a supplier-wise ageing (17 Nov 2026) with a Not Yet Due

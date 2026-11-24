@@ -90,6 +90,9 @@ public static class DatasetRecordKey
         // ── snapshots: a value AS OF a date, so the date is part of identity
         // The rows carry no as-of column, so the batch's window_to supplies it.
         ["trial_balance"] = new(["ledger_name"], true, ""),
+        // 2.5.4: a name can appear under two groups (Sales Bills to Make), so the
+        // row's place in the report is part of its identity.
+        ["trial_balance_detailed"] = new(["ledger_name", "row_index"], true, ""),
         ["balance_sheet"] = new(["ledger_name"], true, ""),
         ["profit_loss"] = new(["ledger_name"], true, ""),
         ["stock_summary"] = new(["item_name"], true, ""),

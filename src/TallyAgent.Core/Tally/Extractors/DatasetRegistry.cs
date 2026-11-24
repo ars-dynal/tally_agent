@@ -48,6 +48,9 @@ public static class DatasetRegistry
         new("voucher_guid_manifest",  DatasetKind.Voucher,  "tally_voucher_guid_manifest"),
         // Snapshot reports
         new("trial_balance",          DatasetKind.Snapshot, "tally_trial_balance"),
+        // 2.5.4: every row of the detailed Trial Balance, so a line Tally computes
+        // (Sales Bills to Make, Purchase Bills to Come) reaches the cloud.
+        new("trial_balance_detailed", DatasetKind.Snapshot, "tally_trial_balance_detailed"),
         new("balance_sheet",          DatasetKind.Snapshot, "tally_balance_sheet"),
         new("profit_loss",            DatasetKind.Snapshot, "tally_profit_loss"),
         new("stock_summary",          DatasetKind.Snapshot, "tally_stock_summary"),

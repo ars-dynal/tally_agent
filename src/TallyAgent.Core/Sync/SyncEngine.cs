@@ -979,6 +979,7 @@ public sealed class SyncEngine(
             "stock_standard_costs" => await masters.StockStandardCosts(ct),
             "stock_standard_prices" => await masters.StockStandardPrices(ct),
             "trial_balance" => await reports.TrialBalance(fyStart, today, ct),
+            "trial_balance_detailed" => await reports.TrialBalanceDetailed(fyStart, today, ct),
             "balance_sheet" => await reports.BalanceSheet(fyStart, today, ct),
             "profit_loss" => await reports.ProfitLoss(fyStart, today, ct),
             "stock_summary" => await reports.StockSummary(fyStart, today, ct),

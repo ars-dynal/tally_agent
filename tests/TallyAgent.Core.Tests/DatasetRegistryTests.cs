@@ -10,7 +10,7 @@ public class DatasetRegistryTests
     /// <summary>Every Snapshot dataset.</summary>
     private static readonly string[] SnapshotNames =
     [
-        "trial_balance", "balance_sheet", "profit_loss",
+        "trial_balance", "trial_balance_detailed", "balance_sheet", "profit_loss",
         "stock_summary", "outstanding_payables", "outstanding_receivables",
     ];
 

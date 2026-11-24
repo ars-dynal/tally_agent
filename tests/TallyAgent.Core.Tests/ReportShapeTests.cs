@@ -253,4 +253,40 @@ public class ReportShapeTests
         Assert.Equal(DatasetKind.Voucher, ds.Kind);
         Assert.Contains(enabled, d => d.Name == "day_book");
     }
+
+    // ── 2.5.4: detailed Trial Balance, every row, repeats and signs kept ─────
+
+    private const string DetailedTrialBalanceXml = """
+        <ENVELOPE>
+         <DSPACCNAME><DSPDISPNAME>Current Assets</DSPDISPNAME></DSPACCNAME>
+         <DSPACCINFO><DSPCLDRAMT><DSPCLDRAMTA>-384010927.25</DSPCLDRAMTA></DSPCLDRAMT><DSPCLCRAMT><DSPCLCRAMTA>8171468.20</DSPCLCRAMTA></DSPCLCRAMT></DSPACCINFO>
+         <DSPACCNAME><DSPDISPNAME>Sundry Debtors</DSPDISPNAME></DSPACCNAME>
+         <DSPACCINFO><DSPCLDRAMT><DSPCLDRAMTA>-110947141.70</DSPCLDRAMTA></DSPCLDRAMT><DSPCLCRAMT><DSPCLCRAMTA>8171316.20</DSPCLCRAMTA></DSPCLCRAMT></DSPACCINFO>
+         <DSPACCNAME><DSPDISPNAME>Sales Bills to Make</DSPDISPNAME></DSPACCNAME>
+         <DSPACCINFO><DSPCLDRAMT><DSPCLDRAMTA>38800.00</DSPCLDRAMTA></DSPCLDRAMT><DSPCLCRAMT><DSPCLCRAMTA></DSPCLCRAMTA></DSPCLCRAMT></DSPACCINFO>
+         <DSPACCNAME><DSPDISPNAME>Sales Accounts</DSPDISPNAME></DSPACCNAME>
+         <DSPACCINFO><DSPCLDRAMT><DSPCLDRAMTA>-2712680.00</DSPCLDRAMTA></DSPCLDRAMT><DSPCLCRAMT><DSPCLCRAMTA>381714881.63</DSPCLCRAMTA></DSPCLCRAMT></DSPACCINFO>
+         <DSPACCNAME><DSPDISPNAME>Sales Bills to Make</DSPDISPNAME></DSPACCNAME>
+         <DSPACCINFO><DSPCLDRAMT><DSPCLDRAMTA></DSPCLDRAMTA></DSPCLDRAMT><DSPCLCRAMT><DSPCLCRAMTA>-38800.00</DSPCLCRAMTA></DSPCLCRAMT></DSPACCINFO>
+        </ENVELOPE>
+        """;
+
+    [Fact]
+    public void DetailedTrialBalance_KeepsRepeatedNamesOrderAndSign()
+    {
+        var rows = ReportExtractor.ParseTrialBalanceDetailed(XDocument.Parse(DetailedTrialBalanceXml));
+
+        // Sales Bills to Make appears under Sundry Debtors AND Sales Accounts:
+        // both rows survive, in report order (the trial_balance parse drops repeats).
+        Assert.Equal(5, rows.Count);
+        Assert.Equal(new[] { 0, 1, 2, 3, 4 }, rows.Select(r => (int)r["row_index"]!).ToArray());
+        Assert.Equal(2, rows.Count(r => (string)r["ledger_name"]! == "Sales Bills to Make"));
+
+        // A (-) in the debit column reduces debits; a (-) in the credit column reduces credits.
+        Assert.Equal(-38800.00, (double)rows[2]["net_debit_signed"]!, 2);
+        Assert.Equal(38800.00, (double)rows[4]["net_debit_signed"]!, 2);
+        // An ordinary group keeps the usual debit-positive net.
+        Assert.Equal(110947141.70 - 8171316.20, (double)rows[1]["net_debit_signed"]!, 2);
+        Assert.All(rows, r => Assert.Equal("report_detailed", r["source"]));
+    }
 }

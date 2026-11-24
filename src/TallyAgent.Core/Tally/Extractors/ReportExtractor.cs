@@ -220,6 +220,65 @@ public sealed class ReportExtractor(TallyClient client, ILogger<ReportExtractor>
         return rows;
     }
 
+    /// <summary>
+    /// Tally's DETAILED Trial Balance for the year to date, EVERY row in report
+    /// order (agent 2.5.4, dataset trial_balance_detailed). On 23 Nov 2026 the
+    /// nightly tie-out showed 7 deviations: Tally's Trial Balance carried a line
+    /// "Sales Bills to Make" (-)38,800 inside BOTH Sales Accounts and Sundry
+    /// Debtors -- a line Tally computes from Delivery Note tracking, with no
+    /// ledger and no voucher behind it, so nothing else the agent sends has it.
+    /// This report lists it, with every group and ledger. Unlike
+    /// <see cref="LedgerBalancesAsAt"/> it keeps REPEATED names (that line
+    /// appears under two groups) and the row order (the cloud places a line
+    /// under the group row above it), and it keeps Tally's SIGN: an amount
+    /// printed as (-) in a column is a reversal of that column, which the
+    /// absolute closing_debit / closing_credit cannot show. Signed:
+    /// debit_raw / credit_raw as Tally sends them (debits negative), and
+    /// net_debit_signed = -(debit_raw + credit_raw). No fallback: no report
+    /// rows means nothing is uploaded.
+    /// </summary>
+    public async Task<List<Row>> TrialBalanceDetailed(DateOnly from, DateOnly to, CancellationToken ct)
+    {
+        var envelope = TallyEnvelopes.Report("Trial Balance", from, to, client.Company)
+            .Replace("</STATICVARIABLES>", "<EXPLODEFLAG>Yes</EXPLODEFLAG></STATICVARIABLES>");
+        var doc = await PostReportAllowingRefusal(envelope, "Trial Balance (detailed, year to date)", ct);
+        var rows = doc is null ? [] : ParseTrialBalanceDetailed(doc);
+        log.LogInformation("Detailed trial balance {From}..{To}: {N} rows", from, to, rows.Count);
+        return rows;
+    }
+
+    /// <summary>Every name/amount pair of a detailed Trial Balance, in order,
+    /// repeats kept, signs kept. Public for the tests.</summary>
+    public static List<Row> ParseTrialBalanceDetailed(XDocument doc)
+    {
+        var rows = new List<Row>();
+        foreach (var nameEl in doc.Descendants().Where(e => Is(e, "DSPACCNAME")))
+        {
+            var name = DspName(nameEl);
+            if (name.Length == 0) continue;
+            var parent = nameEl.Parent;
+            var amountContainer = parent is not null && (Is(parent, "DSPTOTINFO") || Is(parent, "DSPACCINFO"))
+                ? parent
+                : FollowingSibling(nameEl) ?? parent;
+            if (amountContainer is null) continue;
+            var dr = NumByLocalName(amountContainer, "DSPCLDRAMTA");
+            var cr = NumByLocalName(amountContainer, "DSPCLCRAMTA");
+            rows.Add(new Row
+            {
+                ["ledger_name"] = name,
+                ["row_index"] = rows.Count,
+                ["closing_debit"] = Math.Abs(dr),
+                ["closing_credit"] = Math.Abs(cr),
+                ["debit_raw"] = dr,
+                ["credit_raw"] = cr,
+                ["net_debit_signed"] = -(dr + cr),
+                ["parent_group"] = "",
+                ["source"] = "report_detailed",
+            });
+        }
+        return rows;
+    }
+
     public async Task<List<Row>> BalanceSheet(DateOnly from, DateOnly to, CancellationToken ct)
     {
         var doc = await PostReportAllowingRefusal(
